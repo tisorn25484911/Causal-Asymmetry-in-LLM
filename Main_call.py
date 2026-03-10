@@ -3,7 +3,7 @@ import numpy as np
 import matplotlib.pyplot as plt
 from sklearn.decomposition import PCA
 from Training_model import train_model
-from Data_generation import make_loader
+from Data_generation import make_loader, coin_generation, Rev_HMM_generation, flower_process_generation
 from OneHot_model import OneHotDecoder
 from Model_analysis import (
     statistical_complexity,
@@ -27,8 +27,12 @@ def main():
     lr = 1e-2
     p, q = 0.3, 0.4
 
+    #generate data
+    data, states = coin_generation(num_samples=num_samples, seq_len=max_len, p=p, q=q)
+    data_rev, states_rev = Rev_HMM_generation(data, states)
     # Data Loader
-    train_loader = make_loader(pp=p, qq=q, batch_size=batch_size, seq_len=max_len, num_samples=num_samples)
+    train_loader = make_loader(data, states, batch_size=batch_size, mode="forward")
+    train_loader_rev = make_loader(data_rev, states_rev, batch_size=batch_size, mode="backward")
 
     # Train Forward Model
     print("Training Forward Model...")
