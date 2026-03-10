@@ -1,0 +1,7 @@
+d_model: 20
+lr: 0.01
+max_len: 5000
+mode: forward
+n_layers: 2
+reverse_pos_for_backward: false
+token_size: 3
