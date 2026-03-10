@@ -31,10 +31,10 @@ class FlowerDataset(Dataset):
         return input, target
 
     
-def coin_generation(num_samples = 1000, seq_len = 20, pre_depth = 10, p = 0.6, q = 0.4):
-    data = []
-    states = []
-    T = seq_len + pre_depth
+def coin_generation(num_samples = 1000, seq_len = 20, p = 0.6, q = 0.4):
+    data = []   #num_sample x seq_len
+    states = [] #num_sample x seq_len
+    T = seq_len
 
     for _ in range(num_samples):
         seq = []
@@ -65,29 +65,11 @@ def coin_generation(num_samples = 1000, seq_len = 20, pre_depth = 10, p = 0.6, q
         states.append(state_seq)
     return data, states
 
-def Rev_HMM_generation(data, states):
-    rev_data = [list(reversed(seq)) for seq in data]
-    rev_states = [list(reversed(state_seq)) for state_seq in states]
-    return rev_data, rev_states
-
-def make_loader(data, states, batch_size, shuffle = True, mode = "forward"):
-    if mode == "backward":
-        seqs, _ = Rev_HMM_generation(data, states)
-    if mode == "forward":
-        seqs, _ = data, states
-        seq_len = len(seqs[0])
-    else:
-        raise ValueError("Invalid mode. Choose 'forward' or 'backward'.")
-    ds = CoinDataset(seqs, seq_len = seq_len)
-    dl = DataLoader(ds, batch_size = batch_size, shuffle = shuffle)
-    return dl
-
-
 """
 n_m flower process generation
 """
 
-def flower_process_generation(num_samples=500, seq_len=200, pre_depth=10, n=4, m=2, dice_probs=None):
+def flower_process_generation(num_samples=500, seq_len=200, n=4, m=2, dice_probs=None):
     data = []
     states = []
     
@@ -95,7 +77,7 @@ def flower_process_generation(num_samples=500, seq_len=200, pre_depth=10, n=4, m
         # Each die gets a random bias using Dirichlet distribution
         dice_probs = np.random.dirichlet(np.ones(m), size=n)
     
-    T = seq_len + pre_depth  # Total number of cycles
+    T = seq_len  # Total number of cycles
     
     for _ in range(num_samples):
         seq = []
@@ -114,12 +96,29 @@ def flower_process_generation(num_samples=500, seq_len=200, pre_depth=10, n=4, m
             seq.append(obs_die_outcome)
             state_seq.append(('roll', die_outcome))
         
-        # Discard pre_depth cycles (2*pre_depth observations)
-        seq = seq[2*pre_depth:]
-        state_seq = state_seq[2*pre_depth:]
-        
         data.append(seq)
         states.append(state_seq)
     
     return data, states
 
+"""
+DataLoader creation function
+"""
+
+def Rev_HMM_generation(data, states):
+    rev_data = [list(reversed(seq)) for seq in data]
+    rev_states = [list(reversed(state_seq)) for state_seq in states]
+    return rev_data, rev_states
+
+def make_loader(data, states, batch_size, shuffle = True, mode = "forward"):
+    if mode == "backward":
+        seqs, _ = Rev_HMM_generation(data, states)
+        seq_len = len(seqs[0])
+    elif mode == "forward":
+        seqs, _ = data, states
+        seq_len = len(seqs[0])
+    else:
+        raise ValueError("Invalid mode. Choose 'forward' or 'backward'.")
+    ds = CoinDataset(seqs, seq_len = seq_len)
+    dl = DataLoader(ds, batch_size = batch_size, shuffle = shuffle)
+    return dl
