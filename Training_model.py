@@ -138,3 +138,30 @@ def train_model(
     # attach model for convenient access outside
     recorder.model = model
     return recorder
+
+def test_train_validation(train_loader, test_ratio, train_ratio, val_ratio):
+    if test_ratio + train_ratio + val_ratio != 1.0:
+        sum = test_ratio + train_ratio + val_ratio
+        test_ratio /= sum
+        train_ratio /= sum
+        val_ratio /= sum
+        print(f"Ratios normalized to sum to 1.0: test_ratio={test_ratio}, train_ratio={train_ratio}, val_ratio={val_ratio}")
+    total_samples = len(train_loader.dataset)
+    train_features, train_labels = next(iter(train_loader))
+    total_batches = len(train_features)
+
+    num_test = int(total_batches * test_ratio)
+    num_train = int(total_batches * train_ratio)
+    num_val = int(total_batches * val_ratio)
+
+    print(f"Total samples: {total_samples}, Total batches: {total_batches}")
+    print(f"Splitting into: {num_train} train batches, {num_val} val batches, {num_test} test batches") 
+
+    train_set, val_set, test_set = torch.utils.data.random_split(
+        train_loader.dataset, [num_train, num_val, num_test]
+    )
+    train_loader = torch.utils.data.DataLoader(train_set, batch_size=train_loader.batch_size, shuffle=True)
+    val_loader = torch.utils.data.DataLoader(val_set, batch_size=train_loader.batch_size, shuffle=False)
+    test_loader = torch.utils.data.DataLoader(test_set, batch_size=train_loader.batch_size, shuffle=False)
+    return train_loader, val_loader, test_loader
+
