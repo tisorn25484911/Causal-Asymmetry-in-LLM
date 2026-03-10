@@ -16,7 +16,22 @@ class CoinDataset(Dataset):
         target = x[1:]
         return input, target
     
-def HMM_generation(num_samples = 1000, seq_len = 20, pre_depth = 10, p = 0.6, q = 0.4):
+class FlowerDataset(Dataset):
+    def __init__(self, seqs, seq_len=20):
+        self.seqs = seqs
+        self.seq_len = seq_len
+
+    def __len__(self):
+        return len(self.seqs)
+    
+    def __getitem__(self, idx):
+        x = torch.tensor(self.seqs[idx], dtype=torch.long)
+        input = x[:-1]
+        target = x[1:]
+        return input, target
+
+    
+def coin_generation(num_samples = 1000, seq_len = 20, pre_depth = 10, p = 0.6, q = 0.4):
     data = []
     states = []
     T = seq_len + pre_depth
@@ -50,17 +65,61 @@ def HMM_generation(num_samples = 1000, seq_len = 20, pre_depth = 10, p = 0.6, q 
         states.append(state_seq)
     return data, states
 
-def Rev_HMM_generation(num_samples = 1000, seq_len = 20, pre_depth = 10, p = 0.6, q = 0.4):
-    data, states = HMM_generation(num_samples, seq_len, pre_depth, p, q)
+def Rev_HMM_generation(data, states):
     rev_data = [list(reversed(seq)) for seq in data]
     rev_states = [list(reversed(state_seq)) for state_seq in states]
     return rev_data, rev_states
 
-def make_loader(pp = 0.6, qq = 0.4, batch_size = 32, seq_len = 100, num_samples = 2000, shuffle = True, mode = "forward"):
+def make_loader(data, states, batch_size, shuffle = True, mode = "forward"):
     if mode == "backward":
-        seqs, _ = Rev_HMM_generation(q = qq, p = pp, num_samples = num_samples, seq_len = seq_len)
+        seqs, _ = Rev_HMM_generation(data, states)
+    if mode == "forward":
+        seqs, _ = data, states
+        seq_len = len(seqs[0])
     else:
-        seqs, _ = HMM_generation(q = qq, p = pp, num_samples = num_samples, seq_len = seq_len)
+        raise ValueError("Invalid mode. Choose 'forward' or 'backward'.")
     ds = CoinDataset(seqs, seq_len = seq_len)
     dl = DataLoader(ds, batch_size = batch_size, shuffle = shuffle)
     return dl
+
+
+"""
+n_m flower process generation
+"""
+
+def flower_process_generation(num_samples=500, seq_len=200, pre_depth=10, n=4, m=2, dice_probs=None):
+    data = []
+    states = []
+    
+    if dice_probs is None:
+        # Each die gets a random bias using Dirichlet distribution
+        dice_probs = np.random.dirichlet(np.ones(m), size=n)
+    
+    T = seq_len + pre_depth  # Total number of cycles
+    
+    for _ in range(num_samples):
+        seq = []
+        state_seq = []
+        
+        for t in range(T):
+            # Step 1: Randomly select a die (uniform distribution)
+            die_idx = np.random.randint(0, n)
+            obs_die_choice = die_idx  # Observation in {0, ..., n-1}
+            seq.append(obs_die_choice)
+            state_seq.append(('select', die_idx))
+            
+            # Step 2: Roll the selected die
+            die_outcome = np.random.choice(m, p=dice_probs[die_idx])
+            obs_die_outcome = n + die_outcome  # Observation in {n, ..., n+m-1}
+            seq.append(obs_die_outcome)
+            state_seq.append(('roll', die_outcome))
+        
+        # Discard pre_depth cycles (2*pre_depth observations)
+        seq = seq[2*pre_depth:]
+        state_seq = state_seq[2*pre_depth:]
+        
+        data.append(seq)
+        states.append(state_seq)
+    
+    return data, states
+
