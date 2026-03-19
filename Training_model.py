@@ -230,7 +230,7 @@ def train_test_val_pipeline(
     full_dataset = train_loader.dataset
     N            = len(full_dataset)
 
-    train_val, test = test_ratio
+    test, train_val = test_ratio
     print(f"Initial split ratios: test={test}, train={train_val}")
     trainval_loader, test_loader = test_train_validation(train_loader, test_ratio=test, train_ratio=train_val)  
 
