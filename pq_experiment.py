@@ -1,4 +1,4 @@
-from Data_generation import HMM_generation
+from Data_generation import coin_generation
 from Data_generation import make_loader
 from Training_model import train_model
 from Model_analysis import (
