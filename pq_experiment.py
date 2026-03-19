@@ -82,12 +82,13 @@ def pq_experiment(
             print(f"Experiment {idx}/{total}: p={p}, q={q}")
             print(f"{'='*70}")
 
+            data, states = coin_generation(num_samples=num_samples, seq_len=max_len, p=p, q=q)
+
             train_loader = make_loader(
-                pp=float(p),
-                qq=float(q),
+                data,
+                states,
                 batch_size=batch_size,
-                seq_len=max_len,
-                num_samples=num_samples,
+                mode="forward"
             )
 
             print("\n[1/2] Training Forward Model...")
