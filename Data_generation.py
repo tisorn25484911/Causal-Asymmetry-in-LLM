@@ -4,6 +4,7 @@ from torch.utils.data import Dataset, DataLoader
 
 class CoinDataset(Dataset):
     def __init__(self, seqs, seq_len = 20):
+        self.num_token = 3  # Assuming 3 tokens for coin flip: 0, 1, 2
         self.seqs = seqs
         self.seq_len = seq_len
 
@@ -18,6 +19,9 @@ class CoinDataset(Dataset):
     
 class FlowerDataset(Dataset):
     def __init__(self, seqs, seq_len=20):
+        self.n = 4  # Number of dice
+        self.m = 2  # Number of outcomes per die
+        self.num_token = self.n + self.m  # Total number of tokens
         self.seqs = seqs
         self.seq_len = seq_len
 
