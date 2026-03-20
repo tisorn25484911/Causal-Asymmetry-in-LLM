@@ -1,18 +1,66 @@
-"""
-main_large.py — Overnight High-Quality Experiment Runner
-=========================================================
-Identical pipeline to main.py with upgraded parameters:
-  • 4× more training data  (500 → 2000 samples)
-  • 5× more epochs         (15/20 → 80)
-  • 2× model capacity      (d_model 32 → 64)
-  • 2× context window      (chunk 256 → 512 tokens)
-  • 2× batch size          (32 → 64)
-  • Full dataset analysis  (max_batches None instead of 20)
-  • Denser p-q grid        (10 → 19 points, 361 cells)
-  • Fault-tolerant main()  (each experiment saved independently)
-Results saved to: results_large/
-"""
 
+
+"""
+    Experiment Plan:
+    Experiment 1: Train forward and backward models on the coin process data. (500 samples, each len = 2000)
+        - Train forward model on original coin data (observations in {0,1,2}).
+            - 5 fold cross-validation to ensure robustness. 
+            - plot Loss and perplexity curves (training and validation)
+            - **get the best model from the 5 folds for analysis.
+            - Analyze the best forward model using:
+                - Attention heatmaps on sample sequences.
+                - UMAP visualization of latent representations.
+                - Statistical complexity estimation (empirical and theoretical).
+                - *Approximation into Automata*
+        - Train backward model on reversed coin data.
+            - Train forward model on original coin data (observations in {0,1,2}).
+            - 5 fold cross-validation to ensure robustness. 
+            - plot Loss and perplexity curves (training and validation)
+            - **get the best model from the 5 folds for analysis.
+            - Analyze the best forward model using:
+                - Attention heatmaps on sample sequences.
+                - 2D UMAP visualization of latent representations.
+                - Statistical complexity estimation (empirical and theoretical).
+                - *Approximation into Automata*
+        - Analyze and compare models using:
+            - Loss and perplexity curves from *the best model in each fold*.
+            - *calculate the theoretical convergence of the loss function and compare with the trained models' loss curves*
+            - Attention heatmaps on the same sample sequences.
+            - 2D UMAP visualizations of latent representations on the same sample sequences with the same. plotting range for size comparison.
+            - Statistical complexity comparison (empirical and theoretical).
+    Experiment 1.2: Train forward and backward models on the coin process data with different parameters (p = 0.1, q = 0.9). (500 samples, each len = 500)
+        - Repeat the same steps as in Experiment 1 for the new coin process data.
+        - calculate the empirical and theoretical statistical complexity for the new coin process and compare with the previous one (plot a heat map).
+        - plot a heat map of "the difference in statistical complexity" for the new coin process and compare with the previous one (plot a heat map)
+        - plot a heat map of "the difference in perplexity" between forward and backward models across different (p, q) values on the same 2000 seq long test data.
+
+    Experiment 2: Train forward and backward models on the flower process data. (n = 4, m = 2, 500 samples, each len = 2000)
+        - Train forward model on original coin data (observations in {0,1,2}).
+            - 5 fold cross-validation to ensure robustness. 
+            - plot Loss and perplexity curves (training and validation)
+            - **get the best model from the 5 folds for analysis.
+            - Analyze the best forward model using:
+                - Attention heatmaps on sample sequences.
+                - 2D UMAP visualization of latent representations.
+                - Statistical complexity estimation (empirical and theoretical).
+                - *Approximation into Automata*
+        - Train backward model on reversed coin data.
+            - Train forward model on original coin data (observations in {0,1,2}).
+            - 5 fold cross-validation to ensure robustness. 
+            - plot Loss and perplexity curves (training and validation)
+            - **get the best model from the 5 folds for analysis.
+            - Analyze the best forward model using:
+                - Attention heatmaps on sample sequences.
+                - 2D UMAP visualization of latent representations.
+                - Statistical complexity estimation (empirical and theoretical).
+                - *Approximation into Automata*
+        - Analyze and compare models using:
+            - Loss and perplexity curves from *the best model in each fold
+            - *calculate the theoretical convergence of the loss function and compare with the trained models' loss curves*
+            - Attention heatmaps on the same sample sequences.
+            - 2D UMAP visualizations of latent representations on the same sample sequences with the same. plotting range for size comparison.
+            - Statistical complexity comparison (empirical and theoretical).
+"""
 # ── stdlib ─────────────────────────────────────────────────────────────────
 import gc
 import os
@@ -36,20 +84,28 @@ from Data_generation import (
 )
 from Flower_process_generation import FlowerDataset          # FIX-5
 from Model_analysis import (
+    mkdir,
+    save_pkl,
+    _sub,
+    savefig,
+    save_weights,
+    _project2d,
+    plot_umap,
+    plot_diff_heatmap, 
     FW_BW_attention_comparison,
     latent_extraction,
     plot_attention_heatmap,
     statistical_complexity,
     statistical_complexity_empirical,
 )
-from Training_model import _eval_loss_on_loader, train_test_val_pipeline
+from Training_model import ChunckDataset, _loader, make_chunked_loader, _eval_loss_on_loader, train_test_val_pipeline
 from pq_experiment import heatmap_theory, plot_heatmap, pq_experiment, pq_experiment_full
 
 # ── UMAP — warm up JIT here so segfault (if any) happens at startup ───────
 # FIX-2: pre-compile numba kernels before training begins
 try:
     import umap as _umap_mod
-    _warmup = _umap_mod.UMAP(n_components=2, n_neighbors=5).fit_transform(
+    _warmup = _umap_mod.UMAP(n_components=2, n_neighbors=20).fit_transform(
         np.random.rand(20, 4)
     )
     del _warmup
@@ -64,21 +120,22 @@ except Exception as _e:
 # GLOBAL CONFIG
 # ══════════════════════════════════════════════════════════════════════════
 CFG = dict(
-    # ── model (doubled capacity) ────────────────────────────────────────
-    d_model         = 64,        # was 32
-    embed_type      = "onehot",
-    n_folds         = 5,
-    lr              = 5e-3,      # was 1e-2 — slower, more stable convergence
+    # ── model ──────────────────────────────────────────────────────────
+    d_model          = 64,       # was 32  → richer latent space, cleaner UMAP clusters
+    embed_type       = "onehot",
+    n_folds          = 5,
+    lr               = 5e-3,     # was 1e-2 → slower, more stable convergence near H∞
     # ── sequence chunking ──────────────────────────────────────────────
-    train_chunk_len = 512,       # was 256 — 2× longer context window
-    attn_vis_len    = 128,       # was 64
-    umap_n_neighbors = 100,  # UMAP neighbourhood size (reference: 100 for 1000 pts)
-    # ── coin exp 1 (4× data, 5× epochs, 2× batch) ──────────────────────
+    train_chunk_len  = 512,      # was 256 → sees longer dependencies per step
+    attn_vis_len     = 128,      # was 64
+    umap_n_neighbors = 200,
+    umap_n_pts       = 1000,
+    # ── coin exp 1 ─────────────────────────────────────────────────────
     coin_p1          = 0.3,  coin_q1      = 0.4,
-    coin_num_samples = 2000,     # was 500
+    coin_num_samples = 2000,     # was 500  → 4× more data, stable CV folds
     coin_seq_len     = 2000,
-    coin_max_epochs  = 80,       # was 15 — full convergence to H∞
-    coin_batch       = 64,       # was 32
+    coin_max_epochs  = 80,       # was 10   → loss fully converges to H∞
+    coin_batch       = 64,       # was 32   → smoother gradient estimates
     coin_num_token   = 3,
     # ── coin exp 1.2 ───────────────────────────────────────────────────
     coin_p2             = 0.1,  coin_q2         = 0.9,
@@ -88,70 +145,17 @@ CFG = dict(
     flower_n           = 4,  flower_m        = 2,
     flower_num_samples = 2000,   # was 500
     flower_seq_len     = 2000,
-    flower_max_epochs  = 80,     # was 20
+    flower_max_epochs  = 80,     # was 10
     flower_batch       = 64,     # was 32
-    # ── pq heatmap (19-pt grid = 361 cells vs 100) ─────────────────────
+    # ── pq heatmap ─────────────────────────────────────────────────────
     pq_grid   = [0.05, 0.10, 0.15, 0.20, 0.25, 0.30, 0.35, 0.40, 0.45,
                  0.50, 0.55, 0.60, 0.65, 0.70, 0.75, 0.80, 0.85, 0.90, 0.95],
-    pq_epochs  = 30,             # was 15
+    pq_epochs  = 30,             # was 5
     pq_samples = 1000,           # was 500
     pq_len     = 400,            # was 200
 )
-
-
 # ══════════════════════════════════════════════════════════════════════════
-# FIX-1: ChunkedDataset — caps T at train_chunk_len
-# ══════════════════════════════════════════════════════════════════════════
-class ChunkedDataset(tud.Dataset):
-    """
-    Wraps a sequence dataset and returns a random contiguous chunk of
-    length `chunk_len` instead of the full sequence.
-
-    Without this, training on 2000-token sequences allocates
-      B × T × T × 4 bytes ≈ 32 × 1999 × 1999 × 4 ≈ 512 MB
-    per attention layer per batch, causing OOM / kernel kill.
-    """
-
-    def __init__(self, base: tud.Dataset, chunk_len: int, seed: int = 0):
-        self.base  = base
-        self.chunk = chunk_len
-        self.rng   = np.random.default_rng(seed)
-
-    def __len__(self):
-        return len(self.base)
-
-    def __getitem__(self, idx):
-        inp, tgt = self.base[idx]          # shape (T,) each
-        T = inp.shape[0]
-        if T <= self.chunk:
-            return inp, tgt
-        start = int(self.rng.integers(0, T - self.chunk + 1))
-        return inp[start: start + self.chunk], tgt[start: start + self.chunk]
-
-
-def make_chunked_loader(
-    dataset: tud.Dataset, chunk_len: int, batch_size: int, shuffle: bool = True
-) -> tud.DataLoader:
-    """FIX-1 + FIX-3 combined."""
-    return tud.DataLoader(
-        ChunkedDataset(dataset, chunk_len),
-        batch_size=batch_size,
-        shuffle=shuffle,
-        num_workers=0,             # FIX-3
-        persistent_workers=False,  # FIX-3
-    )
-
-
-def _loader(dataset: tud.Dataset, batch_size: int, shuffle: bool = False) -> tud.DataLoader:
-    """Plain loader — FIX-3 only (no chunking; used for analysis)."""
-    return tud.DataLoader(
-        dataset, batch_size=batch_size,
-        shuffle=shuffle, num_workers=0, persistent_workers=False,
-    )
-
-
-# ══════════════════════════════════════════════════════════════════════════
-# FIX-4 / FIX-7 / FIX-8: safe cleanup + CPU-offload for analysis
+#  safe cleanup + CPU-offload for analysis
 # ══════════════════════════════════════════════════════════════════════════
 
 def cleanup():
@@ -193,72 +197,10 @@ def to_cpu_for_analysis(model: torch.nn.Module) -> torch.nn.Module:
     return model
 
 
-def latent_extraction(model, data_loader, max_batches=None):   # noqa: F811
-    """
-    CPU-only latent extraction (FIX-7/8 + FIX-9).
-
-    FIX-9: mirrors the backward-mode batch convention from training_step.
-    The backward model is trained with `targets, inputs = batch`, so it
-    expects batch[1] as its input token sequence.  Using batch[0] for a
-    backward model feeds it the wrong tokens AND colours the UMAP scatter
-    with the wrong token ids — producing the "swapped" cluster appearance.
-
-    Model MUST already be on CPU when this is called (ensured by
-    to_cpu_for_analysis).
-    """
-    model.eval()
-    is_backward = (getattr(model, "mode", "forward") == "backward")
-    latents_all, inputs_all, target_all = [], [], []
-
-    with torch.no_grad():
-        for batch_idx, (a, b) in enumerate(data_loader):
-            if max_batches is not None and batch_idx >= max_batches:
-                break
-            # Mirror the same convention used in training_step:
-            #   forward mode : inputs=a, targets=b
-            #   backward mode: inputs=b, targets=a  (batch is swapped)
-            if is_backward:
-                inputs, targets = b, a
-            else:
-                inputs, targets = a, b
-            _  = model(inputs)
-            z  = model.last_encodings.detach().numpy()
-            latents_all.append(z)
-            inputs_all.append(inputs.numpy())
-            target_all.append(targets.numpy())
-
-    latents = np.concatenate(latents_all, axis=0)
-    inps    = np.concatenate(inputs_all,  axis=0)
-    tgts    = np.concatenate(target_all,  axis=0)
-    return latents, inps, tgts
-
-
 # ══════════════════════════════════════════════════════════════════════════
 # UTILITIES
 # ══════════════════════════════════════════════════════════════════════════
-def mkdir(path: str) -> str:
-    os.makedirs(path, exist_ok=True)
-    return path
 
-
-def save_pkl(obj, path: str):
-    with open(path, "wb") as f:
-        pickle.dump(obj, f, protocol=4)
-    print(f"  pickle saved -> {path}")
-
-
-def save_weights(model, path: str):
-    torch.save(model.state_dict(), path)
-    print(f"  weights saved -> {path}")
-
-
-def savefig(fig, path: str, dpi: int = 120):
-    fig.savefig(path, dpi=dpi, bbox_inches="tight")
-    plt.close(fig)
-    print(f"  figure saved -> {path}")
-
-
-# FIX-6: single function — rate is direction-symmetric
 def entropy_rate_coin(p: float, q: float) -> float:
     """
     Entropy rate H∞ (bits/token) of the coin-process HMM.
@@ -271,67 +213,6 @@ def entropy_rate_coin(p: float, q: float) -> float:
         return -a * np.log2(a) - b * np.log2(b)
     pi0 = q / (p + q);  pi1 = p / (p + q)
     return pi0 * _h2(p) + pi1 * _h2(q)
-
-
-# ── 2-D projection ───────────────────────────────────────────────────────
-# n_neighbors=100 matches the reference notebook and produces tight,
-# well-separated clusters.  min(100, N-1) keeps it valid for small N.
-def _project2d(flat: np.ndarray, n_neighbors: int = 100) -> tuple:
-    if UMAP_AVAILABLE:
-        try:
-            c = _umap_mod.UMAP(
-                n_components=2, random_state=42,
-                n_neighbors=min(n_neighbors, len(flat) - 1),
-                min_dist=0.1,
-                metric="euclidean",
-            ).fit_transform(flat)
-            return c, "UMAP"
-        except Exception as e:
-            print(f"  UMAP failed ({e}), using PCA")
-    from sklearn.decomposition import PCA
-    return PCA(n_components=2).fit_transform(flat), "PCA"
-
-
-# Take the FIRST n consecutive points (same as reference notebook).
-# Random subsampling shuffles temporal order and breaks the neighbourhood
-# structure that UMAP relies on to form clusters.
-def _sub(arr: np.ndarray, n: int = 1000) -> tuple:
-    """Return (latent_subset, index_array) — first n rows, no shuffle."""
-    n = min(n, len(arr))
-    return arr[:n], np.arange(n)
-
-
-def plot_umap(latents, inputs_arr, num_token, title="", save_path=None,
-              xlim=None, ylim=None, n_pts: int = 1000):
-    """
-    Plot 2-D UMAP coloured by token id.
-    n_pts: number of consecutive latent vectors to embed (default 1000).
-    """
-    flat_l = latents.reshape(-1, latents.shape[-1])
-    flat_i = inputs_arr.reshape(-1)
-    sub_l, idx = _sub(flat_l, n_pts)
-    sub_i = flat_i[idx]
-
-    coords, mlbl = _project2d(sub_l)
-    cmap = plt.cm.tab10
-    fig, ax = plt.subplots(figsize=(7, 6))
-    for tok in range(num_token):
-        mask = sub_i == tok
-        if not mask.any():
-            continue
-        ax.scatter(coords[mask, 0], coords[mask, 1],
-                   c=[cmap(tok / max(num_token - 1, 1))],
-                   label=f"Token {tok}", alpha=0.7, s=10)
-    ax.set_title(f"{title} ({mlbl})", fontsize=11, fontweight="bold")
-    ax.legend(fontsize=8, markerscale=3)
-    if xlim:
-        ax.set_xlim(xlim)
-    if ylim:
-        ax.set_ylim(ylim)
-    ax.grid(True, alpha=0.2)
-    if save_path:
-        savefig(fig, save_path)
-    return fig, coords
 
 
 def plot_loss_theory(rec_fw, rec_bw, theory_fw, theory_bw, title="", save_path=None):
@@ -390,20 +271,6 @@ def plot_loss_theory(rec_fw, rec_bw, theory_fw, theory_bw, title="", save_path=N
     return fig
 
 
-def plot_diff_heatmap(Z, p_vals, q_vals, title, cbar_label, save_path=None, cmap="RdBu_r"):
-    fig, ax = plt.subplots(figsize=(7, 6))
-    ext = [float(np.min(q_vals)), float(np.max(q_vals)),
-           float(np.min(p_vals)), float(np.max(p_vals))]
-    im = ax.imshow(Z, origin="lower", extent=ext, cmap=cmap, aspect="auto")
-    Qm, Pm = np.meshgrid(q_vals, p_vals)
-    ax.contour(Qm, Pm, Z, levels=8, colors="white", alpha=0.4, linewidths=0.8)
-    fig.colorbar(im, ax=ax, label=cbar_label)
-    ax.set_xlabel("q", fontsize=12); ax.set_ylabel("p", fontsize=12)
-    ax.set_title(title, fontsize=13, fontweight="bold")
-    if save_path: savefig(fig, save_path)
-    return fig
-
-
 def analyse_model(tag, model, loader, num_token, out_dir,
                   sample_seq=None, p=None, q=None, mode="forward",
                   k=2, use_t="last", attn_vis_len=64):
@@ -414,8 +281,6 @@ def analyse_model(tag, model, loader, num_token, out_dir,
     # Also move sample_seq to CPU
     if sample_seq is not None:
         sample_seq = sample_seq.cpu()
-
-    # Attention — short prefix only (FIX-1)
     if sample_seq is not None:
         try:
             fig_a = plot_attention_heatmap(model, sample_seq[:attn_vis_len])
@@ -429,10 +294,10 @@ def analyse_model(tag, model, loader, num_token, out_dir,
     # All positions flattened together mixes high/low context latents,
     # producing smeared elongated shapes rather than tight clusters.
     try:
-        latents, inp_arr, _ = latent_extraction(model, loader, max_batches=None)
+        latents, inp_arr, _ = latent_extraction(model, loader, max_batches=20)
         is_bw = (getattr(model, "mode", "forward") == "backward")
-        lat_slice = latents[:,  0, :] if is_bw else latents[:, -1, :]
-        inp_slice = inp_arr[:,  0]    if is_bw else inp_arr[:, -1]
+        lat_slice = latents[:,  0, :]
+        inp_slice = inp_arr[:, 0]
         lat_for_plot = lat_slice[:, np.newaxis, :]   # (N,1,D) for plot_umap
         inp_for_plot = inp_slice[:, np.newaxis]       # (N,1)
         _, coords = plot_umap(lat_for_plot, inp_for_plot, num_token, title=tag,
@@ -444,7 +309,7 @@ def analyse_model(tag, model, loader, num_token, out_dir,
 
     # Statistical complexity — model on CPU so no MPS issue inside the fn
     try:
-        S_emp = statistical_complexity_empirical(model, loader, max_batches=None,
+        S_emp = statistical_complexity_empirical(model, loader, max_batches=20,
                                                  use_t=use_t, k=k)
         res["S_emp"] = S_emp
         if p is not None and q is not None:
@@ -490,21 +355,21 @@ def compare_fw_bw(tag, cv_fw, cv_bw, ana_fw, ana_bw, loader_fw, loader_bw, num_t
     # Flattening all positions mixes high-context and low-context latents,
     # producing elongated smears instead of tight clusters.
     try:
-        lfw, ifw, _ = latent_extraction(mfw, loader_fw, max_batches=None)
-        lbw, ibw, _ = latent_extraction(mbw, loader_bw, max_batches=None)
+        lfw, ifw, _ = latent_extraction(mfw, loader_fw, max_batches=20)
+        lbw, ibw, _ = latent_extraction(mbw, loader_fw, max_batches=20)
         # lfw/lbw shape: (N, T, d_model) — slice the max-context position
         # Both models are forward-mode (reversed data → forward model)
         # → last position has the most context for both
-        lat_fw = lfw[:, -1, :]   # last pos: full past context
-        lat_bw = lbw[:, -1, :]   # last pos: full reversed-past context
-        inp_fw = ifw[:, -1]      # token at last input position
-        inp_bw = ibw[:, -1]
+        lat_fw = lfw.reshape(-1, lfw.shape[-1])   # last pos: full past context
+        lat_bw = lbw.reshape(-1, lbw.shape[-1])   # last pos: full reversed-past context
+        inp_fw = ifw.reshape(-1)      # token at last input position
+        inp_bw = ibw.reshape(-1)
         # subsample to 1000 points (first N, ordered)
         n_pts = min(1000, len(lat_fw), len(lat_bw))
         fl_fw, fl_bw = lat_fw[:n_pts], lat_bw[:n_pts]
         si_fw, si_bw = inp_fw[:n_pts], inp_bw[:n_pts]
-        c_fw, mlbl = _project2d(fl_fw, n_neighbors=cfg.get('umap_n_neighbors', 100) if 'cfg' in dir() else 100)
-        c_bw, _    = _project2d(fl_bw, n_neighbors=cfg.get('umap_n_neighbors', 100) if 'cfg' in dir() else 100)
+        c_fw, mlbl = _project2d(fl_fw, n_neighbors=cfg.get('umap_n_neighbors', 200) if 'cfg' in dir() else 200)
+        c_bw, _    = _project2d(fl_bw, n_neighbors=cfg.get('umap_n_neighbors', 200) if 'cfg' in dir() else 200)
 
         # Independent projections — no shared axis range
         cmap = plt.cm.tab10
@@ -588,10 +453,10 @@ def experiment_1(cfg, out_root, all_results):
 
     print("\n  -- 1b Backward CV --")
     cv_bw = train_test_val_pipeline(
-        loader_bw, test_ratio=(0.20, 0.80), n_folds=cfg["n_folds"],
+        loader_fw, test_ratio=(0.20, 0.80), n_folds=cfg["n_folds"],
         embed_type=cfg["embed_type"], num_token=num_token,
         d_model=cfg["d_model"], max_len=max_len,
-        max_epochs=cfg["coin_max_epochs"], lr=cfg["lr"], mode="forward",  # reversed data → forward model
+        max_epochs=cfg["coin_max_epochs"], lr=cfg["lr"], mode="backward",  # forward data → backward model
         save_plot=os.path.join(odir, f"{tag}_bw_cv.png"),
     )
     cleanup()  # FIX-4
@@ -601,14 +466,14 @@ def experiment_1(cfg, out_root, all_results):
                            num_token, odir, sample_seq, p, q, "forward",
                            k=2, use_t="last", attn_vis_len=cfg["attn_vis_len"])
     cleanup()  # GC between fw and bw analysis (model already moved to CPU)
-    ana_bw = analyse_model(f"{tag}_bw", cv_bw["best_model"], loader_bw_ana,
+    ana_bw = analyse_model(f"{tag}_bw", cv_bw["best_model"], loader_fw_ana,
                            num_token, odir, sample_seq, p, q, "backward",
                            k=3, use_t="last", attn_vis_len=cfg["attn_vis_len"])  # forward model → last pos
     cleanup()
 
     print("\n  -- 1d Comparison --")
     compare_fw_bw(tag, cv_fw, cv_bw, ana_fw, ana_bw,
-                  loader_fw_ana, loader_bw_ana, num_token, odir, sample_seq,
+                  loader_fw_ana, loader_fw_ana, num_token, odir, sample_seq,
                   theory, theory, cfg["attn_vis_len"], p, q)
 
     print(f"\n  Exp 1 done in {(time.time()-t0)/60:.1f} min")
@@ -641,7 +506,7 @@ def experiment_1_2(cfg, out_root, all_results):
     ds_fw = CoinDataset(data,     seq_len=cfg["coin_seq_len_12"])
     ds_bw = CoinDataset(data_rev, seq_len=cfg["coin_seq_len_12"])
     loader_fw     = make_chunked_loader(ds_fw, chunk, cfg["coin_batch"])
-    loader_bw     = make_chunked_loader(ds_bw, chunk, cfg["coin_batch"])
+    #loader_bw     = make_chunked_loader(ds_bw, chunk, cfg["coin_batch"])
     loader_fw_ana = _loader(ds_fw, cfg["coin_batch"])
     loader_bw_ana = _loader(ds_bw, cfg["coin_batch"])
     sample_seq    = next(iter(loader_fw_ana))[0][0]
@@ -659,10 +524,10 @@ def experiment_1_2(cfg, out_root, all_results):
     )
     cleanup()
     cv_bw = train_test_val_pipeline(
-        loader_bw, test_ratio=(0.20, 0.80), n_folds=cfg["n_folds"],
+        loader_fw, test_ratio=(0.20, 0.80), n_folds=cfg["n_folds"],
         embed_type=cfg["embed_type"], num_token=num_token,
         d_model=cfg["d_model"], max_len=max_len,
-        max_epochs=cfg["coin_max_epochs"], lr=cfg["lr"], mode="forward",  # reversed data → forward model
+        max_epochs=cfg["coin_max_epochs"], lr=cfg["lr"], mode="backward",  # forward data → backward model
         save_plot=os.path.join(odir, f"{tag}_bw_cv.png"),
     )
     cleanup()
@@ -671,12 +536,12 @@ def experiment_1_2(cfg, out_root, all_results):
                            num_token, odir, sample_seq, p, q, "forward",
                            k=2, use_t="last", attn_vis_len=cfg["attn_vis_len"])
     cleanup()
-    ana_bw = analyse_model(f"{tag}_bw", cv_bw["best_model"], loader_bw_ana,
+    ana_bw = analyse_model(f"{tag}_bw", cv_bw["best_model"], loader_fw_ana,
                            num_token, odir, sample_seq, p, q, "backward",
                            k=3, use_t="last", attn_vis_len=cfg["attn_vis_len"])  # forward model → last pos
     cleanup()
     compare_fw_bw(tag, cv_fw, cv_bw, ana_fw, ana_bw,
-                  loader_fw_ana, loader_bw_ana, num_token, odir, sample_seq,
+                  loader_fw_ana, loader_fw_ana, num_token, odir, sample_seq,
                   theory, theory, cfg["attn_vis_len"], p, q)
 
     # p-q heatmaps
@@ -802,14 +667,14 @@ def experiment_2(cfg, out_root, all_results):
                            num_token, odir, sample_seq, None, None, "forward",
                            k=n+m, use_t="last", attn_vis_len=cfg["attn_vis_len"])
     cleanup()
-    ana_bw = analyse_model(f"{tag}_bw", cv_bw["best_model"], loader_bw_ana,
+    ana_bw = analyse_model(f"{tag}_bw", cv_bw["best_model"], loader_fw_ana,
                            num_token, odir, sample_seq, None, None, "backward",
                            k=n+m, use_t="last", attn_vis_len=cfg["attn_vis_len"])  # forward model → last pos
     cleanup()
 
     print("\n  -- 2d Comparison --")
     compare_fw_bw(tag, cv_fw, cv_bw, ana_fw, ana_bw,
-                  loader_fw_ana, loader_bw_ana, num_token, odir, sample_seq,
+                  loader_fw_ana, loader_fw_ana, num_token, odir, sample_seq,
                   theory_fw, theory_bw, cfg["attn_vis_len"])
 
     try:
@@ -839,55 +704,20 @@ def experiment_2(cfg, out_root, all_results):
 # MAIN
 # ══════════════════════════════════════════════════════════════════════════
 def main():
-    OUT_ROOT = "results_large"
+    OUT_ROOT = "results"
     mkdir(OUT_ROOT)
     mkdir(os.path.join(OUT_ROOT, "models"))
     all_results = {}
     t_start = time.time()
 
-    # ── Progress log file — survives crashes ─────────────────────────────
-    log_path = os.path.join(OUT_ROOT, "run_log.txt")
-    def _log(msg: str):
-        ts = time.strftime("%H:%M:%S")
-        line = f"[{ts}] {msg}"
-        print(line)
-        with open(log_path, "a") as lf:
-            lf.write(line + "\n")
+    experiment_1  (CFG, OUT_ROOT, all_results)
+    experiment_1_2(CFG, OUT_ROOT, all_results)
+    experiment_2  (CFG, OUT_ROOT, all_results)
 
-    _log(f"Starting main_large.py — results -> {OUT_ROOT}/")
-    _log(f"Config: d_model={CFG['d_model']}  chunk={CFG['train_chunk_len']}  "
-         f"coin_epochs={CFG['coin_max_epochs']}  flower_epochs={CFG['flower_max_epochs']}  "
-         f"pq_grid={len(CFG['pq_grid'])}pts")
-
-    # ── Fault-tolerant loop — each experiment is independent ─────────────
-    # A crash in exp 1.2 (pq grid) will NOT lose exp 1 and exp 2 results.
-    for exp_fn in [experiment_1, experiment_1_2, experiment_2]:
-        name = exp_fn.__name__
-        _log(f"Starting {name} ...")
-        t_exp = time.time()
-        try:
-            exp_fn(CFG, OUT_ROOT, all_results)
-            # Save master dict after every successful experiment
-            save_pkl(all_results, os.path.join(OUT_ROOT, "all_results.pkl"))
-            elapsed = (time.time() - t_exp) / 60
-            _log(f"  {name} DONE in {elapsed:.1f} min")
-        except Exception as exc:
-            import traceback
-            elapsed = (time.time() - t_exp) / 60
-            _log(f"  !! {name} FAILED after {elapsed:.1f} min: {exc}")
-            traceback.print_exc()
-            # Save whatever we have so far
-            save_pkl(all_results,
-                     os.path.join(OUT_ROOT, "all_results_partial.pkl"))
-            _log(f"  Partial results saved. Continuing with next experiment.")
-
-    # ── Final save + summary ──────────────────────────────────────────────
     save_pkl(all_results, os.path.join(OUT_ROOT, "all_results.pkl"))
 
     total = (time.time() - t_start) / 60
-    _log(f"ALL COMPLETE — {total:.1f} min  ({total/60:.2f} hr)")
-
-    print(f"\n{'='*70}\n  Results tree:")
+    print(f"\n{'='*70}\n  ALL COMPLETE — {total:.1f} min")
     for root, dirs, files in os.walk(OUT_ROOT):
         lvl    = root.replace(OUT_ROOT, "").count(os.sep)
         indent = "  " * (lvl + 1)
