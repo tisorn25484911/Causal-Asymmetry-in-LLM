@@ -1,9 +1,26 @@
+import gc
+import os
+import pickle
+import time
 import numpy as np
 import matplotlib.pyplot as plt
 from sklearn.decomposition import PCA
 from sklearn.manifold import TSNE
 import torch
 from sklearn.cluster import KMeans
+from OneHot_model import cross_ent_onehot
+try:
+    import umap as _umap_mod
+    _warmup = _umap_mod.UMAP(n_components=2, n_neighbors=200).fit_transform(
+        np.random.rand(20, 4)
+    )
+    del _warmup
+    UMAP_AVAILABLE = True
+    print("umap-learn JIT warm-up succeeded")
+except Exception as _e:
+    UMAP_AVAILABLE = False
+    print(f"UMAP unavailable ({_e}) — PCA fallback active")
+
 plt.rcParams.update({
     "font.size": 12,
     "axes.titlesize": 16,
@@ -12,10 +29,136 @@ plt.rcParams.update({
     "ytick.labelsize": 12,
     "legend.fontsize": 12
 })
-from OneHot_model import cross_ent_onehot
+"""
+latent analysis:
+    - latent_extraction: extract latents, inputs, targets from a model and dataloader
+    - _project2d: UMAP/PCA 2D projection of latents
+    - UMAP plots: color by token type FW/BW models
+    - attention heatmaps: visualize attention patterns for FW/BW models
 
+Post-train analysis:
+    - perplexity_calculation: compute perplexity on a dataset
+    - statistical_complexity_empirical: estimate complexity via clustering latents
+    - statistical_complexity_compare: compare empirical complexity to theoretical HMM complexity
 
+General purpose plotting:
+    - plot_diff_heatmap
+    - training_loss_plot
+"""
+# ── Helper functions ───────────────────────────────────────────────────────
+#Utilities
+def mkdir(path: str) -> str:
+    os.makedirs(path, exist_ok=True)
+    return path
+def save_pkl(obj, path: str):
+    with open(path, "wb") as f:
+        pickle.dump(obj, f, protocol=4)
+    print(f"  pickle saved -> {path}")
+def _sub(arr: np.ndarray, n: int = 1000) -> tuple:
+    """Return (latent_subset, index_array) — first n rows, no shuffle."""
+    n = min(n, len(arr))
+    return arr[:n], np.arange(n)
+def savefig(fig, path: str, dpi: int = 120):
+    fig.savefig(path, dpi=dpi, bbox_inches="tight")
+    plt.close(fig)
+    print(f"  figure saved -> {path}")
+def save_weights(model, path):
+    torch.save(model.state_dict(), path)
+    print(f"  weights -> {path}")
+    
+#latent analysis:
+def latent_extraction(model, data_loader, max_batches = None):
+    model.eval()
+    latents_all = []
+    inputs_all = []
+    target_all = []
 
+    device = next(model.parameters()).device  # FIX 3: Fixed device access
+
+    with torch.no_grad():
+        for batch_idx, (inputs, targets) in enumerate(data_loader):
+            if max_batches is not None and batch_idx >= max_batches:
+                break
+            inputs = inputs.to(device)  # FIX 3: Changed from model.device()
+            targets = targets.to(device)  # FIX 3: Changed from model.device()
+
+            _ = model(inputs)
+            z = model.last_encodings.detach().cpu().numpy()  # FIX 4: Fixed to numpy directly
+
+            latents_all.append(z)  # FIX 4: Append z directly
+            inputs_all.append(inputs.detach().cpu().numpy())
+            target_all.append(targets.detach().cpu().numpy())
+
+    latents_all = np.concatenate(latents_all, axis = 0)
+    inputs_all = np.concatenate(inputs_all, axis = 0)
+    target_all = np.concatenate(target_all, axis = 0)
+
+    return latents_all, inputs_all, target_all
+def _project2d(flat: np.ndarray, n_neighbors: int = 200) -> tuple:
+    if UMAP_AVAILABLE:
+        try:
+            c = _umap_mod.UMAP(
+                n_components=2, random_state=42,
+                n_neighbors=min(n_neighbors, len(flat) - 1),
+                min_dist=0.1,
+                metric="euclidean",
+            ).fit_transform(flat)
+            return c, "UMAP"
+        except Exception as e:
+            print(f"  UMAP failed ({e}), using PCA")
+    from sklearn.decomposition import PCA
+    return PCA(n_components=2).fit_transform(flat), "PCA"
+def plot_umap(latents, inputs_arr, num_token, title="", save_path=None,
+              xlim=None, ylim=None, n_pts: int = 1000):
+    """
+    Plot 2-D UMAP coloured by token id.
+    n_pts: number of consecutive latent vectors to embed (default 1000).
+    """
+    flat_l = latents.reshape(-1, latents.shape[-1])
+    flat_i = inputs_arr.reshape(-1)
+    sub_l, idx = _sub(flat_l, n_pts)
+    sub_i = flat_i[idx]
+
+    coords, mlbl = _project2d(sub_l)
+    cmap = plt.cm.tab10
+    fig, ax = plt.subplots(figsize=(7, 6))
+    for tok in range(num_token):
+        mask = sub_i == tok
+        if not mask.any():
+            continue
+        ax.scatter(coords[mask, 0], coords[mask, 1],
+                   c=[cmap(tok / max(num_token - 1, 1))],
+                   label=f"Token {tok}", alpha=0.7, s=10)
+    ax.set_title(f"{title} ({mlbl})", fontsize=11, fontweight="bold")
+    ax.legend(fontsize=8, markerscale=3)
+    if xlim:
+        ax.set_xlim(xlim)
+    if ylim:
+        ax.set_ylim(ylim)
+    ax.grid(True, alpha=0.2)
+    if save_path:
+        savefig(fig, save_path)
+    return fig, coords
+def plot_attention_heatmap(model, input_seq):
+    fig, ax = plt.subplots(figsize=(8, 6))
+
+    device = next(model.parameters()).device
+    input_seq = input_seq.unsqueeze(0).to(device)  # (1, T)
+
+    _ = model(input_seq)
+
+    attention = model.last_attention.squeeze(0).cpu().numpy()  # (T, T)
+
+    cax = ax.matshow(attention, cmap='viridis')
+    fig.colorbar(cax)
+
+    ax.set_title("Attention Heatmap")
+    ax.set_xlabel("Key")
+    ax.set_ylabel("Query")
+
+    return fig
+
+#Post-train analysis:
 def perplexity_calculation(model, data_loader, max_batches=None, pad_id=None):
     logits_all  = []
     targets_all = []
@@ -49,8 +192,6 @@ def perplexity_calculation(model, data_loader, max_batches=None, pad_id=None):
 
     loss, perplexity = cross_ent_onehot(logits, targets)
     return perplexity.item()
-
-
 def plot_perplexity(model_fw, model_bw, data_loader, max_batches = None):
     perplexity_fw = perplexity_calculation(model_fw, data_loader, max_batches)
     perplexity_bw = perplexity_calculation(model_bw, data_loader, max_batches)
@@ -80,8 +221,7 @@ def plot_perplexity(model_fw, model_bw, data_loader, max_batches = None):
     plt.grid(True, alpha=0.3, axis='y')
     plt.tight_layout()
     plt.show()
-
-def statistical_complexity(p, q, mode):  # FIX 2: Changed signature from (model, data_loader, p, q, max_batches)
+def statistical_complexity(p, q, mode): 
     # statistical complexity of HMM
     if mode == "forward":
         stead0 = q / (p + q)
@@ -98,15 +238,6 @@ def statistical_complexity(p, q, mode):  # FIX 2: Changed signature from (model,
     for prob in state_prob:
         S += - prob * np.log2(prob + 1e-12)
     return S
-
-def perplexity_theory(p, q, mode):
-    c = statistical_complexity(p, q, mode)
-    return np.exp(c)
-
-def perplexity_empirical(model, data_loader, max_batches=None, use_t="last", k=2):
-    c = statistical_complexity_empirical(model, data_loader, max_batches=max_batches, use_t=use_t, k=k)
-    return np.exp(c)
-
 def statistical_complexity_empirical(model, data_loader, max_batches=None, use_t="last", k=2):
     model.eval()
     latents_all = []
@@ -143,8 +274,6 @@ def statistical_complexity_empirical(model, data_loader, max_batches=None, use_t
 
     S = -np.sum(probs * np.log2(probs + 1e-12))
     return S
-
-
 def statistical_complexity_compare(forward_model, backward_model, data_loader, 
                                   p=0.6, q=0.4, max_batches=None, k_fw=2, k_bw=3):
     print("="*70)
@@ -227,94 +356,19 @@ def statistical_complexity_compare(forward_model, backward_model, data_loader,
     print("="*70)
     return Ss_empirical, Ss_theory
 
-
-
-
-def latent_extraction(model, data_loader, max_batches = None):
-    model.eval()
-    latents_all = []
-    inputs_all = []
-    target_all = []
-
-    device = next(model.parameters()).device  # FIX 3: Fixed device access
-
-    with torch.no_grad():
-        for batch_idx, (inputs, targets) in enumerate(data_loader):
-            if max_batches is not None and batch_idx >= max_batches:
-                break
-            inputs = inputs.to(device)  # FIX 3: Changed from model.device()
-            targets = targets.to(device)  # FIX 3: Changed from model.device()
-
-            _ = model(inputs)
-            z = model.last_encodings.detach().cpu().numpy()  # FIX 4: Fixed to numpy directly
-
-            latents_all.append(z)  # FIX 4: Append z directly
-            inputs_all.append(inputs.detach().cpu().numpy())
-            target_all.append(targets.detach().cpu().numpy())
-
-    latents_all = np.concatenate(latents_all, axis = 0)
-    inputs_all = np.concatenate(inputs_all, axis = 0)
-    target_all = np.concatenate(target_all, axis = 0)
-
-    return latents_all, inputs_all, target_all
-
-def plot_latents_2D(latents, inputs):
-    token_colors = {0: 'red', 1: 'green', 2: 'purple'}
-    latents_flat = latents.reshape(-1, latents.shape[-1])
-
-    print("Performing PCA and tSNE...")
-    pca = PCA(n_components = 2)
-    latents_2D = pca.fit_transform(latents.reshape(-1, latents.shape[-1])) #(N*T, 2)
-
-    if latents_flat.shape[0] > 5000:
-        subset_idx = np.random.choice(latents_flat.shape[0], 5000, replace=False)
-        tsne = TSNE(n_components=2, random_state=42, perplexity=30, max_iter=1000)
-        latents_tsne = tsne.fit_transform(latents_flat[subset_idx])
-    else:
-        tsne = TSNE(n_components=2, random_state=42, perplexity=30, max_iter=1000)
-        latents_tsne = tsne.fit_transform(latents_flat)
-        subset_idx = np.arange(latents_flat.shape[0])
-
-    fig, axes = plt.subplots(1, 2, figsize = (12, 6))
-    
-    for token in [0, 1, 2]:
-        mask = inputs.reshape(-1) == token
-        axes[0].scatter(latents_2D[mask, 0], latents_2D[mask, 1], 
-                        c = token_colors[token], label = f'Token {token}', 
-                        alpha = 0.3, s = 5)
-    axes[0].set_title("PCA of Latent Representations")
-    axes[0].legend()
-
-    for token in [0, 1, 2]:
-        mask = inputs.reshape(-1) == token
-        axes[1].scatter(latents_tsne[mask, 0], latents_tsne[mask, 1], 
-                        c = token_colors[token], label = f'Token {token}', 
-                        alpha = 0.3, s = 5)
-    axes[1].set_title("t-SNE of Latent Representations")
-    axes[1].legend()
-
+#General purpose plotting:
+def plot_diff_heatmap(Z, p_vals, q_vals, title, cbar_label, save_path=None, cmap="RdBu_r"):
+    fig, ax = plt.subplots(figsize=(7, 6))
+    ext = [float(np.min(q_vals)), float(np.max(q_vals)),
+           float(np.min(p_vals)), float(np.max(p_vals))]
+    im = ax.imshow(Z, origin="lower", extent=ext, cmap=cmap, aspect="auto")
+    Qm, Pm = np.meshgrid(q_vals, p_vals)
+    ax.contour(Qm, Pm, Z, levels=8, colors="white", alpha=0.4, linewidths=0.8)
+    fig.colorbar(im, ax=ax, label=cbar_label)
+    ax.set_xlabel("q", fontsize=12); ax.set_ylabel("p", fontsize=12)
+    ax.set_title(title, fontsize=13, fontweight="bold")
+    if save_path: savefig(fig, save_path)
     return fig
-
-def plot_attention_heatmap(model, input_seq):
-    fig, ax = plt.subplots(figsize=(8, 6))
-
-    device = next(model.parameters()).device
-    input_seq = input_seq.unsqueeze(0).to(device)  # (1, T)
-
-    _ = model(input_seq)
-
-    attention = model.last_attention.squeeze(0).cpu().numpy()  # (T, T)
-
-    cax = ax.matshow(attention, cmap='viridis')
-    fig.colorbar(cax)
-
-    ax.set_title("Attention Heatmap")
-    ax.set_xlabel("Key")
-    ax.set_ylabel("Query")
-
-    return fig
-
-
 def training_loss_plot(recorder):
     fig, ax = plt.subplots(figsize=(40, 6))
     ax.plot(recorder.epoch_loss, label='Training Loss')
@@ -324,8 +378,8 @@ def training_loss_plot(recorder):
     ax.legend()
     return fig
     
-import numpy as np
-import matplotlib.pyplot as plt
+#Standard Analysis functions:   
+
 
 def FW_BW_attention_comparison(model_fw, model_bw, input_seq, title_prefix=""):
     """
