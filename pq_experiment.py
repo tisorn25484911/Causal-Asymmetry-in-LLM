@@ -1,4 +1,4 @@
-from Data_generation import coin_generation
+from Data_generation import coin_generation, Rev_HMM_generation, flower_process_generation
 from Data_generation import make_loader
 from Training_model import train_model
 from Model_analysis import (
@@ -360,3 +360,128 @@ if __name__ == "__main__":
         print("  Results saved to complexity_heatmap.png")
     else:
         print("\nExperiment cancelled.")
+
+
+# ══════════════════════════════════════════════════════════════════════════
+# pq_experiment_full — returns BOTH statistical complexity AND true PPL
+# ══════════════════════════════════════════════════════════════════════════
+def pq_experiment_full(
+    num_token=3,
+    d_model=20,
+    max_len=100,
+    batch_size=32,
+    num_samples=2000,
+    max_epochs=20,
+    lr=1e-2,
+    p_values=None,
+    q_values=None,
+    max_batches_for_empirical=10,
+):
+    """
+    Identical training loop to pq_experiment, but ALSO computes true
+    model perplexity = exp(CE_loss) via _eval_loss_on_loader at each (p,q).
+
+    Statistical complexity uses k-means on latent representations and is
+    NOT the same as perplexity.  exp(Ss_emp) was incorrect for PPL plots.
+
+    Returns
+    -------
+    Ss_emp   : np.ndarray, shape (2, P, Q)  — empirical statistical complexity
+    Ppl_emp  : np.ndarray, shape (2, P, Q)  — true perplexity  exp(CE_loss)
+    p_values : np.ndarray
+    q_values : np.ndarray
+    """
+    from Training_model import _eval_loss_on_loader
+
+    if p_values is None:
+        p_values = [0.05, 0.15, 0.25, 0.35, 0.45, 0.55, 0.65, 0.75, 0.85, 0.95]
+    if q_values is None:
+        q_values = [0.05, 0.15, 0.25, 0.35, 0.45, 0.55, 0.65, 0.75, 0.85, 0.95]
+
+    p_values = np.array(p_values, dtype=float)
+    q_values = np.array(q_values, dtype=float)
+
+    Ss_emp_FW  = np.zeros((len(p_values), len(q_values)), dtype=float)
+    Ss_emp_BW  = np.zeros((len(p_values), len(q_values)), dtype=float)
+    Ppl_emp_FW = np.zeros((len(p_values), len(q_values)), dtype=float)
+    Ppl_emp_BW = np.zeros((len(p_values), len(q_values)), dtype=float)
+
+    total = len(p_values) * len(q_values)
+
+    for i, p in enumerate(p_values):
+        for j, q in enumerate(q_values):
+            idx = i * len(q_values) + j + 1
+            print(f"\n{'='*70}")
+            print(f"  [{idx}/{total}]  p={p:.2f}  q={q:.2f}")
+            print(f"{'='*70}")
+
+            data, states = coin_generation(num_samples=num_samples, seq_len=max_len, p=p, q=q)
+
+            train_loader = make_loader(
+                data,
+                states,
+                batch_size=batch_size,
+                mode="forward"
+            )
+
+            # ── Train both directions ─────────────────────────────────────
+            print("  [1/2] Forward model ...")
+            rec_fw = train_model(
+                train_loader,
+                num_token=num_token,
+                d_model=d_model,
+                max_len=max_len,
+                max_epochs=max_epochs,
+                lr=lr,
+                mode="forward",
+            )
+
+            print("  [2/2] Backward model ...")
+            rec_bw = train_model(
+                train_loader,
+                num_token=num_token,
+                d_model=d_model,
+                max_len=max_len,
+                max_epochs=max_epochs,
+                lr=lr,
+                mode="backward",
+            )
+
+            # ── Statistical complexity (k-means on latents) ───────────────
+            S_fw = statistical_complexity_empirical(
+                rec_fw.model, train_loader,
+                max_batches=max_batches_for_empirical, use_t="last",  k=2,
+            )
+            S_bw = statistical_complexity_empirical(
+                rec_bw.model, train_loader,
+                max_batches=max_batches_for_empirical, use_t="first", k=3,
+            )
+            Ss_emp_FW[i, j] = S_fw
+            Ss_emp_BW[i, j] = S_bw
+
+            # ── True perplexity = exp(CE loss) on training distribution ───
+            # Move models to CPU before evaluation to avoid MPS race
+            rec_fw.model.cpu()
+            rec_bw.model.cpu()
+
+            ce_fw, ppl_fw = _eval_loss_on_loader(rec_fw.model, train_loader)
+            ce_bw, ppl_bw = _eval_loss_on_loader(rec_bw.model, train_loader)
+            Ppl_emp_FW[i, j] = ppl_fw
+            Ppl_emp_BW[i, j] = ppl_bw
+
+            print(f"  S_emp  FW={S_fw:.4f}  BW={S_bw:.4f} bits")
+            print(f"  PPL    FW={ppl_fw:.4f}  BW={ppl_bw:.4f}")
+            print(f"  CE     FW={ce_fw:.4f}  BW={ce_bw:.4f} bits")
+
+    Ss_emp  = np.stack([Ss_emp_FW,  Ss_emp_BW],  axis=0)
+    Ppl_emp = np.stack([Ppl_emp_FW, Ppl_emp_BW], axis=0)
+
+    print("\n" + "=" * 70)
+    print("EXPERIMENT COMPLETE")
+    print("=" * 70)
+    print(f"FW  complexity: [{Ss_emp_FW.min():.3f}, {Ss_emp_FW.max():.3f}]")
+    print(f"BW  complexity: [{Ss_emp_BW.min():.3f}, {Ss_emp_BW.max():.3f}]")
+    print(f"FW  PPL:        [{Ppl_emp_FW.min():.3f}, {Ppl_emp_FW.max():.3f}]")
+    print(f"BW  PPL:        [{Ppl_emp_BW.min():.3f}, {Ppl_emp_BW.max():.3f}]")
+
+    return Ss_emp, Ppl_emp, p_values, q_values
