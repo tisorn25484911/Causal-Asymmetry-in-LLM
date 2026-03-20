@@ -2,12 +2,49 @@ import math
 import lightning as L
 from OneHot_model import OneHotDecoder, WordEmbDecoder, cross_ent_onehot
 import torch
+import torch.utils.data as tud
+import numpy as np
 
 """
 # dataloader: number of samples (5000), each loader includes (input, target) pair
 # input:  (B, T) token indices in [0, V-1]
 # target: (B, T) token indices in [0, V-1]
 """
+# ─────────────────────────────────────────────────────────────────────────────
+# class and functions for large training sequence
+# ────────────────────────────────────────────────────────────────────────────
+class ChunckDataset(tud.Dataset):
+    def __init__(self, base: tud.Dataset, chunck_len: int, seed: int = 0):
+        self.base = base
+        self.chunck_len = chunck_len
+        self.rng = np.random.default_rng(seed)
+    def __len__(self):
+        return len(self.base)
+    def __getitem__(self, idx):
+        input, target = self.base[idx] #(T, )
+        T = input.shape[0] # length T of the sequence
+        if T <= self.chunck_len:
+            return input, target
+        start = self.rng.integers(0, T - self.chunck_len +1)
+        end = start + self.chunck_len
+        return input[start:end], target[start:end]
+    
+def make_chunked_loader(
+    dataset: tud.Dataset, chunk_len: int, batch_size: int, shuffle: bool = True
+) -> tud.DataLoader:
+    return tud.DataLoader(
+        ChunckDataset(dataset, chunk_len),
+        batch_size=batch_size,
+        shuffle=shuffle,
+        num_workers=0,             
+        persistent_workers=False,  
+    )
+def _loader(dataset: tud.Dataset, batch_size: int, shuffle: bool = False) -> tud.DataLoader:
+    """Plain loader — FIX-3 only (no chunking; used for analysis)."""
+    return tud.DataLoader(
+        dataset, batch_size=batch_size,
+        shuffle=shuffle, num_workers=0, persistent_workers=False,
+    )
 
 # ─────────────────────────────────────────────────────────────────────────────
 # Helper: evaluate a (possibly mid-training) model on a DataLoader
@@ -161,17 +198,17 @@ def train_model(
     lr:        float = 1e-2,
     mode:      str   = "forward",
     embed_type: str  = "onehot",
-    val_loader       = None,        # ← NEW: if provided, val loss recorded per step
+    val_loader       = None, 
 ):
     """
     Trains a OneHotDecoder / WordEmbDecoder and returns a Record_training object.
 
-    recorder.model       – trained model
-    recorder.step_loss   – training loss per gradient step
-    recorder.step_ppl    – training perplexity per gradient step
-    recorder.step_val_loss – validation loss per gradient step (if val_loader given)
-    recorder.step_val_ppl  – validation perplexity per gradient step (if val_loader given)
-    recorder.epoch_loss  – epoch-averaged training loss
+    recorder.model          - trained model
+    recorder.step_loss      - training loss per gradient step
+    recorder.step_ppl       - training perplexity per gradient step
+    recorder.step_val_loss  - validation loss per gradient step (if val_loader given)
+    recorder.step_val_ppl   - validation perplexity per gradient step (if val_loader given)
+    recorder.epoch_loss     - epoch-averaged training loss
     """
     if embed_type == "onehot":
         model = OneHotDecoder(
@@ -249,7 +286,7 @@ def train_test_val_pipeline(
     embed_type:  str   = "onehot",
     num_token:   int   = 3,
     d_model:     int   = 20,
-    max_len:     int   = 15,
+    max_len:     int   = 1000,
     max_epochs:  int   = 5,
     lr:          float = 1e-2,
     mode:        str   = "forward",
@@ -261,15 +298,15 @@ def train_test_val_pipeline(
     Returns
     -------
     dict with keys:
-        best_fold      – 0-based index of the winning fold
-        best_recorder  – Record_training from the best fold
-        best_model     – trained model from the best fold
-        fold_val_loss  – list[float]: mean val loss per fold
-        fold_val_ppl   – list[float]: mean val perplexity per fold
-        fold_test_ppl  – list[float]: test PPL for *every* fold model (NEW)
-        test_loss      – float: test CE loss for the best-fold model
-        test_ppl       – float: test perplexity for the best-fold model
-        all_recorders  – list of all fold recorders
+        best_fold      - 0-based index of the winning fold
+        best_recorder  - Record_training from the best fold
+        best_model     - trained model from the best fold
+        fold_val_loss  - list[float]: mean val loss per fold
+        fold_val_ppl   - list[float]: mean val perplexity per fold
+        fold_test_ppl  - list[float]: test PPL for *every* fold model (NEW)
+        test_loss      - float: test CE loss for the best-fold model
+        test_ppl       - float: test perplexity for the best-fold model
+        all_recorders  - list of all fold recorders
     """
     import matplotlib
     matplotlib.use("Agg")
