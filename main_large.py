@@ -145,7 +145,7 @@ CFG = dict(
     coin_seq_len_12     = 500,
     # ── flower exp 2 ───────────────────────────────────────────────────
     # 1500 samples × 60 epochs × 5 folds × 2 directions ≈ 2 hr
-    flower_n           = 4,  flower_m        = 2,
+    flower_n           = 6,  flower_m        = 4,
     flower_num_samples = 1500,
     flower_seq_len     = 2000,
     flower_max_epochs  = 60,
@@ -293,18 +293,13 @@ def analyse_model(tag, model, loader, num_token, out_dir,
         except Exception as e:
             print(f"  attn failed: {e}")
 
-    # UMAP — slice max-context position before projecting
-    #   forward  mode: last  position (full past context)
-    #   backward mode: first position (full future context)
-    # All positions flattened together mixes high/low context latents,
-    # producing smeared elongated shapes rather than tight clusters.
     try:
         latents, inp_arr, _ = latent_extraction(model, loader, max_batches=20)
-        is_bw = (getattr(model, "mode", "forward") == "backward")
-        lat_slice = latents[:,  0, :]
-        inp_slice = inp_arr[:, 0]
-        lat_for_plot = lat_slice[:, np.newaxis, :]   # (N,1,D) for plot_umap
-        inp_for_plot = inp_slice[:, np.newaxis]       # (N,1)
+        #is_bw = (getattr(model, "mode", "forward") == "backward")
+        lat_slice = latents.reshape(-1, latents.shape[-1])
+        inp_slice = inp_arr.reshape(-1)
+        lat_for_plot = lat_slice
+        inp_for_plot = inp_slice
         _, coords = plot_umap(lat_for_plot, inp_for_plot, num_token, title=tag,
                               save_path=os.path.join(out_dir, f"{tag}_umap.png"))
         res.update({"latents": latents, "inputs_arr": inp_arr, "umap_coords": coords})
@@ -418,7 +413,7 @@ def compare_fw_bw(tag, cv_fw, cv_bw, ana_fw, ana_bw, loader_fw, loader_bw, num_t
 
 
 # ══════════════════════════════════════════════════════════════════════════
-# EXPERIMENT 1 — Coin HMM  p=0.3, q=0.4
+# EXPERIMENT 1 — Coin HMM  p=0.4, q=0.8
 # ══════════════════════════════════════════════════════════════════════════
 def experiment_1(cfg, out_root, all_results):
     tag  = "exp1_coin_p03_q04"
@@ -429,18 +424,16 @@ def experiment_1(cfg, out_root, all_results):
 
     data, states = coin_generation(
         num_samples=cfg["coin_num_samples"], seq_len=cfg["coin_seq_len"], p=p, q=q)
-    data_rev, states_rev = Rev_HMM_generation(data, states)
-
+    #data_rev, states_rev = Rev_HMM_generation(data, states)
     chunk     = cfg["train_chunk_len"]
     num_token = cfg["coin_num_token"]
-
     ds_fw = CoinDataset(data,     seq_len=cfg["coin_seq_len"])
-    ds_bw = CoinDataset(data_rev, seq_len=cfg["coin_seq_len"])
+    #ds_bw = CoinDataset(data_rev, seq_len=cfg["coin_seq_len"])
     loader_fw     = make_chunked_loader(ds_fw, chunk, cfg["coin_batch"])
-    loader_bw     = make_chunked_loader(ds_bw, chunk, cfg["coin_batch"])
+    #loader_bw     = make_chunked_loader(ds_bw, chunk, cfg["coin_batch"])
     loader_fw_ana = _loader(ds_fw, cfg["coin_batch"])
-    loader_bw_ana = _loader(ds_bw, cfg["coin_batch"])
-    sample_seq    = next(iter(loader_fw_ana))[0][0]
+    #loader_bw_ana = _loader(ds_bw, cfg["coin_batch"])
+    sample_seq    = next(iter(loader_fw))[0][0]
 
     max_len = chunk
     theory  = entropy_rate_coin(p, q)
@@ -467,18 +460,18 @@ def experiment_1(cfg, out_root, all_results):
     cleanup()  # FIX-4
 
     print("\n  -- 1c Analysis --")
-    ana_fw = analyse_model(f"{tag}_fw", cv_fw["best_model"], loader_fw_ana,
+    ana_fw = analyse_model(f"{tag}_fw", cv_fw["best_model"], loader_fw,
                            num_token, odir, sample_seq, p, q, "forward",
                            k=2, use_t="last", attn_vis_len=cfg["attn_vis_len"])
     cleanup()  # GC between fw and bw analysis (model already moved to CPU)
-    ana_bw = analyse_model(f"{tag}_bw", cv_bw["best_model"], loader_fw_ana,
+    ana_bw = analyse_model(f"{tag}_bw", cv_bw["best_model"], loader_fw,
                            num_token, odir, sample_seq, p, q, "backward",
                            k=3, use_t="last", attn_vis_len=cfg["attn_vis_len"])  # forward model → last pos
     cleanup()
 
     print("\n  -- 1d Comparison --")
     compare_fw_bw(tag, cv_fw, cv_bw, ana_fw, ana_bw,
-                  loader_fw_ana, loader_fw_ana, num_token, odir, sample_seq,
+                  loader_fw, loader_fw, num_token, odir, sample_seq,
                   theory, theory, cfg["attn_vis_len"], p, q)
 
     print(f"\n  Exp 1 done in {(time.time()-t0)/60:.1f} min")
@@ -503,18 +496,18 @@ def experiment_1_2(cfg, out_root, all_results):
 
     data, states = coin_generation(
         num_samples=cfg["coin_num_samples_12"], seq_len=cfg["coin_seq_len_12"], p=p, q=q)
-    data_rev, _ = Rev_HMM_generation(data, states)
+    #data_rev, _ = Rev_HMM_generation(data, states)
 
     chunk     = min(cfg["train_chunk_len"], cfg["coin_seq_len_12"] - 1)
     num_token = cfg["coin_num_token"]
 
     ds_fw = CoinDataset(data,     seq_len=cfg["coin_seq_len_12"])
-    ds_bw = CoinDataset(data_rev, seq_len=cfg["coin_seq_len_12"])
+    #ds_bw = CoinDataset(data_rev, seq_len=cfg["coin_seq_len_12"])
     loader_fw     = make_chunked_loader(ds_fw, chunk, cfg["coin_batch"])
     #loader_bw     = make_chunked_loader(ds_bw, chunk, cfg["coin_batch"])
     loader_fw_ana = _loader(ds_fw, cfg["coin_batch"])
-    loader_bw_ana = _loader(ds_bw, cfg["coin_batch"])
-    sample_seq    = next(iter(loader_fw_ana))[0][0]
+    #loader_bw_ana = _loader(ds_bw, cfg["coin_batch"])
+    sample_seq    = next(iter(loader_fw))[0][0]
 
     max_len = chunk
     theory  = entropy_rate_coin(p, q)
@@ -537,16 +530,16 @@ def experiment_1_2(cfg, out_root, all_results):
     )
     cleanup()
 
-    ana_fw = analyse_model(f"{tag}_fw", cv_fw["best_model"], loader_fw_ana,
+    ana_fw = analyse_model(f"{tag}_fw", cv_fw["best_model"], loader_fw,
                            num_token, odir, sample_seq, p, q, "forward",
                            k=2, use_t="last", attn_vis_len=cfg["attn_vis_len"])
     cleanup()
-    ana_bw = analyse_model(f"{tag}_bw", cv_bw["best_model"], loader_fw_ana,
+    ana_bw = analyse_model(f"{tag}_bw", cv_bw["best_model"], loader_fw,
                            num_token, odir, sample_seq, p, q, "backward",
                            k=3, use_t="last", attn_vis_len=cfg["attn_vis_len"])  # forward model → last pos
     cleanup()
     compare_fw_bw(tag, cv_fw, cv_bw, ana_fw, ana_bw,
-                  loader_fw_ana, loader_fw_ana, num_token, odir, sample_seq,
+                  loader_fw, loader_fw, num_token, odir, sample_seq,
                   theory, theory, cfg["attn_vis_len"], p, q)
 
     # p-q heatmaps
@@ -579,8 +572,9 @@ def experiment_1_2(cfg, out_root, all_results):
     # Ppl_emp[0] = FW perplexity, Ppl_emp[1] = BW perplexity
     # Both computed as exp(CE_loss) from _eval_loss_on_loader
     plot_diff_heatmap(Ppl_emp[0] - Ppl_emp[1], p_emp, q_emp,
-                      "Empirical Perplexity Diff (FW-BW)  [exp(CE_loss)]", "dPPL",
-                      save_path=os.path.join(odir, f"{tag}_diff_ppl.png"))
+                        "Perplexity Diff (FW - BW)  [exp(CE loss)]", "ΔPPL",
+                        save_path=os.path.join(odir, f"{tag}_diff_ppl.png"),
+                        vcenter=0)
 
     if "exp1_coin_p03_q04" in all_results:
         p1, q1 = cfg["coin_p1"], cfg["coin_q1"]
@@ -641,7 +635,7 @@ def experiment_2(cfg, out_root, all_results):
     loader_bw     = make_chunked_loader(ds_bw, chunk, cfg["flower_batch"])
     loader_fw_ana = _loader(ds_fw, cfg["flower_batch"])
     loader_bw_ana = _loader(ds_bw, cfg["flower_batch"])
-    sample_seq    = next(iter(loader_fw_ana))[0][0]
+    sample_seq    = next(iter(loader_fw))[0][0]
 
     max_len   = chunk
     theory_fw = float("nan")
@@ -659,27 +653,27 @@ def experiment_2(cfg, out_root, all_results):
 
     print("\n  -- 2b Backward CV --")
     cv_bw = train_test_val_pipeline(
-        loader_bw, test_ratio=(0.20, 0.80), n_folds=cfg["n_folds"],
+        loader_fw, test_ratio=(0.20, 0.80), n_folds=cfg["n_folds"],
         embed_type=cfg["embed_type"], num_token=num_token,
         d_model=cfg["d_model"], max_len=max_len,
-        max_epochs=cfg["flower_max_epochs"], lr=cfg["lr"], mode="forward",  # reversed data → forward model
+        max_epochs=cfg["flower_max_epochs"], lr=cfg["lr"], mode="backward",  # reversed data → forward model
         save_plot=os.path.join(odir, f"{tag}_bw_cv.png"),
     )
     cleanup()
 
     print("\n  -- 2c Analysis --")
-    ana_fw = analyse_model(f"{tag}_fw", cv_fw["best_model"], loader_fw_ana,
+    ana_fw = analyse_model(f"{tag}_fw", cv_fw["best_model"], loader_fw,
                            num_token, odir, sample_seq, None, None, "forward",
                            k=n+m, use_t="last", attn_vis_len=cfg["attn_vis_len"])
     cleanup()
-    ana_bw = analyse_model(f"{tag}_bw", cv_bw["best_model"], loader_fw_ana,
+    ana_bw = analyse_model(f"{tag}_bw", cv_bw["best_model"], loader_fw,
                            num_token, odir, sample_seq, None, None, "backward",
                            k=n+m, use_t="last", attn_vis_len=cfg["attn_vis_len"])  # forward model → last pos
     cleanup()
 
     print("\n  -- 2d Comparison --")
     compare_fw_bw(tag, cv_fw, cv_bw, ana_fw, ana_bw,
-                  loader_fw_ana, loader_fw_ana, num_token, odir, sample_seq,
+                  loader_fw, loader_fw, num_token, odir, sample_seq,
                   theory_fw, theory_bw, cfg["attn_vis_len"])
 
     try:
