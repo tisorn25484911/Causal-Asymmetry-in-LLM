@@ -121,43 +121,43 @@ except Exception as _e:
 # ══════════════════════════════════════════════════════════════════════════
 CFG = dict(
     # ── model ──────────────────────────────────────────────────────────
-    d_model          = 64,       # doubled capacity vs small run
+    d_model          = 64,
     embed_type       = "onehot",
     n_folds          = 5,
-    lr               = 5e-3,     # smoother convergence near H∞
+    lr               = 5e-3,
     # ── sequence chunking ──────────────────────────────────────────────
-    train_chunk_len  = 512,      # 2× context window
+    train_chunk_len  = 512,
     attn_vis_len     = 128,
     umap_n_neighbors = 200,
     umap_n_pts       = 1000,
     # ── coin exp 1 ─────────────────────────────────────────────────────
-    # 1500 samples × 60 epochs × 5 folds × 2 directions ≈ 1.5 hr
+    # 2000 samples × 80 epochs × 5 folds × 2 directions ≈ 2.5 hr
     coin_p1          = 0.3,  coin_q1      = 0.4,
-    coin_num_samples = 1500,     # was 500 → 3× more data
+    coin_num_samples = 2000,
     coin_seq_len     = 2000,
-    coin_max_epochs  = 60,       # was 10 → enough to plateau at H∞
+    coin_max_epochs  = 80,
     coin_batch       = 64,
     coin_num_token   = 3,
     # ── coin exp 1.2 ───────────────────────────────────────────────────
-    # CV same cost as exp 1 (~1 hr) + pq grid (~3.5 hr) = ~4.5 hr total
-    coin_p2             = 0.1,  coin_q2         = 0.9,
-    coin_num_samples_12 = 1500,
+    # CV (~2 hr) + pq grid (~8 hr) = ~10 hr total
+    coin_p2             = 0.4,  coin_q2         = 0.8,
+    coin_num_samples_12 = 2000,
     coin_seq_len_12     = 500,
     # ── flower exp 2 ───────────────────────────────────────────────────
-    # 1500 samples × 60 epochs × 5 folds × 2 directions ≈ 2 hr
+    # n=6, m=4 → vocab=10, forward causal states=7, backward=5
+    # 2000 samples × 80 epochs × 5 folds × 2 directions ≈ 3.5 hr
     flower_n           = 6,  flower_m        = 4,
-    flower_num_samples = 1500,
+    flower_num_samples = 2000,
     flower_seq_len     = 2000,
-    flower_max_epochs  = 60,
+    flower_max_epochs  = 80,
     flower_batch       = 64,
     # ── pq heatmap ─────────────────────────────────────────────────────
-    # 2 × 12 × 12 = 288 models × 20 epochs ≈ 3.5 hr
-    # 12 pts gives good contour resolution without blowing the budget
-    pq_grid   = [0.05, 0.15, 0.22, 0.30, 0.38, 0.45,
-                 0.55, 0.62, 0.70, 0.78, 0.85, 0.95],
-    pq_epochs  = 20,
-    pq_samples = 800,
-    pq_len     = 300,
+    # 2 × 16 × 16 = 512 models × 25 epochs ≈ 8 hr
+    pq_grid   = [0.05, 0.10, 0.17, 0.23, 0.30, 0.37, 0.43, 0.50,
+                 0.57, 0.63, 0.70, 0.77, 0.83, 0.90, 0.95, 0.99],
+    pq_epochs  = 25,
+    pq_samples = 1000,
+    pq_len     = 400,
 )
 # ══════════════════════════════════════════════════════════════════════════
 #  safe cleanup + CPU-offload for analysis
@@ -488,7 +488,7 @@ def experiment_1(cfg, out_root, all_results):
 # EXPERIMENT 1.2 — Coin HMM  p=0.1, q=0.9  + heatmaps
 # ══════════════════════════════════════════════════════════════════════════
 def experiment_1_2(cfg, out_root, all_results):
-    tag  = "exp1_2_coin_p01_q09"
+    tag  = "exp1_2_coin_p04_q08"
     odir = mkdir(os.path.join(out_root, tag))
     p, q = cfg["coin_p2"], cfg["coin_q2"]
     t0   = time.time()
@@ -609,7 +609,7 @@ def experiment_1_2(cfg, out_root, all_results):
 # EXPERIMENT 2 — Flower HMM  n=4, m=2
 # ══════════════════════════════════════════════════════════════════════════
 def experiment_2(cfg, out_root, all_results):
-    tag       = "exp2_flower_n4_m2"
+    tag       = f"exp2_flower_n{cfg['flower_n']}_m{cfg['flower_m']}"
     odir      = mkdir(os.path.join(out_root, tag))
     n, m      = cfg["flower_n"], cfg["flower_m"]
     num_token = n + m
