@@ -559,8 +559,9 @@ def experiment_1_2(cfg, out_root, all_results):
     # Ppl_emp[0] = FW perplexity, Ppl_emp[1] = BW perplexity
     # Both computed as exp(CE_loss) from _eval_loss_on_loader
     plot_diff_heatmap(Ppl_emp[0] - Ppl_emp[1], p_emp, q_emp,
-                      "Empirical Perplexity Diff (FW-BW)  [exp(CE_loss)]", "dPPL",
-                      save_path=os.path.join(odir, f"{tag}_diff_ppl.png"))
+                        "Perplexity Diff (FW - BW)  [exp(CE loss)]", "ΔPPL",
+                        save_path=os.path.join(odir, f"{tag}_diff_ppl.png"),
+                        vcenter=0)
 
     if "exp1_coin_p03_q04" in all_results:
         p1, q1 = cfg["coin_p1"], cfg["coin_q1"]

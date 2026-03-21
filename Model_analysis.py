@@ -9,6 +9,7 @@ from sklearn.manifold import TSNE
 import torch
 from sklearn.cluster import KMeans
 from OneHot_model import cross_ent_onehot
+from matplotlib.colors import TwoSlopeNorm
 try:
     import umap as _umap_mod
     _warmup = _umap_mod.UMAP(n_components=2, n_neighbors=200).fit_transform(
@@ -65,7 +66,7 @@ def savefig(fig, path: str, dpi: int = 120):
 def save_weights(model, path):
     torch.save(model.state_dict(), path)
     print(f"  weights -> {path}")
-    
+
 #latent analysis:
 def latent_extraction(model, data_loader, max_batches = None):
     model.eval()
@@ -357,11 +358,20 @@ def statistical_complexity_compare(forward_model, backward_model, data_loader,
     return Ss_empirical, Ss_theory
 
 #General purpose plotting:
-def plot_diff_heatmap(Z, p_vals, q_vals, title, cbar_label, save_path=None, cmap="RdBu_r"):
+def plot_diff_heatmap(Z, p_vals, q_vals, title, cbar_label, save_path=None, cmap="RdBu_r", vcenter=None):
     fig, ax = plt.subplots(figsize=(7, 6))
     ext = [float(np.min(q_vals)), float(np.max(q_vals)),
            float(np.min(p_vals)), float(np.max(p_vals))]
-    im = ax.imshow(Z, origin="lower", extent=ext, cmap=cmap, aspect="auto")
+    if vcenter is not None:                                            # ← added block
+        vmin = float(np.nanmin(Z))
+        vmax = float(np.nanmax(Z))
+        vmin = min(vmin, vcenter - 1e-6)   # guard: vmin < vcenter < vmax
+        vmax = max(vmax, vcenter + 1e-6)
+        norm = TwoSlopeNorm(vmin=vmin, vcenter=vcenter, vmax=vmax)
+        im = ax.imshow(Z, origin="lower", extent=ext,
+                       cmap=cmap, norm=norm, aspect="auto")
+    else:
+        im = ax.imshow(Z, origin="lower", extent=ext, cmap=cmap, aspect="auto")
     Qm, Pm = np.meshgrid(q_vals, p_vals)
     ax.contour(Qm, Pm, Z, levels=8, colors="white", alpha=0.4, linewidths=0.8)
     fig.colorbar(im, ax=ax, label=cbar_label)
