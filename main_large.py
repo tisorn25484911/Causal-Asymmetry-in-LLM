@@ -121,38 +121,43 @@ except Exception as _e:
 # ══════════════════════════════════════════════════════════════════════════
 CFG = dict(
     # ── model ──────────────────────────────────────────────────────────
-    d_model          = 64,       # was 32  → richer latent space, cleaner UMAP clusters
+    d_model          = 64,       # doubled capacity vs small run
     embed_type       = "onehot",
     n_folds          = 5,
-    lr               = 5e-3,     # was 1e-2 → slower, more stable convergence near H∞
+    lr               = 5e-3,     # smoother convergence near H∞
     # ── sequence chunking ──────────────────────────────────────────────
-    train_chunk_len  = 512,      # was 256 → sees longer dependencies per step
-    attn_vis_len     = 128,      # was 64
+    train_chunk_len  = 512,      # 2× context window
+    attn_vis_len     = 128,
     umap_n_neighbors = 200,
     umap_n_pts       = 1000,
     # ── coin exp 1 ─────────────────────────────────────────────────────
+    # 1500 samples × 60 epochs × 5 folds × 2 directions ≈ 1.5 hr
     coin_p1          = 0.3,  coin_q1      = 0.4,
-    coin_num_samples = 2000,     # was 500  → 4× more data, stable CV folds
+    coin_num_samples = 1500,     # was 500 → 3× more data
     coin_seq_len     = 2000,
-    coin_max_epochs  = 80,       # was 10   → loss fully converges to H∞
-    coin_batch       = 64,       # was 32   → smoother gradient estimates
+    coin_max_epochs  = 60,       # was 10 → enough to plateau at H∞
+    coin_batch       = 64,
     coin_num_token   = 3,
     # ── coin exp 1.2 ───────────────────────────────────────────────────
+    # CV same cost as exp 1 (~1 hr) + pq grid (~3.5 hr) = ~4.5 hr total
     coin_p2             = 0.1,  coin_q2         = 0.9,
-    coin_num_samples_12 = 2000,  # was 500
+    coin_num_samples_12 = 1500,
     coin_seq_len_12     = 500,
     # ── flower exp 2 ───────────────────────────────────────────────────
+    # 1500 samples × 60 epochs × 5 folds × 2 directions ≈ 2 hr
     flower_n           = 4,  flower_m        = 2,
-    flower_num_samples = 2000,   # was 500
+    flower_num_samples = 1500,
     flower_seq_len     = 2000,
-    flower_max_epochs  = 80,     # was 10
-    flower_batch       = 64,     # was 32
+    flower_max_epochs  = 60,
+    flower_batch       = 64,
     # ── pq heatmap ─────────────────────────────────────────────────────
-    pq_grid   = [0.05, 0.10, 0.15, 0.20, 0.25, 0.30, 0.35, 0.40, 0.45,
-                 0.50, 0.55, 0.60, 0.65, 0.70, 0.75, 0.80, 0.85, 0.90, 0.95],
-    pq_epochs  = 30,             # was 5
-    pq_samples = 1000,           # was 500
-    pq_len     = 400,            # was 200
+    # 2 × 12 × 12 = 288 models × 20 epochs ≈ 3.5 hr
+    # 12 pts gives good contour resolution without blowing the budget
+    pq_grid   = [0.05, 0.15, 0.22, 0.30, 0.38, 0.45,
+                 0.55, 0.62, 0.70, 0.78, 0.85, 0.95],
+    pq_epochs  = 20,
+    pq_samples = 800,
+    pq_len     = 300,
 )
 # ══════════════════════════════════════════════════════════════════════════
 #  safe cleanup + CPU-offload for analysis
