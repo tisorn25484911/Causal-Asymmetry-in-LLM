@@ -97,19 +97,8 @@ def evaluate_one(tag: str, model: OneHotDecoder, loader_ana,
         latents, inp_arr, tgt_arr = latent_extraction(
             model, loader_ana, max_batches=cfg["max_batches"])
 
-        flat_lat = latents.reshape(-1, latents.shape[-1])   # (N*T, D)
-        # colour fix: backward model's actual input is batch[1] = tgt_arr
-        if mode == "backward":
-            flat_inp = tgt_arr.reshape(-1)
-        else:
-            flat_inp = inp_arr.reshape(-1)
-
-        # wrap into (N*T, 1, D) / (N*T, 1) shape that plot_umap expects
-        flat_lat_wrap = flat_lat[:, np.newaxis, :]
-        flat_inp_wrap = flat_inp[:, np.newaxis]
-
         _, coords = plot_umap(
-            flat_lat_wrap, flat_inp_wrap, num_token,
+            latents, inp_arr, num_token,
             title=tag,
             save_path=os.path.join(out_dir, f"{tag}_umap.png"),
             n_pts=cfg["umap_n_pts"],
@@ -155,7 +144,7 @@ def compare_plot(tag: str, res_fw: dict, res_bw: dict,
     bars = ax.bar(["Forward", "Backward"], vals,
                   color=["#4c72b0", "#dd8452"], alpha=0.85, edgecolor="k")
     ax.bar_label(bars, fmt="%.4f", padding=3, fontsize=10)
-    ax.set_ylabel("Perplexity  [exp(CE loss)]")
+    ax.set_ylabel("Perplexity")
     ax.set_title(f"{tag} — perplexity on new data", fontweight="bold")
     ax.grid(True, alpha=0.3, axis="y")
 
@@ -291,7 +280,7 @@ def main():
 
     if exp in ("all", "exp1_2"):
         eval_coin(
-            tag        = "exp1_2_coin_p01_q09",
+            tag        = "exp1_2_coin_p04_q08",
             p          = cfg["coin_p2"],
             q          = cfg["coin_q2"],
             seq_len    = cfg["coin_seq_len_12"],
@@ -302,7 +291,7 @@ def main():
 
     if exp in ("all", "exp2"):
         eval_flower(
-            tag        = "exp2_flower_n4_m2",
+            tag        = "exp2_flower_n6_m4",
             n          = cfg["flower_n"],
             m          = cfg["flower_m"],
             models_dir = models_dir,
