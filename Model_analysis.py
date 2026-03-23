@@ -193,6 +193,47 @@ def perplexity_calculation(model, data_loader, max_batches=None, pad_id=None):
 
     loss, perplexity = cross_ent_onehot(logits, targets)
     return perplexity.item()
+import torch
+
+import torch
+
+def perplexity_ind_model(model, data_loader):
+    model.eval()
+    total_neg_log2 = 0.0
+    total_tokens = 0
+
+    device = next(model.parameters()).device
+
+    with torch.no_grad():
+        for inputs, targets in data_loader:
+            inputs = inputs.to(device)
+            targets = targets.to(device)
+
+            logits = model(inputs)   # shape: (B, T, C)
+
+            # log softmax in base e, done stably
+            log_probs = logits - torch.logsumexp(logits, dim=-1, keepdim=True)
+
+            # pick log-prob of the true token at each position
+            true_log_probs = log_probs.gather(
+                dim=-1,
+                index=targets.unsqueeze(-1)
+            ).squeeze(-1)   # shape: (B, T)
+
+            # convert ln to log2
+            true_log2_probs = true_log_probs / torch.log(torch.tensor(2.0, device=device))
+
+            total_neg_log2 += (-true_log2_probs).sum().item()
+            total_tokens += targets.numel()
+
+    if total_tokens == 0:
+        raise ValueError("No tokens found in data_loader.")
+
+    ppl = 2 ** (total_neg_log2 / total_tokens)
+    print(f"Perplexity: {ppl:.4f}")
+    return ppl
+
+
 def plot_perplexity(model_fw, model_bw, data_loader, max_batches = None):
     perplexity_fw = perplexity_calculation(model_fw, data_loader, max_batches)
     perplexity_bw = perplexity_calculation(model_bw, data_loader, max_batches)
