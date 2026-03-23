@@ -196,38 +196,28 @@ def perplexity_calculation(model, data_loader, max_batches=None, pad_id=None):
 
 
 def perplexity_ind_model(model, len_seq=2000, start_token=0):
-    """
-    Standard autoregressive perplexity:
-        PPL = 2 ^ ( -1/N  Σ_t  log2 P(x_t | x_{<t}) )
-
-    At each step, sample the next token then look up the log-probability
-    the model assigned to that token. Only one probability per step.
-    Converges to 2^H∞ for a well-trained model on a stationary process.
-    Directly comparable to training CE loss.
-    """
     burn_in = 100
     print(f"Standard PPL over {len_seq - burn_in} tokens (burn-in={burn_in}) ...")
     model.eval()
     device = next(model.parameters()).device
+    is_bw  = (getattr(model, "mode", "forward") == "backward")   # ← add
 
-    total_log2_prob = 0.0
-    total_tokens    = 0
+    total_log2_prob  = 0.0
+    total_tokens     = 0
     predicted_tokens = [start_token]
 
     with torch.no_grad():
         for i in range(len_seq):
-            # full history → causal attention has real context
-            x      = torch.tensor([predicted_tokens], device=device)  # (1, i+1)
-            logits = model(x)[:, -1, :]                               # (1, C)
+            x      = torch.tensor([predicted_tokens], device=device)
+            out    = model(x)                                          # (1, T, C)
+            logits = out[:, 0, :] if is_bw else out[:, -1, :]         # ← fix
 
             log2_probs = torch.nn.functional.log_softmax(logits, dim=-1) \
-                         / torch.log(torch.tensor(2.0, device=device))  # (1, C)
+                         / torch.log(torch.tensor(2.0, device=device))
 
-            # sample next token from the model's distribution
             probs      = torch.softmax(logits, dim=-1)
             next_token = torch.multinomial(probs[0], num_samples=1).item()
 
-            # log2 probability of the token that was actually chosen
             next_token_log2_prob = log2_probs[0, next_token].item()
 
             if i >= burn_in:
