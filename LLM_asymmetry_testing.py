@@ -97,21 +97,23 @@ def compute_ppl_ce(model, loader, max_batches=None):
 # =============================================================================
 # METRIC 2 — perplexity_ind_CE
 #
-# Autoregressively generates a sequence driven by the TRUE HMM transitions
-# (not the model), so both FW and BW models are evaluated at the same true
-# stationary state distribution.
-# At each step: CE_t = -sum_x P_true(x|cur_tok) * log2 P_model(x|context)
-# PPL = 2^(mean CE_t) converges to H_inf for a perfect model.
-# Using the true process to advance means the comparison is fair regardless
-# of how accurate the model's own distribution is.
+# Evaluates BOTH models on the SAME ground-truth sequences from the loader.
+# At each position, CE is computed against the SOFT LABEL (true conditional
+# distribution) instead of the one-hot sampled token.
+#
+# Key properties vs old autoregressive version:
+#   - No distribution shift: both models receive FORWARD sequences (as trained)
+#   - ~500x more data: loader has ~1M positions vs single 2000-token sequence
+#   - In expectation: identical to perplexity_calculation (soft label = hard
+#     label in expectation) but lower per-step variance
 # =============================================================================
-def compute_ind_ce(model, p, q, cfg):
-    """Returns (PPL, CE bits) via perplexity_ind_CE."""
+def compute_ind_ce(model, loader, p, q, cfg):
+    """Returns (PPL, CE bits) via perplexity_ind_CE with ground-truth loader."""
+    num_token = model.token_size
     ppl = perplexity_ind_CE(
-        model,
-        len_seq=cfg.get("ind_ce_len", 2000),
-        start_token=0,
-        p=p, q=q,
+        model, loader, p, q,
+        num_token=num_token,
+        max_batches=cfg.get("max_batches"),
     )
     ce = float(np.log2(ppl))
     return ppl, ce
@@ -441,13 +443,13 @@ def eval_coin(tag, p, q, seq_len, models_dir, out_root, cfg):
     print(f"    BW: PPL={ppl_calc_bw:.4f}  CE={ce_calc_bw:.4f} bits")
     print(f"    H_inf={h_inf:.4f}  delta_CE={ce_calc_bw-ce_calc_fw:+.4f}")
 
-    # --- METRIC 2: perplexity_ind_CE with true-process-driven generation ------
-    # Sequences are driven by the TRUE HMM (not the model), so both models are
-    # evaluated at the same true stationary distribution — fair comparison.
-    print("\n  [Metric 2] perplexity_ind_CE (true-process generation, per-step CE vs true conditional):")
-    ppl_ind_fw, ce_ind_fw = compute_ind_ce(model_fw, p, q, cfg)
+    # --- METRIC 2: perplexity_ind_CE on same ground-truth loader ---------------
+    # Uses soft labels (true conditional) on same sequences — no distribution
+    # shift, 500x more data than old autoregressive version.
+    print("\n  [Metric 2] perplexity_ind_CE (soft-label CE on ground-truth sequences):")
+    ppl_ind_fw, ce_ind_fw = compute_ind_ce(model_fw, loader, p, q, cfg)
     print(f"    FW: PPL={ppl_ind_fw:.4f}  CE={ce_ind_fw:.4f} bits")
-    ppl_ind_bw, ce_ind_bw = compute_ind_ce(model_bw, p, q, cfg)
+    ppl_ind_bw, ce_ind_bw = compute_ind_ce(model_bw, loader, p, q, cfg)
     print(f"    BW: PPL={ppl_ind_bw:.4f}  CE={ce_ind_bw:.4f} bits")
     print(f"    H_inf={h_inf:.4f}  delta_CE={ce_ind_bw-ce_ind_fw:+.4f}")
 
