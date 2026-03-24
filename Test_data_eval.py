@@ -20,13 +20,116 @@ from Model_analysis import (
     statistical_complexity_empirical,
     savefig,
     mkdir,
-    perplexity_ind_model
 )
 
 
 # ══════════════════════════════════════════════════════════════════════════════
 # CONFIG — mirror the values used during training
 # ══════════════════════════════════════════════════════════════════════════════
+# =========================================================================
+# AUTOREGRESSIVE GENERATION HELPERS
+# =========================================================================
+def _get_probs(model, context, num_token):
+    is_bw = (getattr(model, "mode", "forward") == "backward")
+    x = torch.tensor([context])
+    with torch.no_grad():
+        logits = model(x)
+    logits = logits[:, 0, :] if is_bw else logits[:, -1, :]
+    return torch.softmax(logits[0], dim=-1).numpy()
+
+
+def generate_sequence(model, num_token, start_token=0, gen_len=1000, burn_in=200):
+    is_bw = (getattr(model, "mode", "forward") == "backward")
+    context = [start_token]
+    sequence, prob_hist, chosen = [], [], []
+    for i in range(gen_len + burn_in):
+        probs = _get_probs(model, context, num_token)
+        next_token = int(np.random.choice(num_token, p=probs))
+        if i >= burn_in:
+            sequence.append(next_token)
+            prob_hist.append(probs)
+            chosen.append(next_token)
+        if is_bw:
+            context = [next_token] + context
+        else:
+            context = context + [next_token]
+    return sequence, prob_hist, chosen
+
+
+def perplexity_autoregressive(model, num_token, start_token=0,
+                               gen_len=1000, burn_in=200):
+    _, prob_hist, chosen = generate_sequence(
+        model, num_token, start_token, gen_len, burn_in)
+    log2_probs = np.array([
+        -np.log2(prob_hist[t][tok] + 1e-12)
+        for t, tok in enumerate(chosen)
+    ])
+    return float(2 ** np.mean(log2_probs))
+
+
+def cumulative_ppl(prob_hist, chosen):
+    log2_probs = np.array([
+        -np.log2(prob_hist[t][tok] + 1e-12)
+        for t, tok in enumerate(chosen)
+    ])
+    return 2 ** (np.cumsum(log2_probs) / np.arange(1, len(log2_probs) + 1))
+
+
+def plot_colored_tokens(sequence, prob_hist, chosen, num_token,
+                        title="", save_path=None, n_show=100):
+    n = min(n_show, len(sequence))
+    mat = np.array(prob_hist[:n]).T
+    cmap = plt.cm.tab10
+    fig, axes = plt.subplots(2, 1, figsize=(max(14, n // 5), 6),
+                              gridspec_kw={"height_ratios": [3, 1]})
+    ax0 = axes[0]
+    im = ax0.imshow(mat, aspect="auto", origin="lower",
+                    cmap="Blues", vmin=0, vmax=1)
+    for t, tok in enumerate(chosen[:n]):
+        ax0.scatter(t, tok, color="red", s=20, zorder=5, marker="x")
+    ax0.set_yticks(range(num_token))
+    ax0.set_yticklabels([f"tok {i}" for i in range(num_token)], fontsize=8)
+    ax0.set_ylabel("Token")
+    ax0.set_title(f"{title} -- P(token) at each step  [red x = sampled]",
+                  fontweight="bold")
+    plt.colorbar(im, ax=ax0, label="P(token)")
+    ax1 = axes[1]
+    for t, tok in enumerate(chosen[:n]):
+        ax1.bar(t, 1, color=cmap(tok / max(num_token - 1, 1)),
+                width=1.0, edgecolor="none")
+    ax1.set_xlim(-0.5, n - 0.5)
+    ax1.set_yticks([])
+    ax1.set_xlabel("Generation step")
+    ax1.set_ylabel("Token", fontsize=8)
+    for tok in range(num_token):
+        ax1.bar(0, 0, color=cmap(tok / max(num_token - 1, 1)), label=f"Token {tok}")
+    ax1.legend(fontsize=7, loc="upper right", ncol=num_token)
+    plt.tight_layout()
+    if save_path:
+        savefig(fig, save_path)
+    return fig
+
+
+def plot_cumulative_ppl(ppl_fw, ppl_bw, title="", save_path=None):
+    steps = np.arange(len(ppl_fw))
+    fig, ax = plt.subplots(figsize=(12, 5))
+    ax.plot(steps, ppl_fw, color="steelblue",  lw=1.5, label="Forward  cumulative PPL")
+    ax.plot(steps, ppl_bw, color="darkorange", lw=1.5, label="Backward cumulative PPL")
+    ax.axhline(ppl_fw[-1], color="steelblue",  ls="--", lw=1, alpha=0.6,
+               label=f"FW final = {ppl_fw[-1]:.4f}")
+    ax.axhline(ppl_bw[-1], color="darkorange", ls="--", lw=1, alpha=0.6,
+               label=f"BW final = {ppl_bw[-1]:.4f}")
+    ax.set_xlabel("Generation step t")
+    ax.set_ylabel("PPL_t = 2^(-mean log2P up to t)")
+    ax.set_title(f"{title} -- Cumulative standard perplexity (converges to 2^H_inf)",
+                 fontweight="bold")
+    ax.legend(fontsize=9); ax.grid(True, alpha=0.3)
+    plt.tight_layout()
+    if save_path:
+        savefig(fig, save_path)
+    return fig
+
+
 EVAL_CFG = dict(
     # model architecture — must match what was trained
     d_model        = 64,
@@ -48,6 +151,8 @@ EVAL_CFG = dict(
     umap_n_pts       = 1000,
     umap_n_neighbors = 200,
     max_batches      = 20,
+    ppl_gen_len      = 1000,
+    ppl_burn_in      = 200,
 )
 
 
@@ -86,17 +191,34 @@ def evaluate_one(tag: str, model: OneHotDecoder, loader_ana,
     # ── Perplexity ────────────────────────────────────────────────────────────
     # perplexity_calculation collects all logits then computes global CE loss
     # → true dataset-level perplexity (not mean of batch means)
-    ppl = perplexity_ind_model(model, loader_ana)
+    ppl = perplexity_autoregressive(
+        model, num_token, start_token=0,
+        gen_len=cfg.get("ppl_gen_len", 1000),
+        burn_in=cfg.get("ppl_burn_in", 200),
+    )
     res["perplexity"] = ppl
     print(f"  [{tag}]  perplexity = {ppl:.4f}")
 
-    # ── UMAP ─────────────────────────────────────────────────────────────────
-    # latent_extraction always passes batch[0] to model
-    # flatten → (N*T, D) → first umap_n_pts rows  (testing.ipynb convention)
+    # ── Colored token prediction + store prob_hist for cumulative PPL ────────
     try:
-        latents, inp_arr, tgt_arr = latent_extraction(
-            model, loader_ana, max_batches=cfg["max_batches"])
+        seq, ph, ch = generate_sequence(
+            model, num_token, start_token=0,
+            gen_len=cfg.get("ppl_gen_len", 1000),
+            burn_in=cfg.get("ppl_burn_in", 200),
+        )
+        plot_colored_tokens(seq, ph, ch, num_token, title=tag, n_show=200,
+            save_path=os.path.join(out_dir, f"{tag}_token_pred.png"))
+        res["prob_hist"] = ph
+        res["chosen"]    = ch
+    except Exception as e:
+        print(f"  token pred plot failed: {e}")
+        res["prob_hist"] = None
+        res["chosen"]    = None
 
+    # ── UMAP ─────────────────────────────────────────────────────────────────
+    try:
+        latents, inp_arr, _ = latent_extraction(
+            model, loader_ana, max_batches=cfg["max_batches"])
         _, coords = plot_umap(
             latents, inp_arr, num_token,
             title=tag,
@@ -145,7 +267,7 @@ def compare_plot(tag: str, res_fw: dict, res_bw: dict,
                   color=["#4c72b0", "#dd8452"], alpha=0.85, edgecolor="k")
     ax.bar_label(bars, fmt="%.4f", padding=3, fontsize=10)
     ax.set_ylabel("Perplexity")
-    ax.set_title(f"{tag} — perplexity on new data", fontweight="bold")
+    ax.set_title(f"Perplexity on model's generated sequence")
     ax.grid(True, alpha=0.3, axis="y")
 
     # Complexity bar
@@ -158,13 +280,18 @@ def compare_plot(tag: str, res_fw: dict, res_bw: dict,
     ax.set_xticks(x)
     ax.set_xticklabels(["Empirical", "Theoretical"])
     ax.set_ylabel("Statistical Complexity (bits)")
-    ax.set_title(f"{tag} — complexity on new data", fontweight="bold")
+    ax.set_title(f"Statistical complexity on model's generated sequence")
     ax.legend(); ax.grid(True, alpha=0.3, axis="y")
 
-    fig.suptitle(f"{tag} — evaluation on freshly generated data",
-                 fontsize=12, fontweight="bold")
+    fig.suptitle(f"Experimental Results: {tag}", fontsize=12)
     fig.tight_layout()
     savefig(fig, os.path.join(out_dir, f"{tag}_eval_compare.png"))
+
+    if res_fw.get("prob_hist") is not None and res_bw.get("prob_hist") is not None:
+        ppl_fw_curve = cumulative_ppl(res_fw["prob_hist"], res_fw["chosen"])
+        ppl_bw_curve = cumulative_ppl(res_bw["prob_hist"], res_bw["chosen"])
+        plot_cumulative_ppl(ppl_fw_curve, ppl_bw_curve, title=tag,
+            save_path=os.path.join(out_dir, f"{tag}_cumulative_ppl.png"))
 
 
 # ══════════════════════════════════════════════════════════════════════════════
