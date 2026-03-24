@@ -193,38 +193,156 @@ def perplexity_calculation(model, data_loader, max_batches=None, pad_id=None):
 
     loss, perplexity = cross_ent_onehot(logits, targets)
     return perplexity.item()
+def perplexity_ind_CE(model, len_seq=2000, start_token=0, p=None, q=None):
+    """
+    Cross-entropy perplexity where each step is evaluated against the
+    TRUE theoretical transition distribution of the HMM, not the sampled token.
+
+    At each step:
+        CE_t = -sum_x  P_true(x | current_state) * log2 P_model(x | context)
+
+    PPL = 2 ^ (mean CE_t)
+
+    This directly measures how close the model's predicted distribution is
+    to the true HMM conditional — independent of which token was sampled.
+    """
+    burn_in = 200
+    if p is None or q is None:
+        raise ValueError("Both p and q must be provided.")
+
+    if len_seq <= 0:
+        raise ValueError("len_seq must be positive.")
+
+    if burn_in < 0:
+        raise ValueError("burn_in must be non-negative.")
+
+    model.eval()
+    device = next(model.parameters()).device
+    is_backward = getattr(model, "mode", "forward") == "backward"
+
+    num_token = model.token_size
+    if num_token != 3:
+        raise ValueError(
+            f"This implementation expects 3 tokens, but model.token_size={num_token}."
+        )
+
+    # target_prob[cur_token] = true conditional distribution over next token
+    target_prob = np.zeros((num_token, num_token), dtype=np.float64)
+
+    if is_backward:
+        # P(previous token | current token)
+        target_prob[0] = np.array([1 - p, 0.0, p], dtype=np.float64)
+        target_prob[1] = np.array([q * (1 - p), 1 - q, p * q], dtype=np.float64)
+        target_prob[2] = np.array([0.0, 1.0, 0.0], dtype=np.float64)
+    else:
+        # P(next token | current token)
+        target_prob[0] = np.array([1 - p, p, 0.0], dtype=np.float64)
+        target_prob[1] = np.array([0.0, 1 - q, q], dtype=np.float64)
+        target_prob[2] = np.array([1 - p, p, 0.0], dtype=np.float64)
+
+    # Sanity check rows sum to 1
+    row_sums = target_prob.sum(axis=1)
+    if not np.allclose(row_sums, 1.0):
+        raise ValueError(f"Invalid target_prob rows; sums are {row_sums}")
+
+    total_ce_bits = 0.0
+    n_steps = 0
+
+    # Keep full context because the model may use long context,
+    # even though the true process is first-order Markov in token.
+    context = [int(start_token)]
+
+    with torch.no_grad():
+        for step in range(len_seq + burn_in):
+            x = torch.tensor([context], dtype=torch.long, device=device)  # (1, T)
+            logits = model(x)  # (1, T, V)
+
+            if logits.ndim != 3 or logits.shape[0] != 1 or logits.shape[2] != num_token:
+                raise ValueError(
+                    f"Expected logits shape (1, T, {num_token}), got {tuple(logits.shape)}"
+                )
+
+            # Use the prediction corresponding to the next token position
+            # under the user's forward/backward convention.
+            if is_backward:
+                model_logits = logits[0, 0, :]   # predict token to the left
+                current_token = context[0]
+            else:
+                model_logits = logits[0, -1, :]  # predict token to the right
+                current_token = context[-1]
+
+            p_model = torch.softmax(model_logits, dim=-1).cpu().numpy()
+            p_true = target_prob[current_token]
+
+            # True cross-entropy in bits
+            ce_bits = -np.sum(p_true * np.log2(p_model + 1e-12))
+
+            if step >= burn_in:
+                total_ce_bits += ce_bits
+                n_steps += 1
+
+            # Advance using the TRUE process, not the model
+            next_token = int(np.random.choice(num_token, p=p_true))
+
+            if is_backward:
+                context = [next_token] + context
+            else:
+                context = context + [next_token]
+
+    if n_steps == 0:
+        raise ValueError("No steps accumulated; increase len_seq or reduce burn_in.")
+
+    avg_ce_bits = total_ce_bits / n_steps
+    perplexity = 2 ** avg_ce_bits
+    return float(perplexity)
 
 
 def perplexity_ind_model(model, len_seq=2000, start_token=0):
+
     burn_in = 100
     print(f"Standard PPL over {len_seq - burn_in} tokens (burn-in={burn_in}) ...")
     model.eval()
     device = next(model.parameters()).device
-    is_bw  = (getattr(model, "mode", "forward") == "backward")   # ← add
+    is_bw  = (getattr(model, "mode", "forward") == "backward")
 
-    total_log2_prob  = 0.0
-    total_tokens     = 0
-    predicted_tokens = [start_token]
+    total_log2_prob = 0.0
+    total_tokens    = 0
+
+    # forward : context grows rightward  → start at left end
+    # backward: context grows leftward   → start at right end
+    context = [start_token]
 
     with torch.no_grad():
         for i in range(len_seq):
-            x      = torch.tensor([predicted_tokens], device=device)
-            out    = model(x)                                          # (1, T, C)
-            logits = out[:, 0, :] if is_bw else out[:, -1, :]         # ← fix
+            x      = torch.tensor([context], device=device)   # (1, current_len)
+            out    = model(x)                                  # (1, current_len, C)
+
+            if is_bw:
+                # position 0: upper-triangular mask → attends to ALL tokens in context
+                # → predicts the token that comes BEFORE context[0]
+                logits = out[:, 0, :]                          # (1, C)
+            else:
+                # position -1: lower-triangular mask → attends to full past
+                # → predicts the token that comes AFTER context[-1]
+                logits = out[:, -1, :]                         # (1, C)
 
             log2_probs = torch.nn.functional.log_softmax(logits, dim=-1) \
                          / torch.log(torch.tensor(2.0, device=device))
-
             probs      = torch.softmax(logits, dim=-1)
-            next_token = torch.multinomial(probs[0], num_samples=1).item()
 
+            # sample the next token in the respective direction
+            next_token = torch.multinomial(probs[0], num_samples=1).item()
             next_token_log2_prob = log2_probs[0, next_token].item()
 
             if i >= burn_in:
                 total_log2_prob += next_token_log2_prob
                 total_tokens    += 1
 
-            predicted_tokens.append(next_token)
+            # forward: append to right  |  backward: prepend to left
+            if is_bw:
+                context = [next_token] + context
+            else:
+                context = context + [next_token]
 
     perplexity = 2 ** (-(total_log2_prob / total_tokens))
     return perplexity
