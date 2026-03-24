@@ -241,3 +241,71 @@ The Flower experiment serves as a control: theory predicts `delta_CE < 0` (FW ha
 ## Reference
 
 Thompson, J., Garner, A. R., Mahoney, J. R., Vanner, M. R., Gu, M., & Modi, K. (2017). Causal asymmetry in a quantum world. *Physical Review X*, 8(3), 031013.
+
+---
+
+## Related Work
+
+### Causal Asymmetry and the Primary Reference
+
+**Thompson et al. (2018)** — *Causal asymmetry in a quantum world.* Physical Review X, 8(3), 031013.
+The direct theoretical foundation for this repository. Establishes that for causally asymmetric processes C+ ≠ C−, and that quantum models can exploit this gap. This work tests the same asymmetry signal in classical transformer models.
+
+**Papadopoulos, Wenger & Hongler (2024)** — *Arrows of Time for Large Language Models.* arXiv:2401.17505.
+The closest prior empirical study to this work. Tests whether large language models (GPT-2, LLaMA) assign higher perplexity to reversed text than forward text, finding a consistent forward-time preference. This repository provides a controlled, theoretically grounded version of that test on HMM processes where the ground-truth asymmetry is analytically known.
+
+**Ren, Ichter & Majumdar (2024)** — *Thinking Forward and Backward: Effective Backward Planning with Large Language Models.* arXiv:2411.01790.
+Explores asymmetry in LLM reasoning by comparing forward and backward chain-of-thought. Empirically shows that backward planning is harder for LLMs on certain tasks, consistent with the causal asymmetry hypothesis operating at the reasoning level.
+
+---
+
+### Computational Mechanics and Statistical Complexity
+
+**Shalizi & Crutchfield (2001)** — *Computational mechanics: Pattern and prediction, structure and simplicity.* Journal of Statistical Physics, 104(3), 817–879.
+The formal foundation for ε-machines, causal states, and statistical complexity C+. Defines the forward causal state representation used throughout this project and establishes the connection between minimal predictive memory and thermodynamic cost.
+
+**Crutchfield & Feldman (1997)** — *Statistical complexity of simple one-dimensional spin systems.* Physical Review E, 55(2), R1239.
+Early demonstration of computational mechanics on spin chains — closely related to the HMM processes studied here. Shows how C+ varies across parameter space, motivating the p-q heatmap experiments in Experiment 1.2.
+
+**Tan et al. (2014)** — *Towards quantifying complexity with quantum mechanics.* European Physical Journal Plus, 129(9), 191.
+Extends the complexity framework to quantum models and quantifies the advantage quantum memory provides over classical causal states. Provides the theoretical context for why C+ and C− differ and what the gap means thermodynamically.
+
+---
+
+### Quantum Models of Complexity
+
+**Gu et al. (2012)** — *Quantum mechanics can reduce the complexity of classical models.* Nature Communications, 3(1), 762.
+Demonstrates that quantum models can simulate stochastic processes using strictly less memory than any classical model. Directly motivates the question of whether neural network models (which are classical) can nevertheless exploit causal asymmetry through learned representations.
+
+**Suen et al. (2017)** — *The classical-quantum divergence of complexity in modelling spin chains.* Quantum, 1, 25.
+Analyses the gap between classical and quantum statistical complexity across a family of spin-chain processes. The Flower HMM in this repository is structurally similar to the processes studied here.
+
+**Elliott et al. (2022)** — *Quantum adaptive agents with efficient long-term memories.* Physical Review X, 12(1), 011007.
+Shows that quantum agents can maintain efficient long-term memory by exploiting causal structure. Provides the broader context for why causal asymmetry matters for memory-bounded agents — a category that includes transformers with finite model dimension.
+
+---
+
+### Thermodynamics of Computation
+
+**Landauer (1961)** — *Irreversibility and heat generation in the computing process.* IBM Journal of Research and Development, 5(3), 183–191.
+The foundational result connecting logical irreversibility to thermodynamic cost. The causal asymmetry hypothesis can be viewed as a consequence of Landauer's principle applied to the memory operations of a predictor: models of causally asymmetric processes must perform more irreversible operations in one direction, incurring higher representational cost.
+
+---
+
+### Transformer Architecture
+
+**Vaswani et al. (2017)** — *Attention Is All You Need.* NeurIPS, 30.
+Introduces the transformer architecture used in this repository. The causal (lower-triangular) mask used for the forward model and the anti-causal (upper-triangular) mask for the backward model are direct applications of the masked self-attention mechanism described here.
+
+**Devlin et al. (2019)** — *BERT: Pre-training of Deep Bidirectional Transformers for Language Understanding.* arXiv:1810.04805.
+Establishes bidirectional transformers as powerful models of future context. The backward model in this repository is conceptually related to BERT's masked language modelling objective — both attend to future tokens — but is trained autoregressively on reversed causal structure rather than with masked prediction.
+
+---
+
+### Area Laws and Mutual Information
+
+**Wolf et al. (2008)** — *Area laws in quantum systems: Mutual information and correlations.* Physical Review Letters, 100(7), 070502.
+Establishes area laws bounding how mutual information scales with subsystem size in quantum systems. Provides the information-theoretic context for why long-range correlations in a process (high C+ or C−) impose fundamental constraints on the memory required to model it — constraints that manifest as higher cross-entropy for finite-capacity models.
+
+**Asplund & Panciu (2024)** — *Predictive complexity of quantum subsystems.* Entropy, 26(12), 1065.
+Recent work extending predictive complexity to quantum subsystems. Connects the statistical complexity framework to quantum information measures, providing a bridge between the classical HMM experiments here and potential quantum extensions.
