@@ -199,35 +199,67 @@ def evaluate_one(tag: str, model: OneHotDecoder, loader_ana,
     res["perplexity"] = ppl
     print(f"  [{tag}]  perplexity = {ppl:.4f}")
 
-    # ── Colored token prediction + store prob_hist for cumulative PPL ────────
+    # ── Generate model's own sequence ────────────────────────────────────────
+    # All downstream analysis (UMAP, colored token plot, cumulative PPL)
+    # uses this single generated sequence so everything is consistent:
+    # the UMAP shows where the model places tokens it ITSELF produced,
+    # not tokens from the ground-truth data generator.
     try:
         seq, ph, ch = generate_sequence(
             model, num_token, start_token=0,
             gen_len=cfg.get("ppl_gen_len", 1000),
             burn_in=cfg.get("ppl_burn_in", 200),
         )
-        plot_colored_tokens(seq, ph, ch, num_token, title=tag, n_show=200,
-            save_path=os.path.join(out_dir, f"{tag}_token_pred.png"))
         res["prob_hist"] = ph
         res["chosen"]    = ch
+        res["sequence"]  = seq
     except Exception as e:
-        print(f"  token pred plot failed: {e}")
+        print(f"  generation failed: {e}")
         res["prob_hist"] = None
         res["chosen"]    = None
+        res["sequence"]  = None
 
-    # ── UMAP ─────────────────────────────────────────────────────────────────
-    try:
-        latents, inp_arr, _ = latent_extraction(
-            model, loader_ana, max_batches=cfg["max_batches"])
-        _, coords = plot_umap(
-            latents, inp_arr, num_token,
-            title=tag,
-            save_path=os.path.join(out_dir, f"{tag}_umap.png"),
-            n_pts=cfg["umap_n_pts"],
-        )
-        res["umap_coords"] = coords
-    except Exception as e:
-        print(f"  UMAP failed: {e}")
+    # ── Colored token prediction ──────────────────────────────────────────────
+    if res["prob_hist"] is not None:
+        try:
+            plot_colored_tokens(
+                res["sequence"], res["prob_hist"], res["chosen"],
+                num_token, title=tag, n_show=200,
+                save_path=os.path.join(out_dir, f"{tag}_token_pred.png"))
+        except Exception as e:
+            print(f"  token pred plot failed: {e}")
+
+    # ── UMAP of the model's own generated sequence latents ───────────────────
+    # Feed the generated sequence back through the model to get last_encodings.
+    # This shows where each token the model generated sits in latent space,
+    # revealing whether the model has learned distinct causal-state clusters
+    # on the sequences it actually produces (not ground-truth sequences).
+    if res["sequence"] is not None:
+        try:
+            is_bw = (getattr(model, "mode", "forward") == "backward")
+            gen_tensor = torch.tensor([res["sequence"]])    # (1, gen_len)
+            model.eval()
+            with torch.no_grad():
+                _ = model(gen_tensor)                       # populates last_encodings
+            # last_encodings: (1, gen_len, D) → flatten → (gen_len, D)
+            latents_gen = model.last_encodings[0].cpu().numpy()  # (gen_len, D)
+            inp_gen     = np.array(res["sequence"])               # (gen_len,)
+
+            # wrap to (N,1,D) and (N,1) so plot_umap can reshape -1
+            lat_wrap = latents_gen[:, np.newaxis, :]
+            inp_wrap = inp_gen[:, np.newaxis]
+
+            _, coords = plot_umap(
+                lat_wrap, inp_wrap, num_token,
+                title=f"{tag} (generated seq)",
+                save_path=os.path.join(out_dir, f"{tag}_umap.png"),
+                n_pts=cfg["umap_n_pts"],
+            )
+            res["umap_coords"] = coords
+        except Exception as e:
+            print(f"  UMAP failed: {e}")
+            res["umap_coords"] = None
+    else:
         res["umap_coords"] = None
 
     # ── Statistical complexity ────────────────────────────────────────────────
