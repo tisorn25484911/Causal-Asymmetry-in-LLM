@@ -193,108 +193,138 @@ def perplexity_calculation(model, data_loader, max_batches=None, pad_id=None):
 
     loss, perplexity = cross_ent_onehot(logits, targets)
     return perplexity.item()
-def perplexity_ind_CE(model, len_seq=2000, start_token=0, p=None, q=None):
+
+def perplexity_ind_CE(model, data_loader, p, q, num_token=3, max_batches=None):
     """
-    Cross-entropy perplexity where each step is evaluated against the
-    TRUE theoretical transition distribution of the HMM, not the sampled token.
+    Cross-entropy perplexity evaluated against the TRUE HMM conditional
+    distribution (soft label) on GROUND-TRUTH sequences from a DataLoader.
 
-    At each step:
-        CE_t = -sum_x  P_true(x | current_state) * log2 P_model(x | context)
+    At every position t in every ground-truth sequence:
+        cur_tok = input token at position t
+        p_true  = true conditional P(next | cur_tok)  [analytical for coin HMM]
+        p_model = model softmax distribution at position t
+        CE_t    = -sum_x P_true(x | cur_tok) * log2 P_model(x | context_t)
 
-    PPL = 2 ^ (mean CE_t)
-
-    This directly measures how close the model's predicted distribution is
-    to the true HMM conditional — independent of which token was sampled.
+    PPL = 2^(mean CE_t)
     """
-    burn_in = 200
     if p is None or q is None:
         raise ValueError("Both p and q must be provided.")
 
-    if len_seq <= 0:
-        raise ValueError("len_seq must be positive.")
-
-    if burn_in < 0:
-        raise ValueError("burn_in must be non-negative.")
-
     model.eval()
     device = next(model.parameters()).device
-    is_backward = getattr(model, "mode", "forward") == "backward"
+    is_bw  = (getattr(model, "mode", "forward") == "backward")
 
-    num_token = model.token_size
-    if num_token != 3:
-        raise ValueError(
-            f"This implementation expects 3 tokens, but model.token_size={num_token}."
-        )
-
-    # target_prob[cur_token] = true conditional distribution over next token
+    # True transition matrix: target_prob[cur_tok] = P(next/prev | cur_tok)
     target_prob = np.zeros((num_token, num_token), dtype=np.float64)
-
-    if is_backward:
+    if is_bw:
         # P(previous token | current token)
-        target_prob[0] = np.array([1 - p, 0.0, p], dtype=np.float64)
-        target_prob[1] = np.array([q * (1 - p), 1 - q, p * q], dtype=np.float64)
-        target_prob[2] = np.array([0.0, 1.0, 0.0], dtype=np.float64)
+        target_prob[0] = [1-p,       0,    p  ]
+        target_prob[1] = [q*(1-p),   1-q,  p*q]
+        target_prob[2] = [0,         1,    0  ]
     else:
         # P(next token | current token)
-        target_prob[0] = np.array([1 - p, p, 0.0], dtype=np.float64)
-        target_prob[1] = np.array([0.0, 1 - q, q], dtype=np.float64)
-        target_prob[2] = np.array([1 - p, p, 0.0], dtype=np.float64)
+        target_prob[0] = [1-p, p,   0]
+        target_prob[1] = [0,   1-q, q]
+        target_prob[2] = [1-p, p,   0]
 
-    # Sanity check rows sum to 1
     row_sums = target_prob.sum(axis=1)
     if not np.allclose(row_sums, 1.0):
-        raise ValueError(f"Invalid target_prob rows; sums are {row_sums}")
+        raise ValueError(f"target_prob rows do not sum to 1: {row_sums}")
 
-    total_ce_bits = 0.0
-    n_steps = 0
-
-    # Keep full context because the model may use long context,
-    # even though the true process is first-order Markov in token.
-    context = [int(start_token)]
+    total_ce = 0.0
+    n_steps  = 0
 
     with torch.no_grad():
-        for step in range(len_seq + burn_in):
-            x = torch.tensor([context], dtype=torch.long, device=device)  # (1, T)
-            logits = model(x)  # (1, T, V)
+        for batch_idx, batch in enumerate(data_loader):
+            if max_batches is not None and batch_idx >= max_batches:
+                break
 
-            if logits.ndim != 3 or logits.shape[0] != 1 or logits.shape[2] != num_token:
-                raise ValueError(
-                    f"Expected logits shape (1, T, {num_token}), got {tuple(logits.shape)}"
-                )
-
-            # Use the prediction corresponding to the next token position
-            # under the user's forward/backward convention.
-            if is_backward:
-                model_logits = logits[0, 0, :]   # predict token to the left
-                current_token = context[0]
+            # Mirror the training convention — backward model has swapped batch
+            if is_bw:
+                targets, inputs = batch
             else:
-                model_logits = logits[0, -1, :]  # predict token to the right
-                current_token = context[-1]
+                inputs, targets = batch
 
-            p_model = torch.softmax(model_logits, dim=-1).cpu().numpy()
-            p_true = target_prob[current_token]
+            inputs  = inputs.to(device)             # (B, T)
+            logits  = model(inputs)                 # (B, T, V)
+            p_model = torch.softmax(logits, dim=-1).cpu().numpy()  # (B, T, V)
+            inp_np  = inputs.cpu().numpy()          # (B, T)
 
-            # True cross-entropy in bits
-            ce_bits = -np.sum(p_true * np.log2(p_model + 1e-12))
-
-            if step >= burn_in:
-                total_ce_bits += ce_bits
-                n_steps += 1
-
-            # Advance using the TRUE process, not the model
-            next_token = int(np.random.choice(num_token, p=p_true))
-
-            if is_backward:
-                context = [next_token] + context
-            else:
-                context = context + [next_token]
+            B, T, _ = p_model.shape
+            for b in range(B):
+                for t in range(T):
+                    cur_tok = inp_np[b, t]
+                    p_true  = target_prob[cur_tok]  # (V,) soft label
+                    p_mod   = p_model[b, t]         # (V,)
+                    ce_t    = -np.sum(p_true * np.log2(p_mod + 1e-12))
+                    total_ce += ce_t
+                    n_steps  += 1
 
     if n_steps == 0:
-        raise ValueError("No steps accumulated; increase len_seq or reduce burn_in.")
+        raise ValueError("No steps accumulated — empty loader or max_batches=0.")
 
-    avg_ce_bits = total_ce_bits / n_steps
-    perplexity = 2 ** avg_ce_bits
-    return float(perplexity)
+    return float(2 ** (total_ce / n_steps))
+
+def coin_true_conditional(p, q, num_token=3):
+    fw = np.zeros((num_token, num_token))
+    fw[0] = [1-p, p,       0  ]
+    fw[1] = [0,   1-q,     q  ]
+    fw[2] = [1-p, p,       0  ]
+    bw = np.zeros((num_token, num_token))
+    bw[0] = [1-p,      0,   p  ]
+    bw[1] = [q*(1-p),  1-q, p*q]
+    bw[2] = [0,        1,   0  ]
+    return fw, bw
+
+def stepwise_kl_coin(model, loader, p, q, num_token=3, max_batches=None):
+    """
+    For every position in every ground-truth sequence:
+        KL_t = D_KL( P_true(.|cur_tok) || P_model(.|context_t) )
+    Returns mean_kl, per_tok_avg (V,), per_tok_count (V,).
+    """
+    model.eval()
+    is_bw  = (getattr(model, "mode", "forward") == "backward")
+    device = next(model.parameters()).device
+    fw_cond, bw_cond = coin_true_conditional(p, q, num_token)
+    true_cond = bw_cond if is_bw else fw_cond
+
+    total_kl      = 0.0
+    per_tok_kl    = np.zeros(num_token)
+    per_tok_count = np.zeros(num_token)
+
+    with torch.no_grad():
+        for batch_idx, batch in enumerate(loader):
+            if max_batches is not None and batch_idx >= max_batches:
+                break
+            if is_bw:
+                targets, inputs = batch
+            else:
+                inputs, targets = batch
+            inputs  = inputs.to(device)
+            logits  = model(inputs)
+            p_model = torch.softmax(logits, dim=-1).cpu().numpy()
+            inp_np  = inputs.cpu().numpy()
+            B, T, _ = p_model.shape
+            for b in range(B):
+                for t in range(T):
+                    cur_tok = inp_np[b, t]
+                    p_true  = true_cond[cur_tok]
+                    p_mod   = p_model[b, t]
+                    kl_t    = float(np.sum(
+                        p_true * np.log2(p_true / (p_mod + 1e-12) + 1e-12)))
+                    total_kl              += kl_t
+                    per_tok_kl[cur_tok]   += kl_t
+                    per_tok_count[cur_tok] += 1
+
+    mean_kl     = total_kl / max(per_tok_count.sum(), 1)
+    per_tok_avg = np.where(per_tok_count > 0,
+                           per_tok_kl / per_tok_count, 0.0)
+
+    print(f"    mean KL = {mean_kl:.6f} bits")
+    for tok in range(num_token):
+        print(f"      token {tok}: avg KL={per_tok_avg[tok]:.6f}"
+              f"  (n={int(per_tok_count[tok])})")
+    return mean_kl, per_tok_avg, per_tok_count
 
 
 def perplexity_ind_model(model, len_seq=2000, start_token=0):
@@ -660,4 +690,4 @@ def FW_BW_loss_comparison(recorder_fw, recorder_bw):
     ax[0].legend()
     ax[1].legend()
 
-    return 
+    return
