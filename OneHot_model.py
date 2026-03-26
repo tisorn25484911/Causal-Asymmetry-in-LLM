@@ -89,7 +89,7 @@ def cross_ent_onehot(logits, targets):
     logits_prob = flat_input.softmax(dim=-1)
     cond_ent    = -(target_prob * logits_prob.log2()).sum(dim=1)
     loss        = cond_ent.mean()
-    perplexity  = torch.exp(loss)
+    perplexity  = 2**loss
 
     return loss, perplexity
 
