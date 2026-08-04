@@ -1,0 +1,27 @@
+# Direct dependencies for LLM_final_version.
+#
+# Setup (Phase 0 of IMPROVEMENT_PLAN.md):
+#     conda create -n asym python=3.12 -y
+#     conda activate asym
+#     pip install -r requirements.txt
+#
+# Verified working on macOS arm64 / Python 3.12 on 2026-08-04.
+# For a byte-exact reproduction of that environment use requirements-lock.txt.
+#
+# NOTE ON THE OLD BREAKAGE: the /opt/anaconda3 base env could not import
+# umap because its numba was too old for numpy 2.x ("Numba needs NumPy 1.26
+# or less").  numba>=0.66 is the constraint that fixes it -- do not downgrade
+# numba or umap-learn below the pins here without re-checking that
+# `import umap` still works.
+
+torch==2.13.0
+lightning==2.6.5
+
+numpy==2.4.6
+scipy==1.18.0
+scikit-learn==1.9.0
+umap-learn==0.5.12
+numba==0.66.0          # transitively required by umap; pinned because it gates numpy 2.x
+
+matplotlib==3.11.1
+pandas==3.0.5          # used by lightning's CSVLogger
