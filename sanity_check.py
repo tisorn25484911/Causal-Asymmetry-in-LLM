@@ -493,7 +493,7 @@ def exp_coin(cfg, out_root):
         tag, cv_fw, cv_bw, ana_fw, ana_bw,
         loader_ana, num_token, odir, h_inf,
         sample_seq=sample_seq, p=p, q=q, cfg=cfg)
-    paired = paired_delta_ce(cv_fw, cv_bw, label=tag)
+    paired = paired_delta_ce(cv_fw, cv_bw, label=tag, theory=h_inf)
 
     # Save
     save_weights(cv_fw["best_model"],
@@ -616,7 +616,7 @@ def exp_flower(cfg, out_root):
         tag, cv_fw, cv_bw, ana_fw, ana_bw,
         loader_ana, num_token, odir, h_inf_flower,
         sample_seq=sample_seq, cfg=cfg)
-    paired = paired_delta_ce(cv_fw, cv_bw, label=tag)
+    paired = paired_delta_ce(cv_fw, cv_bw, label=tag, theory=h_inf_flower)
 
     # Save
     save_weights(cv_fw["best_model"],

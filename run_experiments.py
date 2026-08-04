@@ -475,7 +475,7 @@ def experiment_1(cfg, out_root, all_results):
     compare_fw_bw(tag, cv_fw, cv_bw, ana_fw, ana_bw,
                   loader_fw_ana, num_token, odir, sample_seq,
                   theory, theory, cfg["attn_vis_len"], p, q, cfg=cfg)
-    paired = paired_delta_ce(cv_fw, cv_bw, label=tag)
+    paired = paired_delta_ce(cv_fw, cv_bw, label=tag, theory=theory)
 
     print(f"\n  Exp 1 done in {(time.time()-t0)/60:.1f} min")
     res = dict(tag=tag, p=p, q=q, theory=theory, seed=seed, paired=paired,
@@ -553,7 +553,7 @@ def experiment_1_2(cfg, out_root, all_results):
     compare_fw_bw(tag, cv_fw, cv_bw, ana_fw, ana_bw,
                   loader_fw_ana, num_token, odir, sample_seq,
                   theory, theory, cfg["attn_vis_len"], p, q, cfg=cfg)
-    paired = paired_delta_ce(cv_fw, cv_bw, label=tag)
+    paired = paired_delta_ce(cv_fw, cv_bw, label=tag, theory=theory)
 
     # p-q heatmaps
     print("\n  -- Theoretical heatmap --")
@@ -730,7 +730,7 @@ def experiment_2(cfg, out_root, all_results, n, m, role):
     compare_fw_bw(tag, cv_fw, cv_bw, ana_fw, ana_bw,
                   loader_fw_ana, num_token, odir, sample_seq,
                   theory, theory, cfg["attn_vis_len"], cfg=cfg)
-    paired = paired_delta_ce(cv_fw, cv_bw, label=tag)
+    paired = paired_delta_ce(cv_fw, cv_bw, label=tag, theory=theory)
     if paired:
         agrees = (paired["mean"] > 0) == (C_minus > C_plus)
         print(f"  sign of delta_CE {'MATCHES' if agrees else 'CONTRADICTS'} "

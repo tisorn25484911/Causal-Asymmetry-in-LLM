@@ -111,7 +111,7 @@ def slim_results(obj):
     return obj
 
 
-def paired_delta_ce(cv_fw, cv_bw, label=""):
+def paired_delta_ce(cv_fw, cv_bw, label="", theory=None, conv_tol=0.10):
     """
     Paired delta-CE = CE_BW - CE_FW, fold by fold, on the held-out test set.
 
@@ -138,20 +138,68 @@ def paired_delta_ce(cv_fw, cv_bw, label=""):
         print("  ! paired_delta_ce: arms were run with different seeds "
               f"({cv_fw.get('seed')} vs {cv_bw.get('seed')}) — NOT paired")
 
-    d    = bw - fw
-    n    = d.size
-    mean = float(d.mean())
-    sd   = float(d.std(ddof=1)) if n > 1 else 0.0
-    sem  = sd / np.sqrt(n) if n > 1 else float("nan")
-    t    = mean / sem if sem and np.isfinite(sem) and sem > 0 else float("nan")
+    def _stats(diff):
+        k = diff.size
+        if k == 0:
+            return dict(mean=float("nan"), sd=float("nan"),
+                        sem=float("nan"), t=float("nan"), n=0)
+        mu = float(diff.mean())
+        sd = float(diff.std(ddof=1)) if k > 1 else 0.0
+        se = sd / np.sqrt(k) if k > 1 else float("nan")
+        return dict(mean=mu, sd=sd, sem=se,
+                    t=(mu / se if se and np.isfinite(se) and se > 0 else float("nan")),
+                    n=k)
 
-    print(f"\n  Paired delta-CE (BW - FW) over {n} folds{' — ' + label if label else ''}")
+    d   = bw - fw
+    all_stats = _stats(d)
+
+    # Convergence filter.  A fold that failed to escape a bad local optimum
+    # contributes an optimisation failure, not a causal-asymmetry measurement,
+    # and at 5 folds one such fold dominates the mean.  Observed in
+    # sanity_check: most folds land within 0.01 bits of H_inf while roughly one
+    # in six sits 0.4-0.7 bits above it.  Folds are called converged when BOTH
+    # arms are within conv_tol of the process entropy rate.
+    #
+    # Nothing is hidden: both statistics are printed and both are returned, and
+    # fold_ce_fw / fold_ce_bw keep every fold so any other filter can be
+    # applied after the fact without re-running.
+    converged = None
+    conv_stats = None
+    if theory is not None and np.isfinite(theory):
+        converged = (np.abs(fw - theory) <= conv_tol) & (np.abs(bw - theory) <= conv_tol)
+        conv_stats = _stats(d[converged])
+
+    print(f"\n  Paired delta-CE (BW - FW) over {all_stats['n']} folds"
+          f"{' — ' + label if label else ''}")
     for k, (a, b) in enumerate(zip(fw, bw)):
-        print(f"    fold {k+1}: CE_FW={a:.4f}  CE_BW={b:.4f}  delta={b-a:+.4f}")
-    print(f"    mean={mean:+.4f}  sd={sd:.4f}  sem={sem:.4f}  t={t:+.2f}")
+        flag = ""
+        if converged is not None and not converged[k]:
+            flag = "   <-- NOT CONVERGED, excluded from the filtered mean"
+        print(f"    fold {k+1}: CE_FW={a:.4f}  CE_BW={b:.4f}  delta={b-a:+.4f}{flag}")
+    print(f"    all folds      : mean={all_stats['mean']:+.4f}  "
+          f"sd={all_stats['sd']:.4f}  sem={all_stats['sem']:.4f}  t={all_stats['t']:+.2f}")
+    if conv_stats is not None:
+        n_bad = int((~converged).sum())
+        if conv_stats["n"] == 0:
+            print(f"    converged only : NO fold reached within {conv_tol} bits of "
+                  f"H_inf={theory:.4f} — reporting all folds, and the number "
+                  f"below is an optimisation artefact, not a measurement")
+        else:
+            print(f"    converged only : mean={conv_stats['mean']:+.4f}  "
+                  f"sd={conv_stats['sd']:.4f}  sem={conv_stats['sem']:.4f}  "
+                  f"t={conv_stats['t']:+.2f}   ({conv_stats['n']}/{all_stats['n']} folds"
+                  f"{f', {n_bad} dropped' if n_bad else ''})")
 
-    return dict(fold_ce_fw=fw.tolist(), fold_ce_bw=bw.tolist(),
-                fold_delta=d.tolist(), mean=mean, sd=sd, sem=sem, t=t, n=n)
+    out = dict(fold_ce_fw=fw.tolist(), fold_ce_bw=bw.tolist(),
+               fold_delta=d.tolist(), theory=theory, conv_tol=conv_tol,
+               converged=(converged.tolist() if converged is not None else None),
+               all_folds=all_stats, converged_only=conv_stats)
+    # Headline: the converged-fold statistic when we have a theory value to
+    # judge convergence against, otherwise all folds.
+    head = conv_stats if (conv_stats and conv_stats["n"] > 0) else all_stats
+    out.update(mean=head["mean"], sd=head["sd"], sem=head["sem"],
+               t=head["t"], n=head["n"])
+    return out
 
 
 def _sub(arr: np.ndarray, n: int = 1000) -> tuple:
