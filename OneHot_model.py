@@ -207,6 +207,41 @@ class OneHotDecoder(L.LightningModule):
         # capture_attention() context manager.
         self.store_attention = False
 
+        # D4: (T, device) -> (1, T, T) bool mask.  A plain dict, deliberately
+        # not a buffer, so it stays out of state_dict.
+        self._mask_cache: dict = {}
+
+    def _causal_mask(self, T: int, device) -> torch.Tensor:
+        """
+        (1, T, T) attention mask, built once per (T, device) — D4.
+
+        The tril/triu mask was rebuilt on EVERY forward pass, allocating a
+        T x T bool tensor each time.  It depends only on (T, device, mode) and
+        the mode is fixed for the life of the model, so it is cached.  Held in
+        a plain dict rather than a buffer so it never lands in state_dict and
+        cannot affect checkpoint compatibility.
+
+        True = allowed.  Forward (tril): position t attends to [0, t].
+        Backward (triu): position t attends to [t, T-1].  The two are exact
+        mirror images -- summed over positions the context budget is identical,
+        which is why the mask is NOT the forward/backward confound (the
+        positional encoding is; see IMPROVEMENT_PLAN.md C2).
+        """
+        key = (T, str(device))
+        cached = self._mask_cache.get(key)
+        if cached is not None:
+            return cached
+        ones = torch.ones((T, T), device=device, dtype=torch.bool)
+        if self.mode == "forward":
+            mask = torch.tril(ones).unsqueeze(0)
+        elif self.mode == "backward":
+            mask = torch.triu(ones).unsqueeze(0)
+        else:
+            raise ValueError(
+                f"Invalid mode: {self.mode}. Must be 'forward' or 'backward'")
+        self._mask_cache[key] = mask
+        return mask
+
     @contextmanager
     def capture_attention(self):
         """Temporarily retain last_attention (see store_attention, D3)."""
@@ -235,14 +270,9 @@ class OneHotDecoder(L.LightningModule):
         reverse_pos = (self.mode == "backward" and self.reverse_pos_for_backward)
         x = self.pe(x, reverse_pos=reverse_pos)  # (B, T, D)
 
-        # --- build mask consistent with goal ---
+        # --- build mask consistent with goal (cached — D4) ---
         B, T, _ = x.shape
-        if self.mode == "forward":
-            mask = torch.tril(torch.ones((T, T), device=x.device, dtype=torch.bool)).unsqueeze(0)  # (1,T,T)
-        elif self.mode == "backward":
-            mask = torch.triu(torch.ones((T, T), device=x.device, dtype=torch.bool)).unsqueeze(0)  # (1,T,T)
-        else:
-            raise ValueError(f"Invalid mode: {self.mode}. Must be 'forward' or 'backward'")
+        mask = self._causal_mask(T, x.device)
 
         want_attn = self.store_attention
         attn_maps = []

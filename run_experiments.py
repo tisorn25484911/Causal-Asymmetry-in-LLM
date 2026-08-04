@@ -92,6 +92,7 @@ from Data_generation import CoinDataset, coin_generation
 # the generator from there and the Dataset from here.
 from Flower_process_generation import FlowerDataset, flower_process_generation
 from Model_analysis import (
+    warm_up_umap,
     _sample_latents,
     _scatter_tokens,
     slim_results,
@@ -118,19 +119,8 @@ from Training_model import (
 )
 from pq_experiment import heatmap_theory, plot_heatmap, pq_experiment_full
 
-# ── UMAP — warm up JIT here so segfault (if any) happens at startup ───────
-# FIX-2: pre-compile numba kernels before training begins
-try:
-    import umap as _umap_mod
-    _warmup = _umap_mod.UMAP(n_components=2, n_neighbors=20).fit_transform(
-        np.random.rand(20, 4)
-    )
-    del _warmup
-    UMAP_AVAILABLE = True
-    print("umap-learn JIT warm-up succeeded")
-except Exception as _e:
-    UMAP_AVAILABLE = False
-    print(f"UMAP unavailable ({_e}) — PCA fallback active")
+# D4: one lazy warm-up, called from main() -- this used to be a third copy of
+# the same JIT compile (Model_analysis at import, here, and sanity_check).
 
 
 # ══════════════════════════════════════════════════════════════════════════
@@ -829,6 +819,9 @@ def main(argv=None):
     # A4: out_root comes from the config, so two configurations can no longer
     # overwrite each other's weights in a shared results/models/ directory.
     out_root = cfg["out_root"]
+    # FIX-2: pre-compile numba kernels so a segfault, if any, happens now
+    # rather than hours into training.
+    warm_up_umap(cfg.get("umap_n_neighbors", 15))
     set_seed(cfg["seed"])                    # A2: reproducible end to end
     mkdir(out_root)
     mkdir(os.path.join(out_root, "models"))

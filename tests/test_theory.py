@@ -504,3 +504,63 @@ def test_vectorised_per_token_kl_matches_explicit_loop():
 
     assert np.allclose(kl_vec, kl_loop, rtol=1e-9)
     assert np.array_equal(cnt_vec, cnt_loop)
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Cheap wins must not change behaviour — D4
+# ─────────────────────────────────────────────────────────────────────────────
+def test_causal_mask_is_cached_correct_and_not_serialised():
+    from OneHot_model import OneHotDecoder
+    dev = torch.device("cpu")
+    fw = OneHotDecoder(token_size=3, d_model=8, max_len=32, mode="forward", n_layers=1)
+    bw = OneHotDecoder(token_size=3, d_model=8, max_len=32, mode="backward", n_layers=1)
+
+    a, b = fw._causal_mask(8, dev), fw._causal_mask(8, dev)
+    assert a is b, "mask should be built once per (T, device)"
+    assert torch.equal(a, torch.tril(torch.ones(8, 8, dtype=torch.bool)).unsqueeze(0))
+    assert torch.equal(bw._causal_mask(8, dev),
+                       torch.triu(torch.ones(8, 8, dtype=torch.bool)).unsqueeze(0))
+    # different T must not reuse the wrong cache entry
+    assert fw._causal_mask(5, dev).shape == (1, 5, 5)
+    # the cache must never reach a checkpoint
+    assert not any("mask" in k for k in fw.state_dict())
+
+    # tril and triu are exact mirror images -- the mask is NOT the fw/bw
+    # confound (C2 says the positional encoding is)
+    T = 9
+    f = fw._causal_mask(T, dev)[0]
+    r = bw._causal_mask(T, dev)[0]
+    assert torch.equal(f, torch.flip(r, dims=[0, 1]))
+    assert f.sum() == r.sum()
+
+
+def test_perplexity_calculation_matches_concatenate_first():
+    """D4 made this incremental; it must equal the old concatenate-then-CE."""
+    from Model_analysis import perplexity_calculation
+    from OneHot_model import cross_ent_onehot
+
+    class M(torch.nn.Module):
+        mode = "forward"
+        def __init__(s):
+            super().__init__(); s.p = torch.nn.Parameter(torch.zeros(1)); s.i = 0
+        def forward(s, x):
+            g = torch.Generator().manual_seed(s.i); s.i += 1
+            return torch.randn(x.shape[0], x.shape[1], 3, generator=g)
+
+    batches = [(torch.randint(0, 3, (8, 40)), torch.randint(0, 3, (8, 40)))
+               for _ in range(4)]
+    m = M()
+    logits, targs = [], []
+    with torch.no_grad():
+        for inp, tg in batches:
+            logits.append(m(inp)); targs.append(tg)
+    ref = cross_ent_onehot(torch.cat(logits), torch.cat(targs))[1].item()
+
+    m.i = 0
+    got = perplexity_calculation(m, batches)
+    assert got == pytest.approx(ref, rel=1e-5)
+
+
+def test_umap_warm_up_is_idempotent():
+    from Model_analysis import warm_up_umap
+    assert warm_up_umap(15) == warm_up_umap(15)     # second call is a no-op

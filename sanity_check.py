@@ -70,6 +70,8 @@ from Model_analysis import (
     latent_extraction,
     paired_delta_ce,
     plot_umap,
+    warm_up_umap,
+    _project2d,
     _sample_latents,
     _scatter_tokens,
     plot_attention_heatmap,
@@ -90,15 +92,8 @@ from utils import (
     to_cpu_for_analysis as to_cpu,
 )
 
-try:
-    import umap as _umap_mod
-    _umap_mod.UMAP(n_components=2, n_neighbors=15).fit_transform(
-        np.random.rand(20, 4))
-    UMAP_AVAILABLE = True
-    print("umap-learn warm-up OK")
-except Exception as _e:
-    UMAP_AVAILABLE = False
-    print(f"UMAP unavailable ({_e}) — PCA fallback")
+# D4: one lazy warm-up, called from main().  UMAP_AVAILABLE / _project2d now
+# come from Model_analysis rather than being re-implemented here (C4).
 
 
 # =============================================================================
@@ -160,19 +155,8 @@ OUT_ROOT = "sanity_check_flower_process"
 # from utils.py -- one definition, so a fix to one cannot miss the others.
 
 
-def _project2d(flat, n_neighbors=15):
-    if UMAP_AVAILABLE:
-        try:
-            c = _umap_mod.UMAP(
-                n_components=2, random_state=42,
-                n_neighbors=min(n_neighbors, len(flat)-1),
-                min_dist=0.1, metric="euclidean",
-            ).fit_transform(flat)
-            return c, "UMAP"
-        except Exception as e:
-            print(f"  UMAP failed ({e}), using PCA")
-    from sklearn.decomposition import PCA
-    return PCA(n_components=2).fit_transform(flat), "PCA"
+# C4: _project2d was a fourth duplicated helper -- byte-equivalent to the one
+# in Model_analysis.  Imported now.
 
 
 # C6: sanity_check used to carry its own copy of the prefix-sampling bug --
@@ -741,6 +725,7 @@ def plot_cross_comparison(res_coin, res_flower, out_root):
 # =============================================================================
 def main():
     t_total = time.time()
+    warm_up_umap(CFG["umap_n_neighbors"])   # D4: once, up front
     set_seed(CFG["seed"])          # A2: reproducible end to end
     mkdir(OUT_ROOT)
     mkdir(os.path.join(OUT_ROOT, "models"))

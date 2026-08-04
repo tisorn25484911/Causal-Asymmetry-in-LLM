@@ -7,15 +7,40 @@ from OneHot_model import cross_ent_onehot
 from matplotlib.colors import TwoSlopeNorm
 try:
     import umap as _umap_mod
-    _warmup = _umap_mod.UMAP(n_components=2, n_neighbors=200).fit_transform(
-        np.random.rand(20, 4)
-    )
-    del _warmup
     UMAP_AVAILABLE = True
-    print("umap-learn JIT warm-up succeeded")
-except Exception as _e:
+except Exception as _e:                                    # pragma: no cover
+    _umap_mod = None
     UMAP_AVAILABLE = False
     print(f"UMAP unavailable ({_e}) — PCA fallback active")
+
+_UMAP_WARMED = False
+
+
+def warm_up_umap(n_neighbors: int = 15) -> bool:
+    """
+    Compile umap/numba's kernels once, up front.
+
+    D4.  This used to run at *import* of Model_analysis, again in
+    Main_call.py and again in sanity_check.py -- three JIT warm-ups per
+    process, and one of them on 20 points with n_neighbors=200, a value umap
+    clamps to 19 anyway (it emits the "n_neighbors is larger than the dataset
+    size" warning every run).  It is now lazy and idempotent: importing this
+    module costs nothing, and a runner calls this once before training so a
+    numba segfault, if any, happens at startup rather than hours in.
+    """
+    global _UMAP_WARMED
+    if _UMAP_WARMED or not UMAP_AVAILABLE:
+        return UMAP_AVAILABLE
+    try:
+        pts = np.random.rand(40, 4)
+        _umap_mod.UMAP(n_components=2,
+                       n_neighbors=min(n_neighbors, len(pts) - 1)
+                       ).fit_transform(pts)
+        _UMAP_WARMED = True
+        print("umap-learn JIT warm-up succeeded")
+    except Exception as e:                                 # pragma: no cover
+        print(f"UMAP warm-up failed ({e}) — PCA fallback may be used")
+    return UMAP_AVAILABLE
 
 plt.rcParams.update({
     "font.size": 12,
@@ -447,9 +472,22 @@ def plot_attention_heatmap(model, input_seq):
 
 #Post-train analysis:
 def perplexity_calculation(model, data_loader, max_batches=None, pad_id=None):
-    logits_all  = []
-    targets_all = []
+    """
+    Dataset-level teacher-forced perplexity: 2 ** (sum CE*n_tok / sum n_tok).
+
+    Both models are scored on the SAME ground-truth sequences, which is what
+    makes this the comparison metric (unlike self_generated_entropy_rate, C3).
+
+    D4: this used to append every batch's logits to a list and torch.cat them
+    all before computing one loss -- 80 MB of float32 held on CPU for the
+    flower config, and more once analysis moved to longer sequences.  CE is
+    accumulated incrementally instead, token-weighted so the result is
+    identical to concatenating first (the previous code computed a single mean
+    over all B*T tokens, and sum(CE_i * n_i) / sum(n_i) is that same mean).
+    Only one batch of logits is alive at a time now.
+    """
     device = next(model.parameters()).device
+    total_ce_tokens, total_tokens = 0.0, 0
 
     with torch.no_grad():
         for batch_idx, batch in enumerate(data_loader):
@@ -466,19 +504,24 @@ def perplexity_calculation(model, data_loader, max_batches=None, pad_id=None):
             targets = targets.to(device)
 
             logits = model(inputs)          # (B, T, V)
-            logits_all.append(logits.cpu())
-            targets_all.append(targets.cpu())
 
-    logits  = torch.cat(logits_all,  dim=0)
-    targets = torch.cat(targets_all, dim=0)
+            if pad_id is not None:
+                keep    = targets != pad_id
+                logits  = logits[keep]      # (n_keep, V)
+                targets = targets[keep]     # (n_keep,)
+                if targets.numel() == 0:
+                    continue
+                loss, _ = cross_ent_onehot(logits.unsqueeze(0), targets.unsqueeze(0))
+            else:
+                loss, _ = cross_ent_onehot(logits, targets)
 
-    if pad_id is not None:
-        mask    = targets != pad_id
-        logits  = logits[mask]
-        targets = targets[mask]
+            n_tok = targets.numel()
+            total_ce_tokens += loss.item() * n_tok
+            total_tokens    += n_tok
 
-    loss, perplexity = cross_ent_onehot(logits, targets)
-    return perplexity.item()
+    if total_tokens == 0:
+        return float("nan")
+    return float(2.0 ** (total_ce_tokens / total_tokens))
 
 def perplexity_ind_CE(model, data_loader, p, q, num_token=3, max_batches=None):
     """
