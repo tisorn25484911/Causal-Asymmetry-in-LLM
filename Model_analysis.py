@@ -203,9 +203,102 @@ def paired_delta_ce(cv_fw, cv_bw, label="", theory=None, conv_tol=0.10):
 
 
 def _sub(arr: np.ndarray, n: int = 1000) -> tuple:
-    """Return (latent_subset, index_array) — first n rows, no shuffle."""
+    """
+    Return (first n rows, their indices).
+
+    DEPRECATED for latent plotting -- this is the C6 bug.  `latents.reshape(-1, d)`
+    flattens (N, T, d) row-major, so the first n rows are every position of the
+    first ceil(n/T) sequences.  At chunk=256 with n=1000 that is 4 sequences;
+    at T=1999 (sanity_check) with n=500 it is positions 0-499 of sequence 0
+    ALONE.  Any cluster structure seen was conditioned on one realisation.
+    Kept only because it is a public name; use _sample_latents instead.
+    """
     n = min(n, len(arr))
     return arr[:n], np.arange(n)
+
+
+def _resolve_t(use_t, T: int) -> int:
+    """Map 'last'/'first'/int to a concrete position index."""
+    if use_t == "last":
+        return T - 1
+    if use_t == "first":
+        return 0
+    if isinstance(use_t, (int, np.integer)):
+        return int(use_t) % T
+    raise ValueError("use_t must be 'first', 'last', or an int index.")
+
+
+def _sample_latents(latents, inputs_arr, mode="per_sequence", use_t="last",
+                    n_pts=1000, burn_in=32, seed=0):
+    """
+    Choose which latent vectors to embed — IMPROVEMENT_PLAN.md C6.
+
+    latents    : (N, T, d)      inputs_arr : (N, T)
+    returns    : (points (M, d), tokens (M,), human-readable label)
+
+    Modes:
+
+    "per_sequence"
+        The latent at ONE position of every sequence, namely the max-context
+        position for the direction (use_t="last" for a tril mask, "first" for
+        triu).  This is exactly the slice statistical_complexity_empirical
+        clusters, so the picture and the S_emp number describe the same thing.
+        Every point has identical context length, so any spread is structure
+        rather than a mixture of context lengths.
+
+    "random"
+        Uniform without replacement over (sequence, position) pairs, covering
+        all N sequences.  Positions with too little context are excluded, and
+        which end counts as "too little" depends on direction: a forward model
+        accumulates context left-to-right, so its first `burn_in` positions are
+        dropped; a backward model accumulates right-to-left, so its LAST
+        `burn_in` positions are dropped.  Richer than "per_sequence" but mixes
+        context lengths, which is what produces elongated smears rather than
+        tight clusters.
+
+    "prefix"
+        The old C6 behaviour, kept so the difference can be shown rather than
+        asserted.  Do not use for results.
+    """
+    lat = np.asarray(latents)
+    inp = np.asarray(inputs_arr)
+    if lat.ndim != 3:
+        raise ValueError(f"latents must be (N, T, d), got {lat.shape}")
+    N, T, _ = lat.shape
+    rng = np.random.default_rng(seed)
+    backward = (use_t == "first")
+
+    if mode == "per_sequence":
+        t = _resolve_t(use_t, T)
+        pts, toks = lat[:, t, :], inp[:, t]
+        if len(pts) > n_pts:                       # still sample ACROSS sequences
+            keep = rng.choice(len(pts), size=n_pts, replace=False)
+            pts, toks = pts[keep], toks[keep]
+        return pts, toks, f"1 pos/seq, t={t}, {len(pts)} seqs"
+
+    if mode == "random":
+        b = int(np.clip(burn_in, 0, max(T - 1, 0)))
+        lo, hi = (0, T - b) if backward else (b, T)   # direction-aware burn-in
+        if hi <= lo:
+            lo, hi = 0, T
+        n_avail = N * (hi - lo)
+        take = min(n_pts, n_avail)
+        flat = rng.choice(n_avail, size=take, replace=False)
+        seq_i = flat // (hi - lo)
+        pos_i = flat % (hi - lo) + lo
+        pts, toks = lat[seq_i, pos_i, :], inp[seq_i, pos_i]
+        span = f"[{lo},{hi})"
+        return pts, toks, f"random over {N} seqs x pos {span}, {take} pts"
+
+    if mode == "prefix":
+        flat_l = lat.reshape(-1, lat.shape[-1])
+        flat_i = inp.reshape(-1)
+        take = min(n_pts, len(flat_l))
+        n_seq_covered = int(np.ceil(take / T))
+        return (flat_l[:take], flat_i[:take],
+                f"PREFIX (C6 bug): first {take} rows = {n_seq_covered} seq(s)")
+
+    raise ValueError(f"unknown sample mode {mode!r}")
 def savefig(fig, path: str, dpi: int = 120):
     fig.savefig(path, dpi=dpi, bbox_inches="tight")
     plt.close(fig)
@@ -251,45 +344,83 @@ def _project2d(flat: np.ndarray, n_neighbors: int = 200) -> tuple:
         except Exception as e:
             print(f"  UMAP failed ({e}), using PCA")
     return PCA(n_components=2).fit_transform(flat), "PCA"
-def plot_umap(latents, inputs_arr, num_token, title="", save_path=None,
-              xlim=None, ylim=None, n_pts: int = 1000, n_neighbors: int = 15):
-    """
-    Plot 2-D UMAP coloured by token id.
-
-    n_pts       : number of consecutive latent vectors to embed (default 1000).
-    n_neighbors : UMAP neighbourhood size.  This used to be unreachable -- the
-                  call below passed no n_neighbors, so every plot silently used
-                  the default of 200 no matter what the config said
-                  (IMPROVEMENT_PLAN.md B7).  200 neighbours on 1000 points is a
-                  very large neighbourhood and smears exactly the local cluster
-                  structure the plot exists to show; 15-50 is appropriate, and
-                  sanity_check.py already used 15.
-    """
-    flat_l = latents.reshape(-1, latents.shape[-1])
-    flat_i = inputs_arr.reshape(-1)
-    sub_l, idx = _sub(flat_l, n_pts)
-    sub_i = flat_i[idx]
-
-    coords, mlbl = _project2d(sub_l, n_neighbors=n_neighbors)
+def _scatter_tokens(ax, coords, toks, num_token, title, xlim=None, ylim=None):
     cmap = plt.cm.tab10
-    fig, ax = plt.subplots(figsize=(7, 6))
     for tok in range(num_token):
-        mask = sub_i == tok
+        mask = toks == tok
         if not mask.any():
             continue
         ax.scatter(coords[mask, 0], coords[mask, 1],
                    c=[cmap(tok / max(num_token - 1, 1))],
                    label=f"Token {tok}", alpha=0.7, s=10)
-    ax.set_title(f"{title} ({mlbl})", fontsize=11, fontweight="bold")
-    ax.legend(fontsize=8, markerscale=3)
+    ax.set_title(title, fontsize=10, fontweight="bold")
+    ax.legend(fontsize=7, markerscale=3)
     if xlim:
         ax.set_xlim(xlim)
     if ylim:
         ax.set_ylim(ylim)
     ax.grid(True, alpha=0.2)
+
+
+def plot_umap(latents, inputs_arr, num_token, title="", save_path=None,
+              xlim=None, ylim=None, n_pts: int = 1000, n_neighbors: int = 15,
+              use_t="last", burn_in: int = 32, seed: int = 0,
+              modes=("per_sequence", "random")):
+    """
+    2-D UMAP of the latents, coloured by input token, one panel per sampling
+    mode — IMPROVEMENT_PLAN.md C6.
+
+    What C6 was.  This used to embed `latents.reshape(-1, d)[:n_pts]`.  The
+    reshape is row-major, so those first n_pts rows are every position of the
+    first ceil(n_pts/T) sequences: 4 sequences at chunk=256, and at T=1999 with
+    n_pts=500 a single sequence.  Every latent figure in the repo was therefore
+    one trajectory, not a sample of the latent distribution, and any cluster
+    structure in it was conditioned on one realisation.
+
+    Two panels are drawn because they answer different questions and each is
+    misleading alone:
+
+      per_sequence  one position per sequence, at the max-context position for
+                    the direction.  This is the exact slice
+                    statistical_complexity_empirical clusters, so the figure
+                    and the S_emp number cannot tell different stories.  All
+                    points share a context length, so spread is structure.
+      random        uniform over (sequence, position) pairs across all
+                    sequences, excluding a direction-aware burn-in.  Shows far
+                    more of the distribution, but mixes context lengths.
+
+    `use_t` must match the direction ("last" for a tril mask, "first" for triu)
+    — it selects the per_sequence position and which end the burn-in trims.
+
+    n_neighbors: 15 by default.  This parameter was unreachable before B7 was
+    fixed; every plot silently used 200, which on 1000 points smears exactly
+    the local structure the figure exists to show.
+
+    Returns (fig, {mode: coords}).
+    """
+    modes = tuple(modes)
+    fig, axes = plt.subplots(1, len(modes), figsize=(6.5 * len(modes), 5.5),
+                             squeeze=False)
+    out = {}
+    for ax, mode in zip(axes[0], modes):
+        try:
+            pts, toks, lbl = _sample_latents(
+                latents, inputs_arr, mode=mode, use_t=use_t,
+                n_pts=n_pts, burn_in=burn_in, seed=seed)
+            coords, mlbl = _project2d(pts, n_neighbors=n_neighbors)
+            out[mode] = coords
+            _scatter_tokens(ax, coords, toks, num_token,
+                            f"{mode} ({mlbl})\n{lbl}", xlim, ylim)
+        except Exception as e:
+            print(f"  UMAP panel {mode!r} failed: {e}")
+            ax.set_title(f"{mode} — failed", fontsize=10)
+            ax.text(0.5, 0.5, str(e)[:80], ha="center", va="center",
+                    transform=ax.transAxes, fontsize=7)
+    fig.suptitle(title, fontsize=11, fontweight="bold")
+    fig.tight_layout()
     if save_path:
         savefig(fig, save_path)
-    return fig, coords
+    return fig, out
 def plot_attention_heatmap(model, input_seq):
     fig, ax = plt.subplots(figsize=(8, 6))
 

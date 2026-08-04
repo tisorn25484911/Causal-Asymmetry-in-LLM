@@ -298,3 +298,68 @@ def test_analysis_loader_matches_training_length():
     train = ChunckDataset(base, chunk, seed=0)
     ana   = ChunckDataset(base, chunk, seed=1000)
     assert any(not torch.equal(train[i][0], ana[i][0]) for i in range(len(base)))
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Latent sampling for the UMAPs — C6
+# ─────────────────────────────────────────────────────────────────────────────
+def _tagged_latents(N=50, T=64, d=4):
+    """latent[..., 0] = sequence index, latent[..., 1] = position index."""
+    lat = np.zeros((N, T, d), dtype=np.float32)
+    lat[..., 0] = np.arange(N)[:, None]
+    lat[..., 1] = np.arange(T)[None, :]
+    inp = np.random.default_rng(0).integers(0, 3, size=(N, T))
+    return lat, inp
+
+
+def test_prefix_sampling_is_the_c6_bug():
+    """Documents the old behaviour: n_pts rows = ceil(n_pts/T) sequences."""
+    from Model_analysis import _sample_latents
+    lat, inp = _tagged_latents(N=50, T=64)
+    pts, _, _ = _sample_latents(lat, inp, mode="prefix", n_pts=128)
+    assert len(np.unique(pts[:, 0])) == 2      # 128/64 = 2 sequences only
+
+
+def test_per_sequence_sampling_covers_every_sequence():
+    from Model_analysis import _sample_latents
+    N, T = 50, 64
+    lat, inp = _tagged_latents(N=N, T=T)
+    pts, toks, _ = _sample_latents(lat, inp, mode="per_sequence",
+                                   use_t="last", n_pts=1000)
+    assert len(pts) == N
+    assert len(np.unique(pts[:, 0])) == N          # every sequence, once
+    assert (pts[:, 1] == T - 1).all()              # all at max-context position
+    # backward reads position 0 instead
+    pts_b, _, _ = _sample_latents(lat, inp, mode="per_sequence",
+                                  use_t="first", n_pts=1000)
+    assert (pts_b[:, 1] == 0).all()
+
+
+def test_random_sampling_spreads_over_sequences_and_respects_burn_in():
+    from Model_analysis import _sample_latents
+    N, T, b = 50, 64, 16
+    lat, inp = _tagged_latents(N=N, T=T)
+
+    # forward: context grows left-to-right, so the FIRST b positions are dropped
+    pts, _, _ = _sample_latents(lat, inp, mode="random", use_t="last",
+                                n_pts=400, burn_in=b, seed=0)
+    assert len(pts) == 400
+    assert pts[:, 1].min() >= b
+    assert len(np.unique(pts[:, 0])) > N // 2      # spread over many sequences
+
+    # backward: context grows right-to-left, so the LAST b positions are dropped
+    pts_b, _, _ = _sample_latents(lat, inp, mode="random", use_t="first",
+                                  n_pts=400, burn_in=b, seed=0)
+    assert pts_b[:, 1].max() < T - b
+
+
+def test_random_sampling_is_without_replacement_and_seeded():
+    from Model_analysis import _sample_latents
+    lat, inp = _tagged_latents(N=20, T=32)
+    a, _, _ = _sample_latents(lat, inp, mode="random", n_pts=200, seed=3)
+    b, _, _ = _sample_latents(lat, inp, mode="random", n_pts=200, seed=3)
+    c, _, _ = _sample_latents(lat, inp, mode="random", n_pts=200, seed=4)
+    assert np.array_equal(a, b)                     # reproducible
+    assert not np.array_equal(a, c)                 # seed matters
+    pairs = {(int(r[0]), int(r[1])) for r in a}
+    assert len(pairs) == len(a)                     # no duplicates

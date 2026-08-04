@@ -92,6 +92,8 @@ from Data_generation import CoinDataset, coin_generation
 # the generator from there and the Dataset from here.
 from Flower_process_generation import FlowerDataset, flower_process_generation
 from Model_analysis import (
+    _sample_latents,
+    _scatter_tokens,
     slim_results,
     savefig,
     _project2d,
@@ -241,14 +243,15 @@ def plot_loss_theory(rec_fw, rec_bw, theory_fw, theory_bw, title="", save_path=N
 def analyse_model(tag, model, loader, num_token, out_dir,
                   sample_seq=None, p=None, q=None, mode="forward",
                   k=2, use_t="last", attn_vis_len=64,
-                  umap_n_pts=1000, umap_n_neighbors=15):
+                  umap_n_pts=1000, umap_n_neighbors=15,
+                  umap_burn_in=32, umap_seed=0, max_batches=20):
     """
-    `loader` must be the FULL-SEQUENCE analysis loader, not the chunked
-    training loader — IMPROVEMENT_PLAN.md B4.  README:233 states the design
-    ("Chunked training, full-length analysis... analysis on full sequences
-    remains in-distribution"); the runners used to build loader_*_ana and then
-    hand analyse_model the chunked loader instead, so UMAP and complexity ran
-    on 256-token windows.
+    `loader` must be the dedicated analysis loader from
+    make_analysis_loader() — windows at the TRAINING chunk length, drawn from
+    a different seed.  Not the full-length loader: the model only ever sees
+    positional-encoding indices [0, chunk), so evaluating at full length
+    measures extrapolation, and does so asymmetrically between the two arms.
+    See make_analysis_loader for the measured numbers.
 
     `use_t` selects the position the complexity is read at, and it must match
     the direction (A3).  With a tril mask the last position has seen the whole
@@ -270,15 +273,14 @@ def analyse_model(tag, model, loader, num_token, out_dir,
             print(f"  attn failed: {e}")
 
     try:
-        latents, inp_arr, _ = latent_extraction(model, loader, max_batches=20)
-        #is_bw = (getattr(model, "mode", "forward") == "backward")
-        lat_slice = latents.reshape(-1, latents.shape[-1])
-        inp_slice = inp_arr.reshape(-1)
-        lat_for_plot = lat_slice
-        inp_for_plot = inp_slice
-        _, coords = plot_umap(lat_for_plot, inp_for_plot, num_token, title=tag,
+        latents, inp_arr, _ = latent_extraction(model, loader, max_batches=max_batches)
+        # C6: pass the raw (N, T, d) latents, not a flattened prefix, and tell
+        # plot_umap which direction this is so it samples the max-context
+        # position and trims the burn-in from the correct end.
+        _, coords = plot_umap(latents, inp_arr, num_token, title=tag,
                               save_path=os.path.join(out_dir, f"{tag}_umap.png"),
-                              n_pts=umap_n_pts, n_neighbors=umap_n_neighbors)
+                              n_pts=umap_n_pts, n_neighbors=umap_n_neighbors,
+                              use_t=use_t, burn_in=umap_burn_in, seed=umap_seed)
         res.update({"latents": latents, "inputs_arr": inp_arr, "umap_coords": coords})
     except Exception as e:
         print(f"  UMAP failed: {e}")
@@ -317,8 +319,10 @@ def compare_fw_bw(tag, cv_fw, cv_bw, ana_fw, ana_bw, loader_ana, num_token, out_
     False and the value was always the hard-coded 200.
     """
     cfg = cfg or {}
-    n_nbr = cfg.get("umap_n_neighbors", 15)
-    n_pts_cfg = cfg.get("umap_n_pts", 1000)
+    n_nbr       = cfg.get("umap_n_neighbors", 15)
+    n_pts_cfg   = cfg.get("umap_n_pts", 1000)
+    umap_seed   = cfg.get("seed", 0)
+    max_batches = cfg.get("max_batches", 20)
     mfw = cv_fw["best_model"];  mbw = cv_bw["best_model"]
     rfw = cv_fw["best_recorder"];  rbw = cv_bw["best_recorder"]
 
@@ -341,39 +345,34 @@ def compare_fw_bw(tag, cv_fw, cv_bw, ana_fw, ana_bw, loader_ana, num_token, out_
         print(f"  attn compare failed: {e}")
 
     # (c) side-by-side UMAP of the two models' latents on the same data.
-    # Both arms see the same forward-generated sequences; they differ in the
-    # attention mask and the batch convention.  Latents from every position are
-    # flattened together here (the per-direction max-context slice is what the
-    # complexity estimator uses, via use_t).
+    # Both arms see the same forward-generated sequences; they differ only in
+    # the attention mask and the batch convention.
+    #
+    # C6: each arm is sampled at ITS OWN max-context position — last for the
+    # forward (tril) model, first for the backward (triu) one — one point per
+    # sequence, across all sequences.  This used to take the first n_pts rows
+    # of the flattened array, i.e. every position of the first few sequences,
+    # so the two panels were comparing single trajectories.
     try:
-        lfw, ifw, _ = latent_extraction(mfw, loader_ana, max_batches=20)
-        lbw, ibw, _ = latent_extraction(mbw, loader_ana, max_batches=20)
-        lat_fw = lfw.reshape(-1, lfw.shape[-1])
-        lat_bw = lbw.reshape(-1, lbw.shape[-1])
-        inp_fw = ifw.reshape(-1)
-        inp_bw = ibw.reshape(-1)
-        n_pts = min(n_pts_cfg, len(lat_fw), len(lat_bw))
-        fl_fw, fl_bw = lat_fw[:n_pts], lat_bw[:n_pts]
-        si_fw, si_bw = inp_fw[:n_pts], inp_bw[:n_pts]
+        lfw, ifw, _ = latent_extraction(mfw, loader_ana, max_batches=max_batches)
+        lbw, ibw, _ = latent_extraction(mbw, loader_ana, max_batches=max_batches)
+        fl_fw, si_fw, lab_fw = _sample_latents(
+            lfw, ifw, mode="per_sequence", use_t="last",
+            n_pts=n_pts_cfg, seed=umap_seed)
+        fl_bw, si_bw, lab_bw = _sample_latents(
+            lbw, ibw, mode="per_sequence", use_t="first",
+            n_pts=n_pts_cfg, seed=umap_seed)
         c_fw, mlbl = _project2d(fl_fw, n_neighbors=n_nbr)
         c_bw, _    = _project2d(fl_bw, n_neighbors=n_nbr)
 
         # Independent projections — no shared axis range
-        cmap = plt.cm.tab10
-        fig, axes = plt.subplots(1, 2, figsize=(12, 5))
+        fig, axes = plt.subplots(1, 2, figsize=(13, 5.5))
         for ax, coords, raw_inp, lbl in zip(
             axes, [c_fw, c_bw], [si_fw, si_bw],
-            [f"Forward model ({mlbl})", f"Backward model ({mlbl})"]
+            [f"Forward model, max context ({mlbl})\n{lab_fw}",
+             f"Backward model, max context ({mlbl})\n{lab_bw}"]
         ):
-            for tok in range(num_token):
-                mask = raw_inp == tok
-                if not mask.any(): continue
-                ax.scatter(coords[mask, 0], coords[mask, 1],
-                           c=[cmap(tok / max(num_token - 1, 1))],
-                           label=f"Token {tok}", alpha=0.7, s=10)
-            ax.set_title(lbl, fontsize=13, fontweight="bold")
-            ax.legend(fontsize=8, markerscale=3)
-            ax.grid(True, alpha=0.2)
+            _scatter_tokens(ax, coords, raw_inp, num_token, lbl)
         fig.suptitle(tag, fontsize=12, fontweight="bold")
         fig.tight_layout()
         savefig(fig, os.path.join(out_dir, f"{tag}_umap_compare.png"))
@@ -459,7 +458,9 @@ def experiment_1(cfg, out_root, all_results):
                            num_token, odir, sample_seq, p, q, "forward",
                            k=2, use_t="last", attn_vis_len=cfg["attn_vis_len"],
                            umap_n_pts=cfg["umap_n_pts"],
-                           umap_n_neighbors=cfg["umap_n_neighbors"])
+                           umap_n_neighbors=cfg["umap_n_neighbors"],
+                           umap_burn_in=cfg["umap_burn_in"], umap_seed=cfg["seed"],
+                           max_batches=cfg["max_batches"])
     cleanup()  # GC between fw and bw analysis (model already moved to CPU)
     # A3: use_t="first" for the backward arm.  With a triu mask position T-1
     # attends to itself only, so reading complexity at "last" read latents that
@@ -468,7 +469,9 @@ def experiment_1(cfg, out_root, all_results):
                            num_token, odir, sample_seq, p, q, "backward",
                            k=3, use_t="first", attn_vis_len=cfg["attn_vis_len"],
                            umap_n_pts=cfg["umap_n_pts"],
-                           umap_n_neighbors=cfg["umap_n_neighbors"])
+                           umap_n_neighbors=cfg["umap_n_neighbors"],
+                           umap_burn_in=cfg["umap_burn_in"], umap_seed=cfg["seed"],
+                           max_batches=cfg["max_batches"])
     cleanup()
 
     print("\n  -- 1d Comparison --")
@@ -542,13 +545,17 @@ def experiment_1_2(cfg, out_root, all_results):
                            num_token, odir, sample_seq, p, q, "forward",
                            k=2, use_t="last", attn_vis_len=cfg["attn_vis_len"],
                            umap_n_pts=cfg["umap_n_pts"],
-                           umap_n_neighbors=cfg["umap_n_neighbors"])
+                           umap_n_neighbors=cfg["umap_n_neighbors"],
+                           umap_burn_in=cfg["umap_burn_in"], umap_seed=cfg["seed"],
+                           max_batches=cfg["max_batches"])
     cleanup()
     ana_bw = analyse_model(f"{tag}_bw", cv_bw["best_model"], loader_fw_ana,
                            num_token, odir, sample_seq, p, q, "backward",
                            k=3, use_t="first", attn_vis_len=cfg["attn_vis_len"],  # A3
                            umap_n_pts=cfg["umap_n_pts"],
-                           umap_n_neighbors=cfg["umap_n_neighbors"])
+                           umap_n_neighbors=cfg["umap_n_neighbors"],
+                           umap_burn_in=cfg["umap_burn_in"], umap_seed=cfg["seed"],
+                           max_batches=cfg["max_batches"])
     cleanup()
     compare_fw_bw(tag, cv_fw, cv_bw, ana_fw, ana_bw,
                   loader_fw_ana, num_token, odir, sample_seq,
@@ -715,14 +722,18 @@ def experiment_2(cfg, out_root, all_results, n, m, role):
                            num_token, odir, sample_seq, None, None, "forward",
                            k=n+1, use_t="last", attn_vis_len=cfg["attn_vis_len"],
                            umap_n_pts=cfg["umap_n_pts"],
-                           umap_n_neighbors=cfg["umap_n_neighbors"])
+                           umap_n_neighbors=cfg["umap_n_neighbors"],
+                           umap_burn_in=cfg["umap_burn_in"], umap_seed=cfg["seed"],
+                           max_batches=cfg["max_batches"])
     ana_fw["S_theory"] = C_plus
     cleanup()
     ana_bw = analyse_model(f"{tag}_bw", cv_bw["best_model"], loader_fw_ana,
                            num_token, odir, sample_seq, None, None, "backward",
                            k=m+1, use_t="first", attn_vis_len=cfg["attn_vis_len"],  # A3
                            umap_n_pts=cfg["umap_n_pts"],
-                           umap_n_neighbors=cfg["umap_n_neighbors"])
+                           umap_n_neighbors=cfg["umap_n_neighbors"],
+                           umap_burn_in=cfg["umap_burn_in"], umap_seed=cfg["seed"],
+                           max_batches=cfg["max_batches"])
     ana_bw["S_theory"] = C_minus
     cleanup()
 

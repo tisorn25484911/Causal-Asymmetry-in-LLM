@@ -69,6 +69,9 @@ from Model_analysis import (
     flower_entropy_rate,
     latent_extraction,
     paired_delta_ce,
+    plot_umap,
+    _sample_latents,
+    _scatter_tokens,
     plot_attention_heatmap,
     perplexity_calculation,
     statistical_complexity,
@@ -171,26 +174,18 @@ def _project2d(flat, n_neighbors=15):
     return PCA(n_components=2).fit_transform(flat), "PCA"
 
 
-def plot_umap_tokens(flat_lat, flat_inp, num_token, title="",
-                     save_path=None, n_pts=500, n_neighbors=15):
-    reduced  = flat_lat[:n_pts]
-    tok_ids  = flat_inp[:n_pts]
-    coords, mlbl = _project2d(reduced, n_neighbors=n_neighbors)
-    cmap = plt.cm.tab10
-    fig, ax = plt.subplots(figsize=(7, 6))
-    for tok in range(num_token):
-        mask = tok_ids == tok
-        if not mask.any():
-            continue
-        ax.scatter(coords[mask, 0], coords[mask, 1],
-                   c=[cmap(tok / max(num_token-1, 1))],
-                   label=f"Token {tok}", alpha=0.7, s=10)
-    ax.set_title(f"{title} ({mlbl})", fontsize=11, fontweight="bold")
-    ax.legend(fontsize=8, markerscale=3)
-    ax.grid(True, alpha=0.2)
-    if save_path:
-        savefig(fig, save_path)
-    return fig, coords
+# C6: sanity_check used to carry its own copy of the prefix-sampling bug --
+# `flat_lat[:n_pts]` on an array flattened from (N, T, d).  At T=999 with
+# n_pts=500 that was positions 0-499 of sequence 0 ALONE.  It now delegates to
+# the shared Model_analysis.plot_umap, which draws both the per-sequence and
+# the random-across-sequences panels.
+def plot_umap_tokens(latents, inputs_arr, num_token, title="",
+                     save_path=None, n_pts=500, n_neighbors=15,
+                     use_t="last", burn_in=32, seed=0):
+    return plot_umap(latents, inputs_arr, num_token, title=title,
+                     save_path=save_path, n_pts=n_pts,
+                     n_neighbors=n_neighbors, use_t=use_t,
+                     burn_in=burn_in, seed=seed)
 
 
 def plot_loss_theory(rec_fw, rec_bw, h_inf, title="", save_path=None):
@@ -258,21 +253,21 @@ def analyse_model(tag, model, loader_ana, num_token, out_dir,
     try:
         latents, inp_arr, _ = latent_extraction(
             model, loader_ana, max_batches=cfg.get("max_batches", 20))
-        flat_lat = latents.reshape(-1, latents.shape[-1])
-        flat_inp = inp_arr.reshape(-1)
+        # C6: raw (N, T, d) and the direction, so plot_umap can sample one
+        # position per sequence at max context AND a random spread.
         fig_u, coords = plot_umap_tokens(
-            flat_lat, flat_inp, num_token,
+            latents, inp_arr, num_token,
             title=tag,
             save_path=os.path.join(out_dir, f"{tag}_umap.png"),
             n_pts=cfg.get("umap_n_pts", 500),
             n_neighbors=cfg.get("umap_n_neighbors", 15),
+            use_t=use_t, burn_in=cfg.get("umap_burn_in", 32),
+            seed=cfg.get("seed", 0),
         )
-        res.update({"latents": latents, "flat_lat": flat_lat,
-                    "flat_inp": flat_inp, "umap_coords": coords})
+        res.update({"latents": latents, "umap_coords": coords})
     except Exception as e:
         print(f"  UMAP: {e}")
-        res.update({"latents": None, "flat_lat": None,
-                    "flat_inp": None, "umap_coords": None})
+        res.update({"latents": None, "umap_coords": None})
 
     try:
         S_emp = statistical_complexity_empirical(
@@ -329,10 +324,14 @@ def compare_fw_bw(tag, cv_fw, cv_bw, ana_fw, ana_bw,
                                          max_batches=cfg.get("max_batches", 20))
         n_pts = cfg.get("umap_n_pts", 500)
         n_nbr = cfg.get("umap_n_neighbors", 15)
-        fl_fw = lfw.reshape(-1, lfw.shape[-1])[:n_pts]
-        fl_bw = lbw.reshape(-1, lbw.shape[-1])[:n_pts]
-        si_fw = ifw.reshape(-1)[:n_pts]
-        si_bw = ibw.reshape(-1)[:n_pts]
+        # C6: each arm at ITS OWN max-context position, one point per
+        # sequence, across all sequences.
+        fl_fw, si_fw, lab_fw = _sample_latents(lfw, ifw, mode="per_sequence",
+                                               use_t="last",  n_pts=n_pts,
+                                               seed=cfg.get("seed", 0))
+        fl_bw, si_bw, lab_bw = _sample_latents(lbw, ibw, mode="per_sequence",
+                                               use_t="first", n_pts=n_pts,
+                                               seed=cfg.get("seed", 0))
         c_fw, mlbl = _project2d(fl_fw, n_neighbors=n_nbr)
         c_bw, _    = _project2d(fl_bw, n_neighbors=n_nbr)
 
@@ -340,7 +339,8 @@ def compare_fw_bw(tag, cv_fw, cv_bw, ana_fw, ana_bw,
         fig, axes = plt.subplots(1, 2, figsize=(12, 5))
         for ax, coords, raw_inp, lbl in zip(
             axes, [c_fw, c_bw], [si_fw, si_bw],
-            [f"Forward model ({mlbl})", f"Backward model ({mlbl})"]
+            [f"Forward model, max context ({mlbl})\n{lab_fw}",
+             f"Backward model, max context ({mlbl})\n{lab_bw}"]
         ):
             for tok in range(num_token):
                 mask = raw_inp == tok

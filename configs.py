@@ -57,6 +57,10 @@ BASE = dict(
     # until B7 was fixed -- every plot silently used the hard-coded 200.)
     umap_n_neighbors = 15,
     umap_n_pts       = 1000,
+    # C6: positions with too little context are dropped from the "random"
+    # UMAP panel.  Direction-aware -- trimmed from the start for a forward
+    # model and from the end for a backward one.
+    umap_burn_in     = 32,
     coin_num_token   = 3,
     flower_dice_seed = 42,
     # ── flower configurations (A1) ─────────────────────────────────────
