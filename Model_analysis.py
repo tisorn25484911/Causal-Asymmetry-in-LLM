@@ -536,15 +536,15 @@ def perplexity_ind_CE(model, data_loader, p, q, num_token=3, max_batches=None):
             p_model = torch.softmax(logits, dim=-1).cpu().numpy()  # (B, T, V)
             inp_np  = inputs.cpu().numpy()          # (B, T)
 
-            B, T, _ = p_model.shape
-            for b in range(B):
-                for t in range(T):
-                    cur_tok = inp_np[b, t]
-                    p_true  = target_prob[cur_tok]  # (V,) soft label
-                    p_mod   = p_model[b, t]         # (V,)
-                    ce_t    = -np.sum(p_true * np.log2(p_mod + 1e-12))
-                    total_ce += ce_t
-                    n_steps  += 1
+            # D2: vectorised.  This was `for b: for t:` in pure Python.
+            # LLM_asymmetry_testing calls it with max_batches=None, i.e. 500
+            # sequences x 1999 positions = 1e6 iterations per call, four calls
+            # per experiment.  Fancy-indexing target_prob by the input tokens
+            # gives the (B, T, V) soft-label array in one step.
+            p_true = target_prob[inp_np]                     # (B, T, V)
+            ce_bt  = -(p_true * np.log2(p_model + 1e-12)).sum(-1)   # (B, T)
+            total_ce += float(ce_bt.sum())
+            n_steps  += ce_bt.size
 
     if n_steps == 0:
         raise ValueError("No steps accumulated — empty loader or max_batches=0.")
@@ -590,17 +590,17 @@ def stepwise_kl_coin(model, loader, p, q, num_token=3, max_batches=None):
             logits  = model(inputs)
             p_model = torch.softmax(logits, dim=-1).cpu().numpy()
             inp_np  = inputs.cpu().numpy()
-            B, T, _ = p_model.shape
-            for b in range(B):
-                for t in range(T):
-                    cur_tok = inp_np[b, t]
-                    p_true  = true_cond[cur_tok]
-                    p_mod   = p_model[b, t]
-                    kl_t    = float(np.sum(
-                        p_true * np.log2(p_true / (p_mod + 1e-12) + 1e-12)))
-                    total_kl              += kl_t
-                    per_tok_kl[cur_tok]   += kl_t
-                    per_tok_count[cur_tok] += 1
+            # D2: vectorised, same shape of fix as perplexity_ind_CE.
+            # np.bincount does the per-token accumulation that the inner loop
+            # was doing one element at a time.
+            p_true = true_cond[inp_np]                          # (B, T, V)
+            kl_bt  = (p_true * np.log2(p_true / (p_model + 1e-12) + 1e-12)).sum(-1)
+            flat_tok = inp_np.reshape(-1)
+            flat_kl  = kl_bt.reshape(-1)
+            total_kl      += float(flat_kl.sum())
+            per_tok_kl    += np.bincount(flat_tok, weights=flat_kl,
+                                         minlength=num_token)
+            per_tok_count += np.bincount(flat_tok, minlength=num_token)
 
     mean_kl     = total_kl / max(per_tok_count.sum(), 1)
     per_tok_avg = np.where(per_tok_count > 0,

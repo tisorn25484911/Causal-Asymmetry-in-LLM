@@ -27,17 +27,25 @@ def heatmap_theory(
     p_values = np.array(p_values, dtype=float)
     q_values = np.array(q_values, dtype=float)
 
-    Ss_theory_FW = np.zeros((len(p_values), len(q_values)), dtype=float)
-    Ss_theory_BW = np.zeros((len(p_values), len(q_values)), dtype=float)
-
     print(f"Computing theoretical complexity for {len(p_values)} x {len(q_values)} grid...")
 
-    for i, p in enumerate(p_values):
-        if i % 10 == 0:
-            print(f"  Progress: {i}/{len(p_values)}")
-        for j, q in enumerate(q_values):
-            Ss_theory_FW[i, j] = statistical_complexity(p, q, mode="forward")
-            Ss_theory_BW[i, j] = statistical_complexity(p, q, mode="backward")
+    # D2: vectorised.  This used to double-loop the grid calling
+    # statistical_complexity once per cell to evaluate a closed form.  The
+    # formulas, straight from Model_analysis.statistical_complexity:
+    #   forward  states  q/(p+q), p/(p+q)
+    #   backward states  q(1-p)/(p+q), p/(p+q), pq/(p+q)
+    # and S = -sum pi log2 pi over those.
+    P, Q = np.meshgrid(p_values, q_values, indexing="ij")   # (len(p), len(q))
+    denom = P + Q
+
+    def _S(states):
+        s = 0.0
+        for pi in states:
+            s = s - pi * np.log2(pi + 1e-12)
+        return s
+
+    Ss_theory_FW = _S([Q / denom, P / denom])
+    Ss_theory_BW = _S([(Q - P * Q) / denom, P / denom, P * Q / denom])
 
     print("✓ Theoretical complexity computation complete")
     return Ss_theory_FW, Ss_theory_BW, p_values, q_values

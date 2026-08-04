@@ -447,3 +447,60 @@ def test_val_cadence_records_its_own_x_axis():
     assert rec.step_val_at == [0, 10, 20, 30, 40]
     assert len(rec.step_val_loss) == len(rec.step_val_at)
     assert len(rec.step_loss) == 50            # train curve untouched
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Vectorisation must not change the numbers — D2
+# ─────────────────────────────────────────────────────────────────────────────
+def test_heatmap_theory_matches_the_scalar_closed_form():
+    """D2 vectorised heatmap_theory against statistical_complexity per cell."""
+    from pq_experiment import heatmap_theory
+    p = np.linspace(0.05, 0.95, 11)
+    q = np.linspace(0.05, 0.95, 13)
+    FW, BW, pv, qv = heatmap_theory(p, q)
+    assert FW.shape == (len(p), len(q)) and BW.shape == (len(p), len(q))
+    for i, pi in enumerate(p):
+        for j, qj in enumerate(q):
+            assert FW[i, j] == pytest.approx(
+                statistical_complexity(pi, qj, "forward"), abs=1e-12)
+            assert BW[i, j] == pytest.approx(
+                statistical_complexity(pi, qj, "backward"), abs=1e-12)
+
+
+def test_vectorised_soft_label_ce_matches_explicit_loop():
+    """The (B,T,V) fancy-index form must equal the original double loop."""
+    rng = np.random.default_rng(0)
+    B, T, V = 4, 60, 3
+    p_model = rng.dirichlet(np.ones(V), size=(B, T))
+    inp = rng.integers(0, V, size=(B, T))
+    tp = rng.dirichlet(np.ones(V), size=V)
+
+    total = 0.0
+    for b in range(B):
+        for t in range(T):
+            total += -np.sum(tp[inp[b, t]] * np.log2(p_model[b, t] + 1e-12))
+    vec = float((-(tp[inp] * np.log2(p_model + 1e-12)).sum(-1)).sum())
+    assert vec == pytest.approx(total, rel=1e-9)
+
+
+def test_vectorised_per_token_kl_matches_explicit_loop():
+    rng = np.random.default_rng(1)
+    B, T, V = 4, 60, 3
+    p_model = rng.dirichlet(np.ones(V), size=(B, T))
+    inp = rng.integers(0, V, size=(B, T))
+    tc = rng.dirichlet(np.ones(V), size=V)
+
+    kl_loop, cnt_loop = np.zeros(V), np.zeros(V)
+    for b in range(B):
+        for t in range(T):
+            c = inp[b, t]
+            kl_loop[c] += float(np.sum(
+                tc[c] * np.log2(tc[c] / (p_model[b, t] + 1e-12) + 1e-12)))
+            cnt_loop[c] += 1
+
+    kl_bt = (tc[inp] * np.log2(tc[inp] / (p_model + 1e-12) + 1e-12)).sum(-1)
+    kl_vec = np.bincount(inp.reshape(-1), weights=kl_bt.reshape(-1), minlength=V)
+    cnt_vec = np.bincount(inp.reshape(-1), minlength=V)
+
+    assert np.allclose(kl_vec, kl_loop, rtol=1e-9)
+    assert np.array_equal(cnt_vec, cnt_loop)
