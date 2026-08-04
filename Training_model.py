@@ -1,4 +1,3 @@
-import math
 import lightning as L
 from OneHot_model import OneHotDecoder, WordEmbDecoder, cross_ent_onehot
 import torch
@@ -51,11 +50,32 @@ def _loader(dataset: tud.Dataset, batch_size: int, shuffle: bool = False) -> tud
 # Temporarily switches to eval mode, then restores train mode.
 # ─────────────────────────────────────────────────────────────────────────────
 def _eval_loss_on_loader(model, loader) -> tuple[float, float]:
-    """Return (mean cross-entropy loss, mean perplexity) over *loader*."""
+    """
+    Return (dataset-level cross-entropy in bits, matching perplexity 2**CE).
+
+    Two bugs fixed here (IMPROVEMENT_PLAN.md B2).
+
+    1. This used to return ``mean(2**CE_batch)`` rather than ``2**mean(CE)``.
+       By Jensen's inequality mean(2^x) >= 2^mean(x), so the reported
+       perplexity was biased *high* by an amount that grows with the variance
+       of the per-batch CE.  On a realistic spread (CE in {0.9, 1.4, 1.1, 0.6})
+       that is 2.0411 vs 2.0000 -- a +0.041 bias, the same order as the
+       delta-CE the whole study is trying to measure.  The perplexity is now
+       derived from the aggregated CE, so the identity PPL = 2**CE holds by
+       construction and log2(PPL) is exactly the CE.
+
+    2. Both accumulators were divided by ``n_batches``, so a ragged final batch
+       (DataLoader defaults to drop_last=False) carried the same weight as a
+       full one.  cross_ent_onehot returns a per-token mean, so the aggregate
+       has to be token-weighted: accumulate sum(CE * n_tokens) / sum(n_tokens).
+
+    This now matches perplexity_calculation in Model_analysis.py, which was
+    already correct -- the repo contained both a right and a wrong estimator.
+    """
     was_training = model.training
     model.eval()
     device = next(model.parameters()).device
-    total_loss, total_ppl, n_batches = 0.0, 0.0, 0
+    total_ce_tokens, total_tokens = 0.0, 0
 
     with torch.no_grad():
         for batch in loader:
@@ -66,17 +86,18 @@ def _eval_loss_on_loader(model, loader) -> tuple[float, float]:
             inputs  = inputs.to(device)
             targets = targets.to(device)
             logits  = model(inputs)                     # (B, T, V)
-            loss, ppl = cross_ent_onehot(logits, targets)
-            total_loss += loss.item()
-            total_ppl  += ppl.item()
-            n_batches  += 1
+            loss, _ = cross_ent_onehot(logits, targets)
+            n_tok    = targets.numel()
+            total_ce_tokens += loss.item() * n_tok
+            total_tokens    += n_tok
 
     if was_training:
         model.train()                                   # restore training mode
 
-    if n_batches == 0:
+    if total_tokens == 0:
         return float("nan"), float("nan")
-    return total_loss / n_batches, total_ppl / n_batches
+    ce = total_ce_tokens / total_tokens
+    return ce, 2.0 ** ce
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -99,15 +120,14 @@ class Record_training(L.Callback):
         record_latents: bool = False,
         record_probs: bool = False,
         max_batches_per_epoch: int | None = None,
-        record_val_loss: bool = False,
-        val_loader=None,                                # ← NEW
+        val_loader=None,
     ):
         super().__init__()
         self.record_every_n_steps   = record_every_n_steps
         self.record_latents         = record_latents
         self.record_probs           = record_probs
         self.max_batches_per_epoch  = max_batches_per_epoch
-        self.val_loader             = val_loader        # ← NEW
+        self.val_loader             = val_loader
 
         # ── per-step series ──────────────────────────────────────────────
         self.step_loss     = []     # training loss at each recorded step
@@ -131,8 +151,6 @@ class Record_training(L.Callback):
         # Optional cap
         if self.max_batches_per_epoch is not None and batch_idx >= self.max_batches_per_epoch:
             return
-        if trainer.global_step % self.record_every_n_steps != 0:
-            return
 
         # ── Training loss ────────────────────────────────────────────────
         if isinstance(outputs, dict):
@@ -143,11 +161,28 @@ class Record_training(L.Callback):
         else:
             loss = outputs.detach().float().cpu().item()
 
-        self.step_loss.append(loss)
-        self.step_ppl.append(math.exp(loss))            # PPL consistent with model's exp(CE)
-
+        # ── Epoch accumulation — ALWAYS, before the sub-sampling gate ────
+        # IMPROVEMENT_PLAN.md B12.  This used to sit *below* the
+        # `global_step % record_every_n_steps` early return, so `epoch_loss`
+        # was the mean over recorded steps only.  At record_every_n_steps=1
+        # that is every step and the two agree, which is why it was never
+        # noticed -- but the moment D1 raises it to 25, `epoch_loss` silently
+        # becomes the mean over every 25th step: a different estimator, no
+        # error raised.  Accumulating here keeps it a true epoch mean at any
+        # recording stride.
         self._epoch_loss_sum   += loss
         self._epoch_loss_count += 1
+
+        # ── Per-step series — sub-sampled by record_every_n_steps ────────
+        if trainer.global_step % self.record_every_n_steps != 0:
+            return
+
+        self.step_loss.append(loss)
+        # B1: the loss is in BITS (cross_ent_onehot divides by ln 2), so the
+        # matching perplexity is 2**loss.  This was math.exp(loss), which put
+        # panel 3 (train PPL) on a different scale from panel 4 (val PPL, base
+        # 2 via _eval_loss_on_loader) while plotting them side by side.
+        self.step_ppl.append(2.0 ** loss)
 
         # ── Validation loss at this step ─────────────────────────────────
         if self.val_loader is not None:
@@ -225,9 +260,8 @@ def train_model(
         record_every_n_steps=1,
         record_latents=False,
         record_probs=False,
-        record_val_loss=True,
         max_batches_per_epoch=None,
-        val_loader=val_loader,      # ← NEW
+        val_loader=val_loader,
     )
 
     trainer = L.Trainer(

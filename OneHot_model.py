@@ -1,3 +1,5 @@
+import math
+
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
@@ -79,17 +81,34 @@ class AttentionModel(nn.Module):
         return out
     
 def cross_ent_onehot(logits, targets):
-    B, T, C = logits.shape
+    """
+    Mean cross-entropy in BITS, and the matching perplexity 2**CE.
+
+    Implementation note (IMPROVEMENT_PLAN.md B3).  The previous version built
+    the one-hot target explicitly and evaluated
+
+        -(target_prob * logits.softmax(-1).log2()).sum(dim=1)
+
+    which returns NaN once any *non-target* class probability underflows to
+    exactly 0: that term is 0 * -inf, and the NaN then propagates through the
+    .sum() and poisons the whole batch even though the target class was fine.
+    That is reachable here rather than hypothetical -- both processes contain
+    deterministic transitions (coin token 2 -> token 1 w.p. 1; a flower roll is
+    always followed by a selection), and cross-entropy training on a
+    deterministic transition drives the logit gap to infinity, so a gap of ~200
+    after 60-80 epochs at lr=1e-2 is realistic.  Measured: at logit scale 200
+    the old expression returns nan where the true value is 0.0.
+
+    F.cross_entropy uses the log-sum-exp trick internally, so it is exact at
+    any logit scale, never touches a 0 * -inf product, and is faster (no
+    separate softmax + log over (B*T, V)).  It returns nats, hence / ln 2.
+    """
+    C = logits.shape[-1]
     flat_input  = logits.reshape(-1, C)   # (B*T, V)
     flat_target = targets.reshape(-1)     # (B*T,)
 
-    # replaces the entire for-loop — same result, fully vectorized
-    target_prob = F.one_hot(flat_target, num_classes=C).float()   # (B*T, V)
-
-    logits_prob = flat_input.softmax(dim=-1)
-    cond_ent    = -(target_prob * logits_prob.log2()).sum(dim=1)
-    loss        = cond_ent.mean()
-    perplexity  = 2**loss
+    loss       = F.cross_entropy(flat_input, flat_target) / math.log(2)
+    perplexity = 2 ** loss
 
     return loss, perplexity
 
