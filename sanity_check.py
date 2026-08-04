@@ -65,8 +65,8 @@ import numpy as np
 import torch
 import torch.utils.data as tud
 
-from Data_generation import CoinDataset, coin_generation, flower_process_generation
-from Flower_process_generation import FlowerDataset
+from Data_generation import CoinDataset, coin_generation
+from Flower_process_generation import FlowerDataset, flower_process_generation
 from Model_analysis import (
     FW_BW_attention_comparison,
     flower_complexity,
@@ -86,6 +86,10 @@ from Training_model import (
     set_seed,
     train_test_val_pipeline,
 )
+from utils import (
+    cleanup, entropy_rate_coin, mkdir, save_pkl, save_weights,
+    to_cpu_for_analysis as to_cpu,
+)
 
 try:
     import umap as _umap_mod
@@ -103,6 +107,7 @@ except Exception as _e:
 # =============================================================================
 CFG = dict(
     seed           = 0,
+    accelerator    = "auto",   # see configs.py / train_model on MPS determinism
     d_model        = 64,
     embed_type     = "onehot",
     n_folds        = 5,
@@ -150,44 +155,9 @@ OUT_ROOT = "sanity_check_flower_process"
 # =============================================================================
 # HELPERS  (self-contained so this file runs independently)
 # =============================================================================
-def mkdir(path):
-    os.makedirs(path, exist_ok=True)
-    return path
-
-
-def save_pkl(obj, path):
-    with open(path, "wb") as f:
-        pickle.dump(obj, f, protocol=4)
-    mb = os.path.getsize(path) / 1024**2
-    print(f"  pickle -> {path}  ({mb:.1f} MB)")
-
-
-def save_weights(model, path):
-    torch.save(model.state_dict(), path)
-    print(f"  weights -> {path}")
-
-
-def cleanup():
-    gc.collect()
-    if torch.cuda.is_available():
-        torch.cuda.empty_cache()
-    if hasattr(torch.backends, "mps") and torch.backends.mps.is_available():
-        try:
-            torch.mps.synchronize()
-        except Exception:
-            pass
-
-
-def to_cpu(model):
-    model.cpu(); gc.collect()
-    return model
-
-
-def entropy_rate_coin(p, q):
-    def _h2(a):
-        b = max(1-a, 1e-12); a = max(a, 1e-12)
-        return -a*np.log2(a) - b*np.log2(b)
-    return (q/(p+q))*_h2(p) + (p/(p+q))*_h2(q)
+# C4: mkdir, save_pkl, save_weights, cleanup, to_cpu and entropy_rate_coin
+# used to be redefined here "so this file runs independently".  They now come
+# from utils.py -- one definition, so a fix to one cannot miss the others.
 
 
 def _project2d(flat, n_neighbors=15):
@@ -496,7 +466,7 @@ def exp_coin(cfg, out_root):
         embed_type=cfg["embed_type"], num_token=num_token,
         d_model=cfg["d_model"], max_len=max_len,
         max_epochs=cfg["coin_max_epochs"], lr=cfg["lr"], mode="forward",
-        save_plot=os.path.join(odir, f"{tag}_fw_cv.png"), seed=cfg["seed"],
+        save_plot=os.path.join(odir, f"{tag}_fw_cv.png"), seed=cfg["seed"], accelerator=cfg["accelerator"],
     ); cleanup()
 
     # Backward model
@@ -506,7 +476,7 @@ def exp_coin(cfg, out_root):
         embed_type=cfg["embed_type"], num_token=num_token,
         d_model=cfg["d_model"], max_len=max_len,
         max_epochs=cfg["coin_max_epochs"], lr=cfg["lr"], mode="backward",
-        save_plot=os.path.join(odir, f"{tag}_bw_cv.png"), seed=cfg["seed"],
+        save_plot=os.path.join(odir, f"{tag}_bw_cv.png"), seed=cfg["seed"], accelerator=cfg["accelerator"],
     ); cleanup()
 
     # Analyse
@@ -613,7 +583,7 @@ def exp_flower(cfg, out_root):
         embed_type=cfg["embed_type"], num_token=num_token,
         d_model=cfg["d_model"], max_len=max_len,
         max_epochs=cfg["flower_max_epochs"], lr=cfg["lr"], mode="forward",
-        save_plot=os.path.join(odir, f"{tag}_fw_cv.png"), seed=cfg["seed"],
+        save_plot=os.path.join(odir, f"{tag}_fw_cv.png"), seed=cfg["seed"], accelerator=cfg["accelerator"],
     ); cleanup()
 
     # Backward model
@@ -623,7 +593,7 @@ def exp_flower(cfg, out_root):
         embed_type=cfg["embed_type"], num_token=num_token,
         d_model=cfg["d_model"], max_len=max_len,
         max_epochs=cfg["flower_max_epochs"], lr=cfg["lr"], mode="backward",
-        save_plot=os.path.join(odir, f"{tag}_bw_cv.png"), seed=cfg["seed"],
+        save_plot=os.path.join(odir, f"{tag}_bw_cv.png"), seed=cfg["seed"], accelerator=cfg["accelerator"],
     ); cleanup()
 
     # Analyse

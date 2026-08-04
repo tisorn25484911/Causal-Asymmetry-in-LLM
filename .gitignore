@@ -4,6 +4,11 @@
 # ---------------------------------------------------------------------------
 lightning_logs/
 results/
+# A4: each config in configs.py now writes to its own out_root, so that two
+# configurations cannot overwrite each other's weights.
+results_smoke/
+results_quick/
+results_large/
 sanity_check_flower_process/
 
 # Model weights, Lightning checkpoints, pickled result bundles

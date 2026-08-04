@@ -8,10 +8,11 @@ import numpy as np
 import torch
 
 # ── project imports ───────────────────────────────────────────────────────────
-from Data_generation import CoinDataset, coin_generation, flower_process_generation
-from Flower_process_generation import FlowerDataset
+from Data_generation import CoinDataset, coin_generation
+from Flower_process_generation import FlowerDataset, flower_process_generation
 from OneHot_model import OneHotDecoder
 from Training_model import make_chunked_loader, _loader
+from configs import CONFIGS
 from Model_analysis import (
     latent_extraction,
     perplexity_calculation,
@@ -19,8 +20,8 @@ from Model_analysis import (
     statistical_complexity,
     statistical_complexity_empirical,
     savefig,
-    mkdir,
 )
+from utils import check_weight_meta, coin_tag, flower_tag, mkdir
 
 
 # ══════════════════════════════════════════════════════════════════════════════
@@ -130,29 +131,20 @@ def plot_cumulative_ppl(ppl_fw, ppl_bw, title="", save_path=None):
     return fig
 
 
+# Evaluation-only knobs.  Everything describing the models and the processes
+# comes from configs.py (A4), so this file cannot disagree with the run that
+# produced the weights it loads.  d_model/n_layers/p/q used to be duplicated
+# here and pinned to main_large's values.
 EVAL_CFG = dict(
-    # model architecture — must match what was trained
-    d_model        = 64,
-    max_len        = 2000,       # full sequence length (PE table covers this)
-    n_layers       = 2,
-    # new data generation
-    num_samples    = 500,        # sequences to generate for evaluation
-    batch_size     = 32,
-    # coin
-    coin_p1        = 0.3,  coin_q1 = 0.4,
-    coin_seq_len   = 2000,
-    coin_num_token = 3,
-    coin_p2        = 0.4,  coin_q2 = 0.8,
-    coin_seq_len_12 = 2000,
-    # flower
-    flower_n       = 6,    flower_m = 4,
-    flower_seq_len = 2000,
-    # analysis
-    umap_n_pts       = 1000,
-    umap_n_neighbors = 200,
-    max_batches      = 20,
-    ppl_gen_len      = 1000,
-    ppl_burn_in      = 200,
+    max_len           = 2000,    # PE table covers the full sequence
+    num_samples       = 500,     # sequences to generate for evaluation
+    batch_size        = 32,
+    coin_seq_len_eval = 2000,
+    umap_n_pts        = 1000,
+    umap_n_neighbors  = 15,      # B7: 200 smears local structure
+    max_batches       = 20,
+    ppl_gen_len       = 1000,
+    ppl_burn_in       = 200,
 )
 
 
@@ -162,6 +154,14 @@ EVAL_CFG = dict(
 def load_model(weights_path: str, num_token: int, cfg: dict,
                mode: str) -> OneHotDecoder:
     """Instantiate OneHotDecoder and load saved weights onto CPU."""
+    # A4: verify the checkpoint is what we think it is, instead of guessing.
+    # Running an evaluator against weights trained with a different config used
+    # to be caught only by load_state_dict raising on a d_model mismatch --
+    # align d_model and it would silently score the wrong process.
+    check_weight_meta(weights_path, {
+        "d_model": cfg["d_model"], "n_layers": cfg["n_layers"],
+        "token_size": num_token, "mode": mode,
+    })
     model = OneHotDecoder(
         token_size = num_token,
         d_model    = cfg["d_model"],
@@ -188,16 +188,37 @@ def evaluate_one(tag: str, model: OneHotDecoder, loader_ana,
     res = {"tag": tag, "mode": mode}
     mkdir(out_dir)
 
-    # ── Perplexity ────────────────────────────────────────────────────────────
-    # perplexity_calculation collects all logits then computes global CE loss
-    # → true dataset-level perplexity (not mean of batch means)
-    ppl = perplexity_autoregressive(
+    # ── Perplexity — TWO different metrics, kept apart ───────────────────────
+    # IMPROVEMENT_PLAN.md B14.  There used to be one number here, computed by
+    # perplexity_autoregressive but carrying a comment describing
+    # perplexity_calculation ("collects all logits then computes global CE
+    # loss"), and compare_plot then presented it as the headline FW-vs-BW
+    # comparison.  Those are not the same metric and only one of them can be
+    # compared across models:
+    #
+    #   ppl_teacher_forced -- both models scored on the SAME ground-truth
+    #       sequences.  This is the comparison metric.
+    #   ppl_self_generated -- each model scored on ITS OWN sampled sequence,
+    #       i.e. an estimate of that model's own entropy rate.  A degenerate,
+    #       over-confident model minimises it.  LLM_asymmetry_testing.py:94-95
+    #       already labels this "informational only -- not used for asymmetry
+    #       comparison"; this file was using it as its primary chart.
+    ppl_tf = perplexity_calculation(
+        model, loader_ana, max_batches=cfg.get("max_batches"))
+    res["ppl_teacher_forced"] = ppl_tf
+    res["ce_teacher_forced"]  = float(np.log2(ppl_tf))
+
+    ppl_self = perplexity_autoregressive(
         model, num_token, start_token=0,
         gen_len=cfg.get("ppl_gen_len", 1000),
         burn_in=cfg.get("ppl_burn_in", 200),
     )
-    res["perplexity"] = ppl
-    print(f"  [{tag}]  perplexity = {ppl:.4f}")
+    res["ppl_self_generated"] = ppl_self
+    # Back-compat for anything reading res["perplexity"]; now the comparable one.
+    res["perplexity"] = ppl_tf
+    print(f"  [{tag}]  teacher-forced PPL = {ppl_tf:.4f}  "
+          f"(CE = {res['ce_teacher_forced']:.4f} bits)")
+    print(f"  [{tag}]  self-generated PPL = {ppl_self:.4f}  [informational only]")
 
     # ── Generate model's own sequence ────────────────────────────────────────
     # All downstream analysis (UMAP, colored token plot, cumulative PPL)
@@ -290,20 +311,35 @@ def compare_plot(tag: str, res_fw: dict, res_bw: dict,
     """
     Side-by-side bar: perplexity + complexity for FW vs BW.
     """
-    fig, axes = plt.subplots(1, 2, figsize=(12, 5))
+    fig, axes = plt.subplots(1, 3, figsize=(17, 5))
 
-    # Perplexity bar
+    # (1) THE comparison: both models on the same ground-truth sequences (B14)
     ax = axes[0]
-    vals = [res_fw["perplexity"], res_bw["perplexity"]]
+    vals = [res_fw["ppl_teacher_forced"], res_bw["ppl_teacher_forced"]]
+    d_ce = res_bw["ce_teacher_forced"] - res_fw["ce_teacher_forced"]
     bars = ax.bar(["Forward", "Backward"], vals,
                   color=["#4c72b0", "#dd8452"], alpha=0.85, edgecolor="k")
     ax.bar_label(bars, fmt="%.4f", padding=3, fontsize=10)
-    ax.set_ylabel("Perplexity")
-    ax.set_title(f"Perplexity on model's generated sequence")
+    ax.set_ylabel("Perplexity  (teacher-forced)")
+    ax.set_title("Teacher-forced PPL on ground-truth sequences\n"
+                 f"delta_CE = {d_ce:+.4f} bits  ← the comparison metric",
+                 fontweight="bold")
     ax.grid(True, alpha=0.3, axis="y")
 
-    # Complexity bar
+    # (2) Informational only — each model on ITS OWN generated sequence
     ax = axes[1]
+    vals = [res_fw["ppl_self_generated"], res_bw["ppl_self_generated"]]
+    bars = ax.bar(["Forward", "Backward"], vals,
+                  color=["#4c72b0", "#dd8452"], alpha=0.45, edgecolor="k",
+                  hatch="//")
+    ax.bar_label(bars, fmt="%.4f", padding=3, fontsize=10)
+    ax.set_ylabel("Perplexity  (self-generated)")
+    ax.set_title("Self-generated PPL — INFORMATIONAL ONLY\n"
+                 "each model scores its own samples; not comparable")
+    ax.grid(True, alpha=0.3, axis="y")
+
+    # (3) Complexity bar
+    ax = axes[2]
     fw_v = [res_fw.get("S_emp", 0), res_fw.get("S_theory", 0)]
     bw_v = [res_bw.get("S_emp", 0), res_bw.get("S_theory", 0)]
     x = np.arange(2)
@@ -408,7 +444,8 @@ def eval_flower(tag: str, n: int, m: int,
 # Works in both scripts (python evaluate_model.py) and Jupyter notebooks
 # ══════════════════════════════════════════════════════════════════════════════
 RUN = dict(
-    results_dir  = "results",   # change to "results_large" for overnight run
+    config       = "LARGE",     # which configs.py entry produced the weights
+    results_dir  = None,        # None → the config's out_root
     out_dir      = None,        # None → <results_dir>/eval
     exp          = "all",       # "all" | "exp1" | "exp1_2" | "exp2"
     num_samples  = None,        # None → use EVAL_CFG default (500)
@@ -416,22 +453,24 @@ RUN = dict(
 
 
 def main():
-    cfg = EVAL_CFG.copy()
+    cfg = dict(CONFIGS[RUN["config"]])
+    cfg.update(EVAL_CFG)
     if RUN["num_samples"] is not None:
         cfg["num_samples"] = RUN["num_samples"]
 
-    models_dir = os.path.join(RUN["results_dir"], "models")
-    out_root   = RUN["out_dir"] or os.path.join(RUN["results_dir"], "eval")
+    results_dir = RUN["results_dir"] or cfg["out_root"]
+    models_dir  = os.path.join(results_dir, "models")
+    out_root    = RUN["out_dir"] or os.path.join(results_dir, "eval")
     mkdir(out_root)
 
     exp = RUN["exp"].lower()
 
     if exp in ("all", "exp1"):
         eval_coin(
-            tag        = "exp1_coin_p03_q04",
+            tag        = coin_tag("exp1", cfg["coin_p1"], cfg["coin_q1"]),
             p          = cfg["coin_p1"],
             q          = cfg["coin_q1"],
-            seq_len    = cfg["coin_seq_len"],
+            seq_len    = cfg["coin_seq_len_eval"],
             models_dir = models_dir,
             out_root   = out_root,
             cfg        = cfg,
@@ -439,24 +478,25 @@ def main():
 
     if exp in ("all", "exp1_2"):
         eval_coin(
-            tag        = "exp1_2_coin_p04_q08",
+            tag        = coin_tag("exp1_2", cfg["coin_p2"], cfg["coin_q2"]),
             p          = cfg["coin_p2"],
             q          = cfg["coin_q2"],
-            seq_len    = cfg["coin_seq_len_12"],
+            seq_len    = cfg["coin_seq_len_eval"],
             models_dir = models_dir,
             out_root   = out_root,
             cfg        = cfg,
         )
 
     if exp in ("all", "exp2"):
-        eval_flower(
-            tag        = "exp2_flower_n6_m4",
-            n          = cfg["flower_n"],
-            m          = cfg["flower_m"],
-            models_dir = models_dir,
-            out_root   = out_root,
-            cfg        = cfg,
-        )
+        for n, m, role in cfg["flower_configs"]:
+            eval_flower(
+                tag        = flower_tag("exp2", n, m),
+                n          = n,
+                m          = m,
+                models_dir = models_dir,
+                out_root   = out_root,
+                cfg        = cfg,
+            )
 
     print(f"\n{'='*60}")
     print(f"  EVAL COMPLETE — outputs in {out_root}/")

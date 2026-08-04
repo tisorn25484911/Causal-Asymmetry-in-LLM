@@ -1,5 +1,4 @@
-from Data_generation import coin_generation, Rev_HMM_generation, flower_process_generation
-from Data_generation import make_loader
+from Data_generation import coin_generation, make_loader
 from Training_model import train_model
 from Model_analysis import (
     statistical_complexity,
@@ -84,12 +83,7 @@ def pq_experiment(
 
             data, states = coin_generation(num_samples=num_samples, seq_len=max_len, p=p, q=q)
 
-            train_loader = make_loader(
-                data,
-                states,
-                batch_size=batch_size,
-                mode="forward"
-            )
+            train_loader = make_loader(data, batch_size=batch_size)
 
             print("\n[1/2] Training Forward Model...")
             recorder_fw = train_model(
@@ -293,10 +287,13 @@ def plot_heatmap(
         linewidths=0.5,
     )
 
-    plt.tight_layout()
-    plt.savefig(save_path, dpi=150, bbox_inches="tight")
+    fig.tight_layout()
+    fig.savefig(save_path, dpi=150, bbox_inches="tight")
     print(f"\n✓ Saved heatmap to {save_path}")
-    plt.show()
+    # B9: was plt.show(), a no-op under Agg, and the figure was never closed —
+    # leaking a large 2x2 figure per call.  The save above is what mattered.
+    plt.close(fig)
+    return save_path
 
 
 # ============================================================================
@@ -417,12 +414,7 @@ def pq_experiment_full(
 
             data, states = coin_generation(num_samples=num_samples, seq_len=max_len, p=p, q=q)
 
-            train_loader = make_loader(
-                data,
-                states,
-                batch_size=batch_size,
-                mode="forward"
-            )
+            train_loader = make_loader(data, batch_size=batch_size)
 
             # ── Train both directions ─────────────────────────────────────
             print("  [1/2] Forward model ...")

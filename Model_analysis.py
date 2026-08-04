@@ -47,15 +47,20 @@ General purpose plotting:
     - training_loss_plot
 """
 # ── Helper functions ───────────────────────────────────────────────────────
-#Utilities
-def mkdir(path: str) -> str:
-    os.makedirs(path, exist_ok=True)
-    return path
-def save_pkl(obj, path: str):
-    with open(path, "wb") as f:
-        pickle.dump(obj, f, protocol=4)
-    mb = os.path.getsize(path) / 1024**2
-    print(f"  pickle saved -> {path}  ({mb:.1f} MB)")
+# C4: mkdir / save_pkl / save_weights / cleanup / entropy_rate_coin now have a
+# single definition in utils.py.  They are re-exported here because several
+# modules and the notebooks import them from Model_analysis.
+from utils import (            # noqa: E402  (re-export)
+    cleanup,
+    coin_tag,
+    entropy_bits,
+    entropy_rate_coin,
+    flower_tag,
+    mkdir,
+    save_pkl,
+    save_weights,
+    to_cpu_for_analysis,
+)
 
 
 # ── Result-bundle slimming ─────────────────────────────────────────────────
@@ -162,10 +167,6 @@ def savefig(fig, path: str, dpi: int = 120):
     fig.savefig(path, dpi=dpi, bbox_inches="tight")
     plt.close(fig)
     print(f"  figure saved -> {path}")
-def save_weights(model, path):
-    torch.save(model.state_dict(), path)
-    print(f"  weights -> {path}")
-
 #latent analysis:
 def latent_extraction(model, data_loader, max_batches = None):
     model.eval()
@@ -206,7 +207,6 @@ def _project2d(flat: np.ndarray, n_neighbors: int = 200) -> tuple:
             return c, "UMAP"
         except Exception as e:
             print(f"  UMAP failed ({e}), using PCA")
-    from sklearn.decomposition import PCA
     return PCA(n_components=2).fit_transform(flat), "PCA"
 def plot_umap(latents, inputs_arr, num_token, title="", save_path=None,
               xlim=None, ylim=None, n_pts: int = 1000, n_neighbors: int = 15):
@@ -438,8 +438,22 @@ def stepwise_kl_coin(model, loader, p, q, num_token=3, max_batches=None):
     return mean_kl, per_tok_avg, per_tok_count
 
 
-def perplexity_ind_model(model, len_seq=2000, start_token=0):
+def self_generated_entropy_rate(model, len_seq=2000, start_token=0):
+    """
+    Estimate of the MODEL'S OWN entropy rate — NOT a comparison metric.
 
+    IMPROVEMENT_PLAN.md C3.  This samples a sequence from the model and then
+    scores the model's log-loss on that same sequence.  A degenerate,
+    over-confident, low-entropy model *minimises* it, so it cannot be used to
+    say which of two models is better: each model is evaluated on its own
+    sequence, drawn from its own state distribution.
+
+    LLM_asymmetry_testing.py already labelled it "informational only — not used
+    for asymmetry comparison"; the old name `perplexity_ind_model` did not, and
+    Test_data_eval.py used it as its headline FW-vs-BW chart (B14).  For an
+    actual comparison use perplexity_calculation / teacher_forced_ppl, which
+    scores both models on the same ground-truth sequences.
+    """
     burn_in = 100
     print(f"Standard PPL over {len_seq - burn_in} tokens (burn-in={burn_in}) ...")
     model.eval()
@@ -489,8 +503,12 @@ def perplexity_ind_model(model, len_seq=2000, start_token=0):
     return perplexity
 
 
+# Backwards-compatible alias: metric_panel_plot.ipynb imports the old name.
+perplexity_ind_model = self_generated_entropy_rate
 
-def plot_perplexity(model_fw, model_bw, data_loader, max_batches = None):
+
+def plot_perplexity(model_fw, model_bw, data_loader, max_batches=None,
+                    save_path=None):
     perplexity_fw = perplexity_calculation(model_fw, data_loader, max_batches)
     perplexity_bw = perplexity_calculation(model_bw, data_loader, max_batches)
 
@@ -516,9 +534,14 @@ def plot_perplexity(model_fw, model_bw, data_loader, max_batches = None):
 
     ax.set_ylabel('Perplexity', fontsize=12)
     ax.set_title('Model Perplexity Comparison', fontsize=14, fontweight='bold')
-    plt.grid(True, alpha=0.3, axis='y')
-    plt.tight_layout()
-    plt.show()
+    ax.grid(True, alpha=0.3, axis='y')
+    fig.tight_layout()
+    # B9: this used to end in plt.show(), which is a NO-OP under the Agg
+    # backend that every runner selects — so the figure was built and then
+    # silently discarded, and the function returned None.
+    if save_path:
+        savefig(fig, save_path)
+    return fig
 def statistical_complexity(p, q, mode): 
     # statistical complexity of HMM
     if mode == "forward":
@@ -536,13 +559,6 @@ def statistical_complexity(p, q, mode):
     for prob in state_prob:
         S += - prob * np.log2(prob + 1e-12)
     return S
-def _entropy_bits(probs) -> float:
-    """Shannon entropy in bits, ignoring zero-probability atoms."""
-    p = np.asarray(probs, dtype=float)
-    p = p[p > 0]
-    return float(-(p * np.log2(p)).sum())
-
-
 def flower_complexity(n: int, m: int, dice_probs) -> tuple[float, float]:
     """
     Closed-form (C+, C-) for the n-m flower process — IMPROVEMENT_PLAN.md A1.
@@ -599,7 +615,7 @@ def flower_complexity(n: int, m: int, dice_probs) -> tuple[float, float]:
         key = tuple(posterior)
         merged[key] = merged.get(key, 0.0) + pi_outcome[j]
 
-    C_minus = 1.0 + 0.5 * _entropy_bits(list(merged.values()))
+    C_minus = 1.0 + 0.5 * entropy_bits(list(merged.values()))
     return float(C_plus), float(C_minus)
 
 
@@ -620,7 +636,7 @@ def flower_entropy_rate(n: int, m: int, dice_probs) -> float:
     """
     dp = np.asarray(dice_probs, dtype=float)
     return float(0.5 * np.log2(n)
-                 + 0.5 * np.mean([_entropy_bits(dp[i]) for i in range(n)]))
+                 + 0.5 * np.mean([entropy_bits(dp[i]) for i in range(n)]))
 
 
 def statistical_complexity_empirical(model, data_loader, max_batches=None, use_t="last", k=2):
@@ -650,7 +666,8 @@ def statistical_complexity_empirical(model, data_loader, max_batches=None, use_t
         raise ValueError("use_t must be 'first', 'last', or an int index.")
 
     # --- cluster in full space (don’t PCA-crush by default) ---
-    from sklearn.cluster import KMeans
+    # D4: KMeans and PCA were re-imported inside functions that already import
+    # them at module top.
     kmeans = KMeans(n_clusters=k, random_state=42, n_init=10)
     labels = kmeans.fit_predict(z_use)
 
@@ -659,8 +676,9 @@ def statistical_complexity_empirical(model, data_loader, max_batches=None, use_t
 
     S = -np.sum(probs * np.log2(probs + 1e-12))
     return S
-def statistical_complexity_compare(forward_model, backward_model, data_loader, 
-                                  p=0.6, q=0.4, max_batches=None, k_fw=2, k_bw=3):
+def statistical_complexity_compare(forward_model, backward_model, data_loader,
+                                  p=0.6, q=0.4, max_batches=None, k_fw=2, k_bw=3,
+                                  save_path=None):
     print("="*70)
     print("STATISTICAL COMPLEXITY COMPARISON")
     print("="*70)
@@ -713,33 +731,36 @@ def statistical_complexity_compare(forward_model, backward_model, data_loader,
     print(f"  Difference (FW - BW): {S_fw_theory - S_bw_theory:+.4f} bits")
     
     # Visualization
-    plt.figure(figsize=(10, 6))
+    fig, ax = plt.subplots(figsize=(10, 6))
     modes = ['Forward', 'Backward']
     emp_values = [Ss_empirical['forward'], Ss_empirical['backward']]
     theory_values = [Ss_theory['forward'], Ss_theory['backward']]
-    
+
     x = np.arange(len(modes))
     width = 0.35
-    
-    bars1 = plt.bar(x - width/2, emp_values, width, label='Empirical', alpha=0.8, color='blue')
-    bars2 = plt.bar(x + width/2, theory_values, width, label='Theoretical', alpha=0.8, color='red')
-    
+
+    bars1 = ax.bar(x - width/2, emp_values, width, label='Empirical', alpha=0.8, color='blue')
+    bars2 = ax.bar(x + width/2, theory_values, width, label='Theoretical', alpha=0.8, color='red')
+
     for bars in [bars1, bars2]:
         for bar in bars:
             h = bar.get_height()
-            plt.text(bar.get_x() + bar.get_width()/2., h,
-                     f'{h:.3f}', ha='center', va='bottom', fontsize=9, fontweight='bold')
-    
-    plt.ylabel('Statistical Complexity (bits)', fontsize=11)
-    plt.title("Empirical vs Theoretical Statistical Complexity", fontsize=12, fontweight='bold')
-    plt.xticks(x, modes)
-    plt.legend(fontsize=10)
-    plt.grid(True, alpha=0.3, axis='y')
-    plt.tight_layout()
-    plt.show()
-    
+            ax.text(bar.get_x() + bar.get_width()/2., h,
+                    f'{h:.3f}', ha='center', va='bottom', fontsize=9, fontweight='bold')
+
+    ax.set_ylabel('Statistical Complexity (bits)', fontsize=11)
+    ax.set_title("Empirical vs Theoretical Statistical Complexity", fontsize=12, fontweight='bold')
+    ax.set_xticks(x); ax.set_xticklabels(modes)
+    ax.legend(fontsize=10)
+    ax.grid(True, alpha=0.3, axis='y')
+    fig.tight_layout()
+    # B9: was plt.show() under Agg — a no-op, so this figure was discarded and
+    # only the numbers came back.
+    if save_path:
+        savefig(fig, save_path)
+
     print("="*70)
-    return Ss_empirical, Ss_theory
+    return Ss_empirical, Ss_theory, fig
 
 #General purpose plotting:
 def plot_diff_heatmap(Z, p_vals, q_vals, title, cbar_label, save_path=None, cmap="RdBu_r", vcenter=None):
@@ -874,22 +895,47 @@ def compare_FW_BW_latents(model_fw, model_bw, data_loader, max_batches = None):
 
     return fig
 
-def FW_BW_loss_comparison(recorder_fw, recorder_bw):
+def FW_BW_loss_comparison(recorder_fw, recorder_bw, save_path=None):
+    """
+    Forward vs backward training loss, and their difference.
+
+    IMPROVEMENT_PLAN.md B10.  Four defects, all fixed here:
+      * the function ended in a bare `return`, so the figure it had just built
+        was unreachable and discarded;
+      * both x-axes were labelled "Epoch" while step_loss is indexed by
+        gradient step;
+      * panel 2's title said "Backward Model Training Loss" while it plots the
+        BW - FW difference;
+      * panel 1's title said "Forward Model Training Loss" while it plots both.
+
+    Note the runners do not call this — they use their own plot_loss_theory,
+    which was already correct.  Kept and fixed rather than deleted so ad-hoc
+    and notebook use gets a working version.
+    """
     print("="*70)
     print("FW/BW LOSS COMPARISON")
     print("="*70)
+    sl_fw = np.asarray(recorder_fw.step_loss, dtype=float)
+    sl_bw = np.asarray(recorder_bw.step_loss, dtype=float)
+    n = min(len(sl_fw), len(sl_bw))          # folds can differ by a step
+    sl_fw, sl_bw = sl_fw[:n], sl_bw[:n]
+
     fig, ax = plt.subplots(1, 2, figsize=(20, 4))
-    ax[0].plot(recorder_fw.step_loss, label='Forward Model Loss')
-    ax[0].plot(recorder_bw.step_loss, label='Backward Model Loss')
-    ax[1].plot(np.array(recorder_bw.step_loss) - np.array(recorder_fw.step_loss), label='Loss Difference (BW - FW)')  # FIX 6: Convert lists to numpy arrays
+    ax[0].plot(sl_fw, label='Forward Model Loss')
+    ax[0].plot(sl_bw, label='Backward Model Loss')
+    ax[1].plot(sl_bw - sl_fw, label='Loss Difference (BW - FW)')
+    ax[1].axhline(0, color="k", ls="--", lw=0.8, alpha=0.5)
 
-    ax[0].set_xlabel("Epoch")
-    ax[0].set_ylabel("Loss")
-    ax[0].set_title("Forward Model Training Loss")
-    ax[1].set_xlabel("Epoch")
-    ax[1].set_ylabel("Loss_difference")
-    ax[1].set_title("Backward Model Training Loss")
-    ax[0].legend()
-    ax[1].legend()
+    ax[0].set_xlabel("Gradient step")
+    ax[0].set_ylabel("Loss (bits)")
+    ax[0].set_title("Training Loss — Forward vs Backward")
+    ax[1].set_xlabel("Gradient step")
+    ax[1].set_ylabel("CE_BW − CE_FW (bits)")
+    ax[1].set_title("Loss Difference (BW − FW)")
+    ax[0].legend(); ax[1].legend()
+    ax[0].grid(True, alpha=0.3); ax[1].grid(True, alpha=0.3)
+    fig.tight_layout()
 
-    return
+    if save_path:
+        savefig(fig, save_path)
+    return fig

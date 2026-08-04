@@ -141,14 +141,28 @@ class OneHotDecoder(L.LightningModule):
         self.n_layers = n_layers
 
         self.token_size = token_size
-        self.we = nn.Embedding(num_embeddings=token_size, embedding_dim=d_model)
         self.d_model = d_model
         self.max_len = max_len
         self.lr = lr
 
+        # IMPROVEMENT_PLAN.md C5.  This was an nn.Parameter, which makes
+        # `one_hot @ self.rand_prj` a LEARNED embedding table -- mathematically
+        # identical to nn.Embedding -- despite the class name and the "fixed
+        # random projection" comment.  It is now a buffer, so "onehot" mode
+        # really is a fixed random projection.
+        #
+        # This is what makes the Phase 4 d_model sweep interpretable: varying
+        # d_model then varies representational capacity alone, rather than
+        # capacity plus the size of a learned input code.  Note it invalidates
+        # every checkpoint written before this commit -- rand_prj moves from
+        # the parameter list to the buffer list.
         rand_prj = torch.randn(token_size, d_model)
         rand_prj = F.normalize(rand_prj, dim=1)
-        self.rand_prj = nn.Parameter(rand_prj)
+        self.register_buffer("rand_prj", rand_prj)
+
+        # `self.we = nn.Embedding(...)` used to live here.  It was never used
+        # in forward(): dead parameters that received no gradient and were
+        # serialised into every .pt.  Deleted (C5).
 
         self.pe = PositionalEncoding(d_model=d_model, max_len=max_len)
         
@@ -280,98 +294,11 @@ class OneHotDecoder(L.LightningModule):
     def configure_optimizers(self):
         return Adam(self.parameters(), lr=self.lr)
 
-class WordEmbDecoder(L.LightningModule):
-
-    def __init__(
-        self,
-        token_size=3,
-        d_model=20,
-        max_len=150,
-        lr=1e-2,
-        mode="forward",
-        reverse_pos_for_backward: bool = False,
-    ):
-        super().__init__()
-        self.mode = mode
-        self.reverse_pos_for_backward = reverse_pos_for_backward
-
-        self.token_size = token_size
-        self.we = nn.Embedding(num_embeddings=token_size, embedding_dim=d_model)
-        self.d_model = d_model
-        self.max_len = max_len
-        self.lr = lr
-
-        # Fixed random projection acts like embedding table (V, D)
-        rand_prj = torch.randn(token_size, d_model)
-        rand_prj = F.normalize(rand_prj, dim=1)
-        self.register_buffer("rand_prj", rand_prj)
-
-        self.pe = PositionalEncoding(d_model=d_model, max_len=max_len)
-        self.attn = AttentionModel(d_model=d_model)
-        self.output_prj = nn.Linear(d_model, token_size)
-
-        # REMOVED: self.loss = nn.CrossEntropyLoss()
-        self.save_hyperparameters()
-
-        self.last_encodings = None
-        self.last_attention = None  # (B, T, T)
-
-    def forward(self, tokens):
-        # --- sanitize tokens dtype/device ---
-        if isinstance(tokens, torch.Tensor):
-            if tokens.dtype in (torch.float32, torch.float64):
-                tokens = tokens.long()
-            elif tokens.dtype not in (torch.long, torch.int64):
-                tokens = tokens.to(torch.long)
-        else:
-            tokens = torch.LongTensor(tokens).to(self.rand_prj.device)
-
-        # tokens: (B, T)
-        x = self.we(tokens)
-        
-        # --- positional encoding (optionally reversed for backward mode) ---
-        reverse_pos = (self.mode == "backward" and self.reverse_pos_for_backward)
-        x = self.pe(x, reverse_pos=reverse_pos)  # (B, T, D)
-
-        # --- build mask consistent with goal ---
-        B, T, _ = x.shape
-        if self.mode == "forward":
-            mask = torch.tril(torch.ones((T, T), device=x.device, dtype=torch.bool)).unsqueeze(0)  # (1,T,T)
-        elif self.mode == "backward":
-            mask = torch.triu(torch.ones((T, T), device=x.device, dtype=torch.bool)).unsqueeze(0)  # (1,T,T)
-        else:
-            raise ValueError(f"Invalid mode: {self.mode}. Must be 'forward' or 'backward'")
-
-        # --- attention ---
-        attn_out, attn_prob = self.attn(x, x, x, mask=mask, return_attn=True)  # (B,T,D), (B,T,T)
-        values = x + attn_out
-
-        self.last_encodings = values.detach()
-        self.last_attention = attn_prob.detach()
-
-        logits = self.output_prj(values)  # (B, T, V)
-        return logits
-
-
-
-    def training_step(self, batch, batch_idx):
-        if self.mode == "forward":
-            input, targets = batch
-        elif self.mode == "backward":
-            targets, input = batch
-        else:
-            raise ValueError(f"Invalid mode: {self.mode}. Must be 'forward' or 'backward'")
-
-        logits = self.forward(input)  # (B, T, V)
-
-        # CHANGED: use cross_ent_onehot instead of self.loss
-        loss, perplexity = cross_ent_onehot(logits, targets)
-
-        self.log("train_loss", loss, prog_bar=True, on_step=True, on_epoch=True)
-        # ADDED: also log perplexity for consistency
-        self.log("train_perplexity", perplexity, prog_bar=True, on_step=True, on_epoch=True)
-        
-        return loss
-
-    def configure_optimizers(self):
-        return Adam(self.parameters(), lr=self.lr)
+# WordEmbDecoder was deleted here -- IMPROVEMENT_PLAN.md C5.
+#
+# No runner ever set embed_type="wordemb", so it was unreachable.  It was also
+# not, as v1 of the plan supposed, a near-twin of OneHotDecoder: it was a
+# SINGLE attention layer with no FFN, no LayerNorm and no n_layers argument,
+# while OneHotDecoder is n-layer with pre-norm LayerNorm, FFN and residuals.
+# Unifying them would have meant inventing a shared abstraction for two
+# genuinely different architectures; deleting the unused one is the honest fix.

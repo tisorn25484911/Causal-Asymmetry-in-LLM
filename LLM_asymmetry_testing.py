@@ -7,19 +7,23 @@ import matplotlib.pyplot as plt
 import numpy as np
 import torch
 
-from Data_generation import CoinDataset, coin_generation, flower_process_generation
-from Flower_process_generation import FlowerDataset
+from configs import CONFIGS
+from Data_generation import CoinDataset, coin_generation
+from Flower_process_generation import FlowerDataset, flower_process_generation
 from OneHot_model import OneHotDecoder
 from Training_model import _loader
 from Model_analysis import (
+    coin_true_conditional,
+    flower_complexity,
     perplexity_calculation,
     perplexity_ind_CE,
-    perplexity_ind_model,
+    self_generated_entropy_rate,
     statistical_complexity,
     statistical_complexity_empirical,
+    stepwise_kl_coin,
     savefig,
-    mkdir,
 )
+from utils import check_weight_meta, coin_tag, entropy_rate_coin, flower_tag, mkdir
 
 # ── LaTeX rendering ───────────────────────────────────────────────────────────
 plt.rcParams.update({
@@ -38,38 +42,50 @@ plt.rcParams.update({
 # =============================================================================
 # CONFIG
 # =============================================================================
-CFG = dict(
-    d_model        = 64,
+# Evaluation-only knobs.  Everything describing the *models* and the
+# *processes* comes from configs.py, so this file can no longer disagree with
+# the run that produced the weights it loads (IMPROVEMENT_PLAN.md A4).  It
+# previously hard-coded main_large's tags and CFG, so running it after
+# Main_call.py would have scored p=0.4,q=0.8 weights against p=0.3,q=0.4 data;
+# only the d_model mismatch raising in load_state_dict prevented that.
+EVAL_CFG = dict(
     max_len        = 2000,
-    n_layers       = 2,
     num_samples    = 500,
     batch_size     = 32,
     max_batches    = None,
-    # coin
-    coin_p1        = 0.3,  coin_q1 = 0.4,
-    coin_seq_len   = 2000,
-    coin_num_token = 3,
-    coin_p2        = 0.4,  coin_q2 = 0.8,
-    coin_seq_len_12 = 2000,
-    # flower
-    flower_n       = 6,    flower_m = 4,
-    flower_seq_len = 2000,
+    coin_seq_len_eval = 2000,   # eval sequence length, independent of training
     # KL generation
     kl_gen_len  = 2000,
     kl_burn_in  = 200,
 )
 
 RUN = dict(
-    results_dir = "results",
+    config      = "LARGE",  # which configs.py entry produced the weights
+    results_dir = None,     # None → the config's out_root
     out_dir     = None,
     exp         = "all",    # "all" | "exp1" | "exp1_2" | "exp2"
 )
+
+
+def build_cfg():
+    """Config that trained the weights, plus the evaluation-only knobs."""
+    cfg = dict(CONFIGS[RUN["config"]])
+    cfg.update(EVAL_CFG)
+    return cfg
 
 
 # =============================================================================
 # MODEL LOADER
 # =============================================================================
 def load_model(path, num_token, cfg, mode):
+    # A4: verify the checkpoint is what we think it is, instead of guessing.
+    # Running an evaluator against weights trained with a different config used
+    # to be caught only by load_state_dict raising on a d_model mismatch --
+    # align d_model and it would silently score the wrong process.
+    check_weight_meta(path, {
+        "d_model": cfg["d_model"], "n_layers": cfg["n_layers"],
+        "token_size": num_token, "mode": mode,
+    })
     model = OneHotDecoder(
         token_size=num_token, d_model=cfg["d_model"],
         max_len=cfg["max_len"], mode=mode, n_layers=cfg["n_layers"])
@@ -80,16 +96,6 @@ def load_model(path, num_token, cfg, mode):
 
 
 # =============================================================================
-# ENTROPY RATE
-# =============================================================================
-def entropy_rate_coin(p, q):
-    def _h2(a):
-        b = max(1-a, 1e-12); a = max(a, 1e-12)
-        return -a*np.log2(a) - b*np.log2(b)
-    return (q/(p+q))*_h2(p) + (p/(p+q))*_h2(q)
-
-
-# =============================================================================
 # METRIC 0 — Standard autoregressive perplexity
 # Informational only — not used for asymmetry comparison because each model
 # evaluates on its OWN generated sequence (different state distributions).
@@ -97,7 +103,7 @@ def entropy_rate_coin(p, q):
 def compute_standard_ppl(model, len_seq=2000):
     # FIX [1]: removed (loader, max_batches) — perplexity_ind_model is
     # autoregressive and does not accept a loader.
-    return perplexity_ind_model(model, len_seq=len_seq, start_token=0)
+    return self_generated_entropy_rate(model, len_seq=len_seq, start_token=0)
 
 
 # =============================================================================
@@ -178,64 +184,11 @@ def kl_from_true_coin(model, p, q, cfg, num_token=3):
 
 
 # =============================================================================
-# STEPWISE KL — per-token average KL on ground-truth sequences
+# STEPWISE KL -- per-token average KL on ground-truth sequences.
+# coin_true_conditional and stepwise_kl_coin used to be byte-identical
+# copies of the Model_analysis versions (IMPROVEMENT_PLAN.md C4); they are
+# now imported.  Verified identical before deleting.
 # =============================================================================
-def coin_true_conditional(p, q, num_token=3):
-    fw = np.zeros((num_token, num_token))
-    fw[0] = [1-p, p,       0  ]
-    fw[1] = [0,   1-q,     q  ]
-    fw[2] = [1-p, p,       0  ]
-    bw = np.zeros((num_token, num_token))
-    bw[0] = [1-p,      0,   p  ]
-    bw[1] = [q*(1-p),  1-q, p*q]
-    bw[2] = [0,        1,   0  ]
-    return fw, bw
-
-
-def stepwise_kl_coin(model, loader, p, q, num_token=3, max_batches=None):
-    model.eval()
-    is_bw  = (getattr(model, "mode", "forward") == "backward")
-    device = next(model.parameters()).device
-    fw_cond, bw_cond = coin_true_conditional(p, q, num_token)
-    true_cond = bw_cond if is_bw else fw_cond
-
-    total_kl      = 0.0
-    per_tok_kl    = np.zeros(num_token)
-    per_tok_count = np.zeros(num_token)
-
-    with torch.no_grad():
-        for batch_idx, batch in enumerate(loader):
-            if max_batches is not None and batch_idx >= max_batches:
-                break
-            if is_bw:
-                targets, inputs = batch
-            else:
-                inputs, targets = batch
-            inputs  = inputs.to(device)
-            logits  = model(inputs)
-            p_model = torch.softmax(logits, dim=-1).cpu().numpy()
-            inp_np  = inputs.cpu().numpy()
-            B, T, _ = p_model.shape
-            for b in range(B):
-                for t in range(T):
-                    cur_tok = inp_np[b, t]
-                    p_true  = true_cond[cur_tok]
-                    p_mod   = p_model[b, t]
-                    kl_t    = float(np.sum(
-                        p_true * np.log2(p_true / (p_mod + 1e-12) + 1e-12)))
-                    total_kl              += kl_t
-                    per_tok_kl[cur_tok]   += kl_t
-                    per_tok_count[cur_tok] += 1
-
-    mean_kl     = total_kl / max(per_tok_count.sum(), 1)
-    per_tok_avg = np.where(per_tok_count > 0,
-                           per_tok_kl / per_tok_count, 0.0)
-
-    print(f"    mean KL = {mean_kl:.6f} bits")
-    for tok in range(num_token):
-        print(f"      token {tok}: avg KL={per_tok_avg[tok]:.6f}"
-              f"  (n={int(per_tok_count[tok])})")
-    return mean_kl, per_tok_avg, per_tok_count
 
 
 # =============================================================================
@@ -683,18 +636,20 @@ def eval_flower(tag, n, m, models_dir, out_root, cfg):
 # MAIN
 # =============================================================================
 def main():
-    cfg        = CFG.copy()
-    models_dir = os.path.join(RUN["results_dir"], "models")
-    out_root   = RUN["out_dir"] or os.path.join(RUN["results_dir"], "asymmetry_test")
+    cfg          = build_cfg()
+    results_dir  = RUN["results_dir"] or cfg["out_root"]
+    models_dir   = os.path.join(results_dir, "models")
+    out_root     = RUN["out_dir"] or os.path.join(results_dir, "asymmetry_test")
     mkdir(out_root)
     exp = RUN["exp"].lower()
+    print(f"  config={RUN['config']}  models_dir={models_dir}")
 
     if exp in ("all", "exp1"):
         eval_coin(
-            tag        = "exp1_coin_p03_q04",
+            tag        = coin_tag("exp1", cfg["coin_p1"], cfg["coin_q1"]),
             p          = cfg["coin_p1"],
             q          = cfg["coin_q1"],
-            seq_len    = cfg["coin_seq_len"],
+            seq_len    = cfg["coin_seq_len_eval"],
             models_dir = models_dir,
             out_root   = out_root,
             cfg        = cfg,
@@ -702,24 +657,27 @@ def main():
 
     if exp in ("all", "exp1_2"):
         eval_coin(
-            tag        = "exp1_2_coin_p04_q08",
+            tag        = coin_tag("exp1_2", cfg["coin_p2"], cfg["coin_q2"]),
             p          = cfg["coin_p2"],
             q          = cfg["coin_q2"],
-            seq_len    = cfg["coin_seq_len_12"],
+            seq_len    = cfg["coin_seq_len_eval"],
             models_dir = models_dir,
             out_root   = out_root,
             cfg        = cfg,
         )
 
     if exp in ("all", "exp2"):
-        eval_flower(
-            tag        = "exp2_flower_n6_m4",
-            n          = cfg["flower_n"],
-            m          = cfg["flower_m"],
-            models_dir = models_dir,
-            out_root   = out_root,
-            cfg        = cfg,
-        )
+        # Every flower configuration the runner trained, not one hard-coded
+        # (n, m) — the runner now trains both a positive and a reversed case.
+        for n, m, role in cfg["flower_configs"]:
+            eval_flower(
+                tag        = flower_tag("exp2", n, m),
+                n          = n,
+                m          = m,
+                models_dir = models_dir,
+                out_root   = out_root,
+                cfg        = cfg,
+            )
 
     print(f"\n  DONE — outputs in {out_root}/")
 

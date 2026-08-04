@@ -17,24 +17,16 @@ class CoinDataset(Dataset):
         target = x[1:]
         return input, target
     
-class FlowerDataset(Dataset):
-    def __init__(self, seqs, seq_len=20):
-        self.n = 4  # Number of dice
-        self.m = 2  # Number of outcomes per die
-        self.num_token = self.n + self.m  # Total number of tokens
-        self.seqs = seqs
-        self.seq_len = seq_len
+# IMPROVEMENT_PLAN.md C4.  `FlowerDataset` and `flower_process_generation`
+# used to be defined HERE as well as in Flower_process_generation.py -- this
+# copy with n=4/m=2 hard-coded as attributes and no `pre_depth`, that one
+# parametric and with it.  Every runner imported the generator from this file
+# and the Dataset from the other, so this file's FlowerDataset was dead in all
+# of them.  Both copies are deleted; Flower_process_generation.py is the single
+# definition.  Duplicated definitions are fine right up until one is fixed and
+# the other is not.
 
-    def __len__(self):
-        return len(self.seqs)
-    
-    def __getitem__(self, idx):
-        x = torch.tensor(self.seqs[idx], dtype=torch.long)
-        input = x[:-1]
-        target = x[1:]
-        return input, target
 
-    
 def coin_generation(num_samples = 1000, seq_len = 20, p = 0.6, q = 0.4):
     data = []   #num_sample x seq_len
     states = [] #num_sample x seq_len
@@ -70,42 +62,6 @@ def coin_generation(num_samples = 1000, seq_len = 20, p = 0.6, q = 0.4):
     return data, states
 
 """
-n_m flower process generation
-"""
-
-def flower_process_generation(num_samples=500, seq_len=200, n=4, m=2, dice_probs=None):
-    data = []
-    states = []
-    
-    if dice_probs is None:
-        # Each die gets a random bias using Dirichlet distribution
-        dice_probs = np.random.dirichlet(np.ones(m), size=n)
-    
-    T = seq_len  # Total number of cycles
-    
-    for _ in range(num_samples):
-        seq = []
-        state_seq = []
-        
-        for t in range(T):
-            # Step 1: Randomly select a die (uniform distribution)
-            die_idx = np.random.randint(0, n)
-            obs_die_choice = die_idx  # Observation in {0, ..., n-1}
-            seq.append(obs_die_choice)
-            state_seq.append(('select', die_idx))
-            
-            # Step 2: Roll the selected die
-            die_outcome = np.random.choice(m, p=dice_probs[die_idx])
-            obs_die_outcome = n + die_outcome  # Observation in {n, ..., n+m-1}
-            seq.append(obs_die_outcome)
-            state_seq.append(('roll', die_outcome))
-        
-        data.append(seq)
-        states.append(state_seq)
-    
-    return data, states
-
-"""
 DataLoader creation function
 """
 
@@ -114,15 +70,21 @@ def Rev_HMM_generation(data, states):
     rev_states = [list(reversed(state_seq)) for state_seq in states]
     return rev_data, rev_states
 
-def make_loader(data, states, batch_size, shuffle = True, mode = "forward"):
-    if mode == "backward":
-        seqs, _ = Rev_HMM_generation(data, states)
-        seq_len = len(seqs[0])
-    elif mode == "forward":
-        seqs, _ = data, states
-        seq_len = len(seqs[0])
-    else:
-        raise ValueError("Invalid mode. Choose 'forward' or 'backward'.")
-    ds = CoinDataset(seqs, seq_len = seq_len)
-    dl = DataLoader(ds, batch_size = batch_size, shuffle = shuffle)
-    return dl
+def make_loader(data, batch_size, shuffle=True):
+    """
+    Plain DataLoader over `data`.
+
+    IMPROVEMENT_PLAN.md C7.  This used to take a `states` argument that was a
+    no-op: the body read `seqs, _ = data, states`, a tuple unpack that assigns
+    seqs = data and discards states, written in a form that made `states` look
+    load-bearing.  No caller ever used the state sequences.
+
+    It also had a mode="backward" branch that reversed the *data* — a third,
+    unused notion of "backward" alongside the triu mask and the batch swap,
+    and NOT the mechanism any experiment uses.  Only pq_experiment.py calls
+    this, and always with mode="forward", so the branch is removed rather than
+    left as a trap.
+    """
+    seqs = data
+    ds = CoinDataset(seqs, seq_len=len(seqs[0]))
+    return DataLoader(ds, batch_size=batch_size, shuffle=shuffle)

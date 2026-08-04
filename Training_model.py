@@ -1,7 +1,7 @@
 import random
 
 import lightning as L
-from OneHot_model import OneHotDecoder, WordEmbDecoder, cross_ent_onehot
+from OneHot_model import OneHotDecoder, cross_ent_onehot
 import torch
 import torch.utils.data as tud
 import numpy as np
@@ -302,10 +302,20 @@ def train_model(
     lr:        float = 1e-2,
     mode:      str   = "forward",
     embed_type: str  = "onehot",
-    val_loader       = None, 
+    val_loader       = None,
+    n_layers:  int   = 2,
+    accelerator: str = "auto",
 ):
     """
-    Trains a OneHotDecoder / WordEmbDecoder and returns a Record_training object.
+    Trains a OneHotDecoder and returns a Record_training object.
+
+    `n_layers` is now a real parameter — IMPROVEMENT_PLAN.md B11.  It used to
+    be absent here and never forwarded, so OneHotDecoder's default of 2 applied
+    to every trained model regardless of intent, while
+    LLM_asymmetry_testing.py and Test_data_eval.py both instantiated with
+    n_layers=cfg["n_layers"].  Both configs happened to say 2, so it worked —
+    silently.  Changing either config would have made load_state_dict fail with
+    a shape error rather than a clear message.
 
     recorder.model          - trained model
     recorder.step_loss      - training loss per gradient step
@@ -314,16 +324,14 @@ def train_model(
     recorder.step_val_ppl   - validation perplexity per gradient step (if val_loader given)
     recorder.epoch_loss     - epoch-averaged training loss
     """
-    if embed_type == "onehot":
-        model = OneHotDecoder(
-            token_size=num_token, d_model=d_model, max_len=max_len, lr=lr, mode=mode,
-        )
-    elif embed_type == "wordemb":
-        model = WordEmbDecoder(
-            token_size=num_token, d_model=d_model, max_len=max_len, lr=lr, mode=mode,
-        )
-    else:
-        raise ValueError(f"Invalid embed_type: {embed_type!r}. Must be 'onehot' or 'wordemb'.")
+    # C5: WordEmbDecoder is gone — no runner ever set embed_type="wordemb".
+    if embed_type != "onehot":
+        raise ValueError(f"Invalid embed_type: {embed_type!r}. Only 'onehot' "
+                         "remains; WordEmbDecoder was deleted (C5).")
+    model = OneHotDecoder(
+        token_size=num_token, d_model=d_model, max_len=max_len, lr=lr, mode=mode,
+        n_layers=n_layers,
+    )
 
     recorder = Record_training(
         record_every_n_steps=1,
@@ -333,9 +341,19 @@ def train_model(
         val_loader=val_loader,
     )
 
+    # A note on reproducibility (A2).  Seeding makes the forward and backward
+    # arms *paired* -- within one run they share splits, folds, batch order and
+    # init -- and that is what delta_CE needs.  It does NOT make a run
+    # bit-reproducible across invocations on Apple MPS: measured here, model
+    # init is identical and the first loss matches to 8 decimals, then the
+    # trajectories diverge from the first backward pass (~1e-3 by step 2).
+    # That is the MPS backend, not this code -- the same test on CPU is exactly
+    # repeatable.  CPU is ~6x slower at these sizes (LARGE: 304 vs 49 ms/step,
+    # i.e. ~13 hr -> ~78 hr), so MPS stays the default and `accelerator="cpu"`
+    # is available when an exactly reproducible run is worth the wall-clock.
     trainer = L.Trainer(
         max_epochs=max_epochs,
-        accelerator="auto",
+        accelerator=accelerator,
         devices="auto",
         log_every_n_steps=5,
         callbacks=[recorder],
@@ -414,6 +432,8 @@ def train_test_val_pipeline(
     mode:        str   = "forward",
     save_plot:   str   = "cv_results.png",
     seed:        int   = 0,
+    n_layers:    int   = 2,
+    accelerator: str   = "auto",
 ):
     """
     Full cross-validation pipeline with step-level training + validation curves.
@@ -470,7 +490,8 @@ def train_test_val_pipeline(
     print(f"  Train+Val pool   : {n_trainval}")
     print(f"  Folds            : {n_folds}")
     print(f"  Mode             : {mode}  |  embed: {embed_type}")
-    print(f"  d_model={d_model}  max_epochs={max_epochs}  lr={lr}  seed={seed}")
+    print(f"  d_model={d_model}  n_layers={n_layers}  max_epochs={max_epochs}"
+          f"  lr={lr}  seed={seed}")
     print(f"{'='*65}\n")
 
     # ── 2. n-fold cross-validation ───────────────────────────────────────
@@ -516,7 +537,9 @@ def train_test_val_pipeline(
             lr=lr,
             mode=mode,
             embed_type=embed_type,
-            val_loader=fold_val_loader,   # ← NEW
+            val_loader=fold_val_loader,
+            n_layers=n_layers,            # B11
+            accelerator=accelerator,
         )
         all_recorders.append(recorder)
 
@@ -726,4 +749,5 @@ def train_test_val_pipeline(
         "test_ppl"      : test_ppl,
         "all_recorders" : all_recorders,
         "seed"          : seed,
+        "n_layers"      : n_layers,
     }
