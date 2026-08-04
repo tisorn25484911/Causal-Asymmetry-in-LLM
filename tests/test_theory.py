@@ -28,7 +28,7 @@ from Model_analysis import (                                   # noqa: E402
 )
 from OneHot_model import cross_ent_onehot                      # noqa: E402
 from Training_model import ChunckDataset, _eval_loss_on_loader, set_seed  # noqa: E402
-from utils import entropy_rate_coin                            # noqa: E402
+from utils import entropy_bits, entropy_rate_coin              # noqa: E402
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -592,3 +592,98 @@ def test_diagnose_divergence_distinguishes_blow_up_from_a_bad_optimum():
     assert not diagnose_divergence(stuck)["diverged"]
 
     assert not diagnose_divergence([])["diverged"]
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Causal-state discovery — C1
+# ─────────────────────────────────────────────────────────────────────────────
+class _StubDecoder(torch.nn.Module):
+    """
+    A model whose predictive distribution is a chosen function of the token,
+    so the true causal-state partition is known exactly.
+    """
+    def __init__(self, rows):
+        super().__init__()
+        self.mode = "forward"
+        self.rows = np.asarray(rows, float)          # (V, V) P(next | token)
+        V = self.rows.shape[0]
+        # latent = one-hot(token); output_prj maps it to log P(next | token),
+        # so softmax(output_prj(latent)) reproduces `rows` exactly.
+        self.emb = torch.nn.Parameter(torch.eye(V), requires_grad=False)
+        self.output_prj = torch.nn.Linear(V, V, bias=False)
+        with torch.no_grad():
+            self.output_prj.weight.copy_(
+                torch.log(torch.tensor(self.rows.T, dtype=torch.float32) + 1e-9))
+        self.last_encodings = None
+
+    def forward(self, tokens):
+        x = self.emb[tokens.long()]
+        self.last_encodings = x.detach()
+        return self.output_prj(x)
+
+    def parameters(self, *a, **k):
+        return super().parameters(*a, **k)
+
+
+def _stub_loader(V, n_seq=120, T=8, seed=0):
+    rng = np.random.default_rng(seed)
+    toks = torch.from_numpy(rng.integers(0, V, size=(n_seq, T)))
+    return [(toks[i:i+30], toks[i:i+30]) for i in range(0, n_seq, 30)]
+
+
+def test_recover_causal_states_merges_tokens_with_equal_futures():
+    """
+    C1.  Tokens 0 and 2 share a predictive distribution, so they are ONE causal
+    state even though they are two tokens -- exactly the coin's forward case.
+    A fixed-k estimator cannot discover this; a threshold on the predictive
+    distribution can.
+    """
+    from Model_analysis import recover_causal_states
+    rows = [[0.6, 0.4, 0.0],      # token 0  \  same future
+            [0.0, 0.2, 0.8],      # token 1   > distinct
+            [0.6, 0.4, 0.0]]      # token 2  /  same future  -> 2 states
+    m = _StubDecoder(rows)
+    r = recover_causal_states(m, _stub_loader(3), use_t="last",
+                              max_batches=None, state_tol=0.10, n_pts=500)
+    assert r["k_hat"] == 2, f"expected 2 causal states, got {r['k_hat']}"
+    # and tokens 0 and 2 must land in the SAME cluster
+    lab, tok = r["labels"], r["tokens"]
+    assert set(lab[tok == 0]) == set(lab[tok == 2])
+    assert set(lab[tok == 1]).isdisjoint(set(lab[tok == 0]))
+
+
+def test_recover_causal_states_keeps_genuinely_distinct_futures_apart():
+    from Model_analysis import recover_causal_states
+    rows = [[0.9, 0.05, 0.05], [0.05, 0.9, 0.05], [0.05, 0.05, 0.9]]
+    m = _StubDecoder(rows)
+    r = recover_causal_states(m, _stub_loader(3), use_t="last",
+                              max_batches=None, state_tol=0.10, n_pts=500)
+    assert r["k_hat"] == 3
+
+
+def test_recover_causal_states_reports_a_stability_profile():
+    """
+    The threshold is a real free parameter -- the smallest true state gap
+    ranges from 0.135 to 0.612 across this repo's configs -- so k_hat at one
+    threshold is not defensible alone.  The profile must always come back.
+    """
+    from Model_analysis import recover_causal_states
+    rows = [[0.6, 0.4, 0.0], [0.0, 0.2, 0.8], [0.6, 0.4, 0.0]]
+    r = recover_causal_states(_StubDecoder(rows), _stub_loader(3), use_t="last",
+                              max_batches=None, state_tol=0.10, n_pts=500)
+    assert len(r["stability"]) >= 5
+    assert all(isinstance(t, float) and isinstance(k, int) for t, k in r["stability"])
+    assert r["plateau"] == 2                     # 2 survives the widest span
+    # k is non-increasing as the threshold grows (agglomerative merging)
+    ks = [k for _, k in r["stability"]]
+    assert all(a >= b for a, b in zip(ks, ks[1:])), ks
+
+
+def test_S_hat_is_entropy_over_recovered_clusters():
+    from Model_analysis import recover_causal_states
+    rows = [[0.6, 0.4, 0.0], [0.0, 0.2, 0.8], [0.6, 0.4, 0.0]]
+    r = recover_causal_states(_StubDecoder(rows), _stub_loader(3), use_t="last",
+                              max_batches=None, state_tol=0.10, n_pts=500)
+    counts = np.bincount(r["labels"], minlength=r["k_hat"]).astype(float)
+    assert r["S_hat"] == pytest.approx(entropy_bits(counts / counts.sum()))
+    assert r["S_hat"] <= math.log2(r["k_hat"]) + 1e-9      # S <= log2(k)

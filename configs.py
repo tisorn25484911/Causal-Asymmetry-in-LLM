@@ -67,6 +67,14 @@ BASE = dict(
     # UMAP panel.  Direction-aware -- trimmed from the start for a forward
     # model and from the end for a backward one.
     umap_burn_in     = 32,
+    # C1: distance threshold on the model's PREDICTIVE DISTRIBUTION, used to
+    # DISCOVER the number of causal states instead of assuming it.  This is a
+    # genuine free parameter and no single value is right everywhere: the
+    # smallest true separation between backward states ranges from 0.135 at
+    # p=0.1,q=0.9 to 0.612 at p=q=0.5.  recover_causal_states therefore always
+    # reports k̂ across a grid of thresholds as well as at this one, and the
+    # plateau -- the k that survives the widest span -- is the defensible claim.
+    state_tol        = 0.10,
     coin_num_token   = 3,
     flower_dice_seed = 42,
     # ── flower configurations (A1) ─────────────────────────────────────

@@ -73,6 +73,7 @@ from Model_analysis import (
     latent_extraction,
     paired_delta_ce,
     plot_umap,
+    recover_causal_states,
     warm_up_umap,
     _project2d,
     _sample_latents,
@@ -114,6 +115,7 @@ CFG = dict(
     attn_vis_len   = 64,
     umap_n_neighbors = 15,   # small: datasets are smaller than main experiments
     umap_n_pts     = 500,
+    state_tol      = 0.10,   # C1: see configs.py
     max_batches    = 20,
 
     # Coin p=q=0.5  — POSITIVE control: C+=1.0, C-=1.5, predict delta_CE > 0
@@ -242,6 +244,22 @@ def analyse_model(tag, model, loader_ana, num_token, out_dir,
         except Exception as e:
             print(f"  attn: {e}")
 
+    # C1: discover k rather than assume it (see Model_analysis).
+    try:
+        rcs = recover_causal_states(model, loader_ana, use_t=use_t,
+                                    max_batches=cfg.get("max_batches", 20),
+                                    state_tol=cfg.get("state_tol", 0.10),
+                                    n_pts=cfg.get("umap_n_pts", 500),
+                                    seed=cfg.get("seed", 0))
+        res.update(k_hat=rcs["k_hat"], S_hat=rcs["S_hat"],
+                   k_plateau=rcs["plateau"], k_stability=rcs["stability"],
+                   state_tol=rcs["state_tol"])
+        print(f"  [{tag}] recovered k̂={rcs['k_hat']} (assumed k={k})  "
+              f"S_hat={rcs['S_hat']:.4f}   stability={rcs['stability']}")
+    except Exception as e:
+        print(f"  causal-state recovery failed: {e}")
+        rcs = None
+
     try:
         latents, inp_arr, _ = latent_extraction(
             model, loader_ana, max_batches=cfg.get("max_batches", 20))
@@ -255,6 +273,9 @@ def analyse_model(tag, model, loader_ana, num_token, out_dir,
             n_neighbors=cfg.get("umap_n_neighbors", 15),
             use_t=use_t, burn_in=cfg.get("umap_burn_in", 32),
             seed=cfg.get("seed", 0),
+            probs=(rcs["probs"] if rcs else None),
+            jitter=cfg.get("state_tol", 0.10) / 4.0,
+            k_hat=(rcs["k_hat"] if rcs else None), k_theory=k,
         )
         res.update({"latents": latents, "umap_coords": coords})
     except Exception as e:

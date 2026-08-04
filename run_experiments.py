@@ -94,6 +94,7 @@ from Data_generation import CoinDataset, coin_generation
 from Flower_process_generation import FlowerDataset, flower_process_generation
 from Model_analysis import (
     warm_up_umap,
+    recover_causal_states,
     _sample_latents,
     _scatter_tokens,
     slim_results,
@@ -241,7 +242,8 @@ def analyse_model(tag, model, loader, num_token, out_dir,
                   sample_seq=None, p=None, q=None, mode="forward",
                   k=2, use_t="last", attn_vis_len=64,
                   umap_n_pts=1000, umap_n_neighbors=15,
-                  umap_burn_in=32, umap_seed=0, max_batches=20):
+                  umap_burn_in=32, umap_seed=0, max_batches=20,
+                  state_tol=0.10):
     """
     `loader` must be the dedicated analysis loader from
     make_analysis_loader() — windows at the TRAINING chunk length, drawn from
@@ -256,6 +258,10 @@ def analyse_model(tag, model, loader, num_token, out_dir,
     attends to itself alone and maximum context is at position 0.
     """
     res = {"tag": tag}
+    # `k` is the THEORETICAL causal-state count for this arm (2/3 for the coin,
+    # n+1/m+1 for the flower).  It is what the fixed-k estimator assumes, and
+    # what the discovered k̂ is compared against.
+    k_theory = k
 
     # ── Move to CPU so Metal heap is freed before analysis ────────────────
     to_cpu_for_analysis(model)
@@ -269,6 +275,29 @@ def analyse_model(tag, model, loader, num_token, out_dir,
         except Exception as e:
             print(f"  attn failed: {e}")
 
+    # C1: discover k rather than assume it, by clustering the model's
+    # PREDICTIVE DISTRIBUTION -- a causal state is an equivalence class of
+    # histories with the same future distribution, which is not the same thing
+    # as a region of latent space.
+    try:
+        rcs = recover_causal_states(model, loader, use_t=use_t,
+                                    max_batches=max_batches, state_tol=state_tol,
+                                    n_pts=umap_n_pts, seed=umap_seed)
+        res["k_hat"]      = rcs["k_hat"]
+        res["S_hat"]      = rcs["S_hat"]
+        res["k_plateau"]  = rcs["plateau"]
+        res["k_stability"]= rcs["stability"]
+        res["state_tol"]  = rcs["state_tol"]
+        print(f"  [{tag}] recovered k̂={rcs['k_hat']} at tol={state_tol}"
+              + (f" (theory {k_theory})" if k_theory else "")
+              + f"   S_hat={rcs['S_hat']:.4f}")
+        print(f"  [{tag}] k̂ vs threshold: {rcs['stability']}  -> plateau k={rcs['plateau']}")
+    except Exception as e:
+        print(f"  causal-state recovery failed: {e}")
+        rcs = None
+        res.update(k_hat=None, S_hat=float("nan"), k_plateau=None,
+                   k_stability=None, state_tol=state_tol)
+
     try:
         latents, inp_arr, _ = latent_extraction(model, loader, max_batches=max_batches)
         # C6: pass the raw (N, T, d) latents, not a flattened prefix, and tell
@@ -277,7 +306,11 @@ def analyse_model(tag, model, loader, num_token, out_dir,
         _, coords = plot_umap(latents, inp_arr, num_token, title=tag,
                               save_path=os.path.join(out_dir, f"{tag}_umap.png"),
                               n_pts=umap_n_pts, n_neighbors=umap_n_neighbors,
-                              use_t=use_t, burn_in=umap_burn_in, seed=umap_seed)
+                              use_t=use_t, burn_in=umap_burn_in, seed=umap_seed,
+                              probs=(rcs["probs"] if rcs else None),
+                              jitter=state_tol / 4.0,
+                              k_hat=(rcs["k_hat"] if rcs else None),
+                              k_theory=k_theory)
         res.update({"latents": latents, "inputs_arr": inp_arr, "umap_coords": coords})
     except Exception as e:
         print(f"  UMAP failed: {e}")
@@ -459,7 +492,8 @@ def experiment_1(cfg, out_root, all_results):
                            umap_n_pts=cfg["umap_n_pts"],
                            umap_n_neighbors=cfg["umap_n_neighbors"],
                            umap_burn_in=cfg["umap_burn_in"], umap_seed=cfg["seed"],
-                           max_batches=cfg["max_batches"])
+                           max_batches=cfg["max_batches"],
+                           state_tol=cfg["state_tol"])
     cleanup()  # GC between fw and bw analysis (model already moved to CPU)
     # A3: use_t="first" for the backward arm.  With a triu mask position T-1
     # attends to itself only, so reading complexity at "last" read latents that
@@ -470,7 +504,8 @@ def experiment_1(cfg, out_root, all_results):
                            umap_n_pts=cfg["umap_n_pts"],
                            umap_n_neighbors=cfg["umap_n_neighbors"],
                            umap_burn_in=cfg["umap_burn_in"], umap_seed=cfg["seed"],
-                           max_batches=cfg["max_batches"])
+                           max_batches=cfg["max_batches"],
+                           state_tol=cfg["state_tol"])
     cleanup()
 
     print("\n  -- 1d Comparison --")
@@ -548,7 +583,8 @@ def experiment_1_2(cfg, out_root, all_results):
                            umap_n_pts=cfg["umap_n_pts"],
                            umap_n_neighbors=cfg["umap_n_neighbors"],
                            umap_burn_in=cfg["umap_burn_in"], umap_seed=cfg["seed"],
-                           max_batches=cfg["max_batches"])
+                           max_batches=cfg["max_batches"],
+                           state_tol=cfg["state_tol"])
     cleanup()
     ana_bw = analyse_model(f"{tag}_bw", cv_bw["best_model"], loader_fw_ana,
                            num_token, odir, sample_seq, p, q, "backward",
@@ -556,7 +592,8 @@ def experiment_1_2(cfg, out_root, all_results):
                            umap_n_pts=cfg["umap_n_pts"],
                            umap_n_neighbors=cfg["umap_n_neighbors"],
                            umap_burn_in=cfg["umap_burn_in"], umap_seed=cfg["seed"],
-                           max_batches=cfg["max_batches"])
+                           max_batches=cfg["max_batches"],
+                           state_tol=cfg["state_tol"])
     cleanup()
     compare_fw_bw(tag, cv_fw, cv_bw, ana_fw, ana_bw,
                   loader_fw_ana, num_token, odir, sample_seq,
@@ -727,7 +764,8 @@ def experiment_2(cfg, out_root, all_results, n, m, role):
                            umap_n_pts=cfg["umap_n_pts"],
                            umap_n_neighbors=cfg["umap_n_neighbors"],
                            umap_burn_in=cfg["umap_burn_in"], umap_seed=cfg["seed"],
-                           max_batches=cfg["max_batches"])
+                           max_batches=cfg["max_batches"],
+                           state_tol=cfg["state_tol"])
     ana_fw["S_theory"] = C_plus
     cleanup()
     ana_bw = analyse_model(f"{tag}_bw", cv_bw["best_model"], loader_fw_ana,
@@ -736,7 +774,8 @@ def experiment_2(cfg, out_root, all_results, n, m, role):
                            umap_n_pts=cfg["umap_n_pts"],
                            umap_n_neighbors=cfg["umap_n_neighbors"],
                            umap_burn_in=cfg["umap_burn_in"], umap_seed=cfg["seed"],
-                           max_batches=cfg["max_batches"])
+                           max_batches=cfg["max_batches"],
+                           state_tol=cfg["state_tol"])
     ana_bw["S_theory"] = C_minus
     cleanup()
 

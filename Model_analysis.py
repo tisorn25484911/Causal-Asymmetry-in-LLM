@@ -2,7 +2,7 @@ import numpy as np
 import matplotlib.pyplot as plt
 from sklearn.decomposition import PCA
 import torch
-from sklearn.cluster import KMeans
+from sklearn.cluster import KMeans, AgglomerativeClustering
 from OneHot_model import cross_ent_onehot
 from matplotlib.colors import TwoSlopeNorm
 try:
@@ -391,7 +391,8 @@ def _scatter_tokens(ax, coords, toks, num_token, title, xlim=None, ylim=None):
 def plot_umap(latents, inputs_arr, num_token, title="", save_path=None,
               xlim=None, ylim=None, n_pts: int = 1000, n_neighbors: int = 15,
               use_t="last", burn_in: int = 32, seed: int = 0,
-              modes=("per_sequence", "random")):
+              modes=("per_sequence", "random"),
+              probs=None, jitter: float = 0.025, k_hat=None, k_theory=None):
     """
     2-D UMAP of the latents, coloured by input token, one panel per sampling
     mode — IMPROVEMENT_PLAN.md C6.
@@ -425,7 +426,8 @@ def plot_umap(latents, inputs_arr, num_token, title="", save_path=None,
     Returns (fig, {mode: coords}).
     """
     modes = tuple(modes)
-    fig, axes = plt.subplots(1, len(modes), figsize=(6.5 * len(modes), 5.5),
+    n_panels = len(modes) + (1 if probs is not None else 0)
+    fig, axes = plt.subplots(1, n_panels, figsize=(6.5 * n_panels, 5.5),
                              squeeze=False)
     out = {}
     for ax, mode in zip(axes[0], modes):
@@ -442,7 +444,45 @@ def plot_umap(latents, inputs_arr, num_token, title="", save_path=None,
             ax.set_title(f"{mode} — failed", fontsize=10)
             ax.text(0.5, 0.5, str(e)[:80], ha="center", va="center",
                     transform=ax.transAxes, fontsize=7)
-    fig.suptitle(title, fontsize=11, fontweight="bold")
+
+    # Causal-state panel.  UMAP is scale-free -- it builds a k-NN graph, so a
+    # separation 26x smaller than the state gap still reads as a clean boundary
+    # provided it is larger than the local spread.  On the coin's forward arm
+    # the model's residual error puts tokens 0 and 2 (ONE causal state) 0.041
+    # apart while the true state gap is 1.065, and the latent panels therefore
+    # draw three blobs for a two-state process.
+    #
+    # Jittering the predictive distribution by `jitter` states the tolerance
+    # explicitly -- "differences below this are not a state difference" -- and
+    # makes the panel show causal states rather than tokens.  Colour stays by
+    # TOKEN so the merge is visible: tokens 0 and 2 land in one blob.
+    if probs is not None:
+        ax = axes[0][len(modes)]
+        try:
+            pts, toks, _ = _sample_latents(latents, inputs_arr,
+                                           mode="per_sequence", use_t=use_t,
+                                           n_pts=n_pts, seed=seed)
+            P = np.asarray(probs, dtype=float)
+            if len(P) != len(pts):
+                P = P[:len(pts)]
+            rng = np.random.default_rng(seed)
+            coords, mlbl = _project2d(P + rng.normal(0, jitter, P.shape),
+                                      n_neighbors=n_neighbors)
+            out["predictive"] = coords
+            _scatter_tokens(ax, coords, toks[:len(coords)], num_token,
+                            f"predictive distribution ({mlbl})\n"
+                            f"jittered at eps={jitter} — CAUSAL STATES", xlim, ylim)
+        except Exception as e:
+            print(f"  UMAP panel 'predictive' failed: {e}")
+            ax.set_title("predictive — failed", fontsize=10)
+
+    sub = title
+    if k_hat is not None:
+        sub += f"    |    recovered k̂ = {k_hat}"
+        if k_theory is not None:
+            sub += f"   (theory {k_theory})"
+        sub += "\nblob count in a UMAP is NOT a state count — k̂ is measured in the full space"
+    fig.suptitle(sub, fontsize=11, fontweight="bold")
     fig.tight_layout()
     if save_path:
         savefig(fig, save_path)
@@ -855,6 +895,79 @@ def flower_entropy_rate(n: int, m: int, dice_probs) -> float:
     dp = np.asarray(dice_probs, dtype=float)
     return float(0.5 * np.log2(n)
                  + 0.5 * np.mean([entropy_bits(dp[i]) for i in range(n)]))
+
+
+def recover_causal_states(model, data_loader, use_t="last", max_batches=20,
+                          state_tol=0.10, n_pts=2000, seed=0,
+                          tol_grid=(0.02, 0.05, 0.10, 0.15, 0.20, 0.30, 0.40, 0.60)):
+    """
+    DISCOVER the number of causal states and their occupancy entropy, instead
+    of assuming it -- IMPROVEMENT_PLAN.md C1.
+
+    Why this is the right quantity.  A causal state is an equivalence class of
+    histories that induce the SAME distribution over the future
+    (Crutchfield's epsilon-machine).  It is not a region of latent space.  So
+    the thing to cluster is the model's PREDICTIVE DISTRIBUTION,
+    softmax(output_prj(latent)), not the latent itself -- two histories in the
+    same causal state must predict the same next token, but nothing forces the
+    network to give them the same latent, and in practice it does not.
+
+    Measured on the coin, forward arm, where tokens 0 and 2 are ONE causal
+    state: their latents sit 1.59 apart while the true state gap is 19.10, and
+    their predictive distributions sit 0.041 apart against a state gap of
+    1.065.  Both carry the state structure, but the latent also carries token
+    identity that the state does not depend on.
+
+    `statistical_complexity_empirical` (kept, unchanged) runs k-means at a k
+    the CALLER supplies, so S = H(occupancy) <= log2(k) and it will confirm
+    whatever k it is handed.  This function instead uses agglomerative
+    clustering with a distance threshold, so k falls out of the data.
+
+    THE THRESHOLD IS A REAL FREE PARAMETER AND NO SINGLE VALUE IS CORRECT.
+    The smallest true separation between backward states varies by an order of
+    magnitude across the configs in this repo -- 0.135 at p=0.1,q=0.9 versus
+    0.612 at p=q=0.5 -- so a threshold that resolves one config merges another.
+    That is why `stability` is always returned and always printed: k_hat at a
+    single threshold is not a defensible number on its own, whereas "k_hat = 2,
+    stable across tol in [0.10, 0.60]" is.
+
+    Returns dict with:
+        k_hat       clusters found at `state_tol`
+        S_hat       H(cluster occupancy) in bits, over the RECOVERED clusters
+        labels      per-point cluster id
+        tokens      per-point input token (for cross-tabulation)
+        probs       per-point predictive distribution
+        stability   [(tol, k), ...] over tol_grid
+        plateau     the k that persists over the widest span of tol_grid
+    """
+    lat, inp, _ = latent_extraction(model, data_loader, max_batches=max_batches)
+    pts, toks, _ = _sample_latents(lat, inp, mode="per_sequence", use_t=use_t,
+                                   n_pts=n_pts, seed=seed)
+    with torch.no_grad():
+        probs = torch.softmax(
+            model.output_prj(torch.from_numpy(pts).to(
+                next(model.parameters()).device)), dim=-1).cpu().numpy()
+
+    def _fit(tol):
+        return AgglomerativeClustering(n_clusters=None, distance_threshold=tol,
+                                       linkage="complete").fit_predict(probs)
+
+    labels = _fit(state_tol)
+    k_hat  = int(len(np.unique(labels)))
+    counts = np.bincount(labels, minlength=k_hat).astype(float)
+    S_hat  = entropy_bits(counts / counts.sum())
+
+    stability = [(float(t), int(len(np.unique(_fit(t))))) for t in tol_grid]
+    # the k that survives the widest span of thresholds -- a weaker claim than
+    # a single tol, and correspondingly harder to argue with
+    spans = {}
+    for t, k in stability:
+        spans[k] = spans.get(k, 0) + 1
+    plateau = max(spans, key=spans.get) if spans else k_hat
+
+    return dict(k_hat=k_hat, S_hat=float(S_hat), labels=labels, tokens=toks,
+                probs=probs, state_tol=float(state_tol),
+                stability=stability, plateau=int(plateau))
 
 
 def statistical_complexity_empirical(model, data_loader, max_batches=None, use_t="last", k=2):
