@@ -398,9 +398,24 @@ def plot_complexity(tag, S_emp_fw, S_emp_bw, S_th_fw=None, S_th_bw=None,
     ax.set_xticks(x); ax.set_xticklabels(labels, fontsize=10)
     ax.set_ylabel(r"Statistical Complexity $\mathcal{C}$ (bits)")
     tag_safe = tag.replace("_", r"\_")
+
+    # IMPROVEMENT_PLAN.md A1.  This title used to read "C^- > C^+ expected"
+    # unconditionally, including on the flower configs where C^+ > C^- and the
+    # prediction is the opposite.  The expectation is now derived from the
+    # theory values actually passed in, so the chart cannot assert the reverse
+    # of what the process does.
+    if S_th_fw is not None and S_th_bw is not None:
+        if S_th_bw > S_th_fw:
+            expect = r"$\mathcal{C}^- > \mathcal{C}^+$ predicted"
+        elif S_th_fw > S_th_bw:
+            expect = r"$\mathcal{C}^+ > \mathcal{C}^-$ predicted (reversed)"
+        else:
+            expect = r"$\mathcal{C}^+ = \mathcal{C}^-$ predicted (null)"
+    else:
+        expect = "no closed-form prediction supplied"
     ax.set_title(
         rf"\textbf{{{tag_safe}}} --- "
-        r"Causal State Complexity  ($\mathcal{C}^- > \mathcal{C}^+$ expected)")
+        rf"Causal State Complexity  ({expect})")
     ax.legend(fontsize=9); ax.grid(True, alpha=0.3, axis="y")
     fig.tight_layout()
     if out_dir:
@@ -613,10 +628,16 @@ def eval_flower(tag, n, m, models_dir, out_root, cfg):
         model_fw, loader, max_batches=cfg["max_batches"], use_t="last",  k=n+1)
     S_emp_bw = statistical_complexity_empirical(
         model_bw, loader, max_batches=cfg["max_batches"], use_t="first", k=m+1)
-    plot_complexity(tag, S_emp_fw, S_emp_bw, out_dir=odir)
+    # A1: real closed forms for the flower, so the chart states the correct
+    # prediction instead of assuming C- > C+.  These used to be absent, and
+    # plot_complexity then asserted C- > C+ on configs where C+ > C-.
+    S_th_fw, S_th_bw = flower_complexity(n, m, dice_probs)
+    plot_complexity(tag, S_emp_fw, S_emp_bw, S_th_fw, S_th_bw, out_dir=odir)
 
     sep = "=" * 60
     print(f"\n{sep}\n  SUMMARY — {tag}\n{sep}")
+    print(f"  C+ / C- (theory)      = {S_th_fw:.4f} / {S_th_bw:.4f}"
+          f"   → delta_CE {'> 0' if S_th_bw > S_th_fw else '< 0'} predicted")
     print(f"  [Metric 1] perplexity_calculation")
     print(f"    PPL  FW / BW        = {ppl_calc_fw:.4f} / {ppl_calc_bw:.4f}")
     print(f"    CE   FW / BW        = {ce_calc_fw:.4f} / {ce_calc_bw:.4f} bits")
