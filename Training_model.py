@@ -14,6 +14,50 @@ import numpy as np
 # ─────────────────────────────────────────────────────────────────────────────
 # class and functions for large training sequence
 # ────────────────────────────────────────────────────────────────────────────
+def diagnose_divergence(step_loss, rise_factor: float = 2.0) -> dict:
+    """
+    Detect a training run that reached a good solution and then blew up.
+
+    Returns {min, min_at, peak_after_min, final, diverged}.
+
+    Why this exists.  Training on these processes is only marginally stable and
+    a large fraction of folds diverge: measured on the sanity_check flower
+    config (n=1, m=2, lr=5e-3, 60 epochs), 4 of 6 seeds reached H_inf = 0.499
+    and then spiked to CE 15-58 bits before partially recovering.  The failure
+    is NOT a bad local optimum -- the loss reaches the entropy rate first, then
+    rises -- so it cannot be diagnosed from the final value alone.
+
+    Root cause is the same one B3 describes: both processes contain
+    deterministic transitions (coin token 2 -> token 1 w.p. 1; a flower roll is
+    always followed by a selection), and cross-entropy on a deterministic
+    transition has no finite optimum, so training drives the logit gap toward
+    infinity until a step overshoots.  Before B3 was fixed this surfaced as
+    NaN; it now surfaces as a large finite loss.
+
+    Measured divergence rates on that config, 6 seeds each:
+
+        MPS, Adam,  lr=5e-3 (current)   4/6
+        MPS, AdamW, wd=0.01             1/6
+        MPS, Adam,  lr=1e-3             0/6
+        CPU, Adam,  lr=5e-3             0/6
+
+    So it is an interaction, not purely either cause: the landscape is sharp
+    enough that MPS's numerical noise tips it over where CPU's does not.  Left
+    unfixed deliberately -- changing the optimiser or the learning rate would
+    change every number in the study -- so this function exists to make it
+    visible in the run log instead of silent.
+    """
+    sl = np.asarray(step_loss, dtype=float)
+    if sl.size == 0:
+        return dict(min=float("nan"), min_at=-1, peak_after_min=float("nan"),
+                    final=float("nan"), diverged=False)
+    i = int(np.argmin(sl))
+    peak = float(sl[i:].max())
+    lo = float(sl[i])
+    return dict(min=lo, min_at=i, peak_after_min=peak, final=float(sl[-1]),
+                diverged=bool(peak > max(rise_factor * lo, lo + 0.5)))
+
+
 def set_seed(seed: int = 0) -> int:
     """
     Seed every global RNG this repo draws from, and return the seed.
@@ -589,6 +633,7 @@ def train_test_val_pipeline(
     fold_val_loss  = []
     fold_val_ppl   = []
     all_recorders  = []
+    fold_divergence = []      # per-fold diagnose_divergence() output
 
     for fold in range(n_folds):
         print(f"\n--- Fold {fold + 1}/{n_folds} ---")
@@ -635,6 +680,14 @@ def train_test_val_pipeline(
         fold_val_loss.append(val_loss)
         fold_val_ppl.append(val_ppl)
 
+        # Report divergence explicitly -- a fold that reached the entropy rate
+        # and then blew up cannot be diagnosed from its final value alone.
+        dv = diagnose_divergence(recorder.step_loss)
+        fold_divergence.append(dv)
+        if dv["diverged"]:
+            print(f"  ! Fold {fold+1} DIVERGED: train loss reached {dv['min']:.4f} "
+                  f"at step {dv['min_at']}, then peaked at {dv['peak_after_min']:.2f} "
+                  f"(final {dv['final']:.4f}).  See diagnose_divergence().")
         print(f"  ✓ Fold {fold+1}  val loss: {val_loss:.4f}  |  val ppl: {val_ppl:.4f}")
 
     # ── 3. Select best fold ──────────────────────────────────────────────
@@ -829,6 +882,12 @@ def train_test_val_pipeline(
         f"{float(np.std(fold_val_ppl)):>10.4f} "
         f"{float(np.std(fold_test_ppl)):>10.4f}"
     )
+    n_div = sum(d["diverged"] for d in fold_divergence)
+    if n_div:
+        print(f"  !! {n_div}/{n_folds} folds DIVERGED during training "
+              f"(reached a good loss, then blew up).  Their delta-CE is an\n"
+              f"     optimisation artefact; paired_delta_ce drops them from the "
+              f"converged-only statistic.")
     print(f"{'='*65}\n")
 
     return {
@@ -844,5 +903,6 @@ def train_test_val_pipeline(
         "all_recorders" : all_recorders,
         "seed"          : seed,
         "n_layers"      : n_layers,
+        "fold_divergence": fold_divergence,
         "val_every_n_steps": val_every_n_steps,
     }

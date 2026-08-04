@@ -564,3 +564,31 @@ def test_perplexity_calculation_matches_concatenate_first():
 def test_umap_warm_up_is_idempotent():
     from Model_analysis import warm_up_umap
     assert warm_up_umap(15) == warm_up_umap(15)     # second call is a no-op
+
+
+def test_diagnose_divergence_distinguishes_blow_up_from_a_bad_optimum():
+    """
+    A fold that reaches the entropy rate and then blows up cannot be spotted
+    from its final loss alone -- it often partially recovers.  Measured on the
+    sanity_check flower config, 4/6 MPS seeds do exactly this.
+    """
+    from Training_model import diagnose_divergence
+
+    converged = [2.0, 1.2, 0.6, 0.50, 0.499, 0.499]
+    assert not diagnose_divergence(converged)["diverged"]
+
+    # reaches 0.499 then spikes to 40 and partially recovers to 1.07 --
+    # this is the real shape observed in sanity_check fold 3
+    blew_up = [1.9, 0.8, 0.499, 40.6, 12.0, 1.07]
+    d = diagnose_divergence(blew_up)
+    assert d["diverged"]
+    assert d["min"] == pytest.approx(0.499)
+    assert d["peak_after_min"] == pytest.approx(40.6)
+    assert d["final"] == pytest.approx(1.07)
+
+    # a fold merely stuck high never dips low, so it is NOT flagged as
+    # divergence -- the convergence filter is what catches that case
+    stuck = [1.9, 1.6, 1.5, 1.49, 1.49]
+    assert not diagnose_divergence(stuck)["diverged"]
+
+    assert not diagnose_divergence([])["diverged"]
