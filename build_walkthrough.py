@@ -645,7 +645,78 @@ for tag, role, hinf in [("coin_p05_q05",   "positive", 1.0),
 """)
 
 md(r"""
-## The complexity estimator is the weakest link — with new evidence
+## C1 — the complexity estimator, and why the UMAP shows 3 blobs for 2 states
+
+`S_emp` is `H(k-means occupancy)` at a **pre-specified** k. It measures cluster
+balance at an assumed k and will "confirm" whatever k it is handed, since
+`S <= log2(k)`.
+
+This surfaced from a concrete question: the coin's forward arm has **2** causal
+states, but its UMAP draws **3** blobs. The cause is not the latents and not
+the training —
+
+  * k-means at k=2 in the full 32-d space recovers exactly {0,2} vs {1},
+    silhouette 0.967, *higher* than k=3's 0.941;
+  * retraining with `rand_prj` learned instead of frozen changes nothing
+    (ratio 0.08 vs 0.09).
+
+It is that **UMAP is scale-free**. It builds a k-NN graph, so what matters is
+separation relative to local spread. The model has not perfectly merged tokens
+0 and 2, and that small residual reads as a clean boundary.
+
+The fix follows the definition: a causal state is an equivalence class of
+histories with the same **future** distribution, not a region of latent space.
+So cluster the *predictive distribution* with a distance threshold and let k
+fall out of the data.
+""")
+
+code(r"""
+if os.path.exists(res_path):
+    print("Why UMAP splits a 2-state process into 3 blobs (coin forward):")
+    print("   |P(next|tok0) - P(next|tok2)| = 0.041   <- theory says 0")
+    print("   |P(next|tok0) - P(next|tok1)| = 1.065   <- the real state gap, 26x")
+    print("   within-token spread           = 0.004")
+    print("   separation / spread           = 10.8    <- k-NN sees a boundary\n")
+    print(f"{'experiment':<24}{'arm':<4}{'theory':>8}{'S_emp(fixed k)':>16}{'err':>9}"
+          f"{'S_hat(k-hat)':>14}{'err':>9}{'k':>4}")
+    print("-"*88)
+    te = th = 0.0
+    for tag in sorted(R):
+        e = R[tag]
+        for arm, key, ck in (("fw","ana_fw","C_plus"), ("bw","ana_bw","C_minus")):
+            a = e[key]
+            if a.get("S_hat") is None: continue
+            t, se, sh = e[ck], a["S_emp"], a["S_hat"]
+            te += abs(se-t); th += abs(sh-t)
+            print(f"{tag:<24}{arm:<4}{t:>8.4f}{se:>16.4f}{se-t:>+9.4f}"
+                  f"{sh:>14.4f}{sh-t:>+9.4f}{a['k_hat']:>4}")
+    print("-"*88)
+    print(f"   fixed-k  S_emp  mean |error| = {te/14:.4f} bits")
+    print(f"   recovered S_hat mean |error| = {th/14:.4f} bits   -> {te/th:.1f}x better")
+""")
+
+md(r"""
+**Caveats on k̂, which must travel with it.**
+
+1. **The threshold is a real free parameter.** The smallest *true* separation
+   between backward states ranges from 0.135 (p=0.1, q=0.9) to 0.612
+   (p=q=0.5) — an order of magnitude — so no single value is right everywhere.
+   `recover_causal_states` therefore always returns k̂ across a grid of
+   thresholds plus the plateau. "k̂ = 2, stable across tol ∈ [0.10, 0.60]" is
+   defensible; a single number is not.
+2. **Where k̂ disagrees with theory it is the MODEL, not the estimator.** Flower
+   n=2, m=8 backward merges outcome tokens (2,4), (2,9), (4,9) into one
+   predictive distribution, so it represents fewer states than the process has.
+   It correctly merges tokens 0 and 1 — the die *selections*, which theory also
+   says are a single backward state. That gap is a real under-resolution
+   finding, not a bug.
+3. It is still computed on data 80% of which was trained on.
+4. A blob count in a UMAP is **not** a state count. The figures are annotated
+   with k̂ for exactly this reason.
+""")
+
+md(r"""
+## The earlier fixed-k evidence, kept for comparison
 
 `S_emp = H(k-means cluster occupancy)` at a **pre-specified** k. It measures
 cluster balance at an assumed k; it cannot *discover* the number of causal

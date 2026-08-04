@@ -202,10 +202,7 @@ into any write-up:
 
 ## 4. What is still not done
 
-- **C1** — `S_emp` is still `H(k-means occupancy)` at a *pre-specified* k. It
-  measures cluster balance at an assumed k and cannot discover the number of
-  causal states. Phase 4.1. **And there is now direct evidence it matters**:
-  see §5.
+- ~~**C1**~~ — **done**, see §5a. Driven by the UMAP question below.
 - **C2** — `reverse_pos_for_backward` still never set anywhere. This is the
   remaining architectural asymmetry between the arms and Phase 4.4 exists to
   test it.
@@ -218,7 +215,63 @@ into any write-up:
 
 ---
 
-## 5. New evidence that C1 matters
+## 5a. C1 — done, and why (commit `e57cc01`)
+
+You asked why the forward UMAP shows 3 blobs when the coin has 2 forward
+causal states. The diagnosis was not what either of us guessed.
+
+**Not C5.** Retraining with `rand_prj` learned vs frozen gives
+d(tok0,tok2)/d(state) of 0.08 vs 0.09 — indistinguishable. **Not the training
+logic**: D1 changes only what is recorded; D2/D4 are verified numerically
+identical. **Not the latents being wrong**: k-means at k=2 in the full 32-d
+space recovers exactly {0,2} vs {1}, silhouette 0.967 — *higher* than k=3's
+0.941.
+
+**It is UMAP being scale-free.** It builds a k-NN graph, so what matters is
+separation relative to *local spread*, not absolute distance. The model has not
+perfectly merged tokens 0 and 2:
+
+```
+|P(next|tok0) - P(next|tok2)| = 0.041     theory says 0
+|P(next|tok0) - P(next|tok1)| = 1.065     the real state gap, 26x larger
+within-token spread           = 0.004
+separation / spread           = 10.8      -> a clean boundary to k-NN
+```
+
+C6 did not cause this, it **exposed** it: per-sequence sampling removes the
+context-length smear, so all structure sharpens — including the sub-split the
+old prefix sampling blurred away.
+
+**The fix.** A causal state is an equivalence class of histories with the same
+*future* distribution, not a region of latent space. So `recover_causal_states`
+clusters the model's **predictive distribution** with an agglomerative distance
+threshold, and k falls out of the data. Measured on all 14 checkpoints:
+
+| | mean abs error vs closed form |
+|---|---|
+| fixed-k `S_emp` | 0.1104 bits |
+| recovered `S_hat` | **0.0260 bits** (4.2x better) |
+
+The worst fixed-k cases collapse: flower n=2,m=6 backward +0.4831 → −0.0140,
+n=6,m=4 forward +0.2925 → +0.0007, n=4,m=2 forward +0.2378 → +0.0021.
+
+**The threshold is a real free parameter and is not hidden.** The smallest true
+separation between backward states ranges from 0.135 (p=0.1,q=0.9) to 0.612
+(p=q=0.5), so no single value is right everywhere. `recover_causal_states`
+always returns and prints k̂ across a grid plus the plateau, because
+"k̂ = 2, stable across tol ∈ [0.10, 0.60]" is defensible where one number is not.
+
+Where k̂ ≠ theory it is the **model**, not the estimator: flower n=2,m=8
+backward merges outcome tokens (2,4), (2,9), (4,9) into one predictive
+distribution, so it represents fewer states than theory. It correctly merges
+tokens 0 and 1 — the die *selections*, which theory also says are one backward
+state.
+
+UMAP plots are kept, annotated with k̂ and the reminder that a blob count is not
+a state count, plus a third panel showing the predictive distribution jittered
+at ε = state_tol/4, which draws causal states.
+
+## 5b. The original evidence that C1 mattered
 
 `S_emp` against the closed form, from the QUICK re-run:
 
