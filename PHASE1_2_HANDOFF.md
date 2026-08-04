@@ -382,14 +382,15 @@ print(flower_complexity(1, 2, [[0.5, 0.5]]))   # (1.0, 1.0), not (1.0, 1.5)
 
 ## 8. The re-runs (Phase 1.9)
 
-Launched on 2026-08-04, in this order, sequentially — they share one MPS device,
-so overlapping them only thrashes it:
+Launched on 2026-08-04 via `./run_all.sh`, in this order, sequentially — they
+share one MPS device, so overlapping them only thrashes it.  SANITY and QUICK
+are **complete**; LARGE was still running when this was written.
 
 | Run | Command | Log | Output |
 |---|---|---|---|
 | SANITY | `python sanity_check.py` | `run_sanity.log` | `sanity_check_flower_process/` |
 | QUICK | `python run_experiments.py --config QUICK` | `run_quick.log` | `results_quick/` |
-| LARGE | queued behind QUICK by `run_large_when_quick_done.sh` | `run_large.log` | `results_large/` |
+| LARGE | third in `run_all.sh` | `run_large.log` | `results_large/` |
 
 Check progress with `tail -f run_quick.log`, or jump to the verdict:
 
@@ -397,6 +398,54 @@ Check progress with `tail -f run_quick.log`, or jump to the verdict:
 grep -A12 "ASYMMETRY SUMMARY" run_quick.log
 grep -A30 "SANITY CHECK SUMMARY" run_sanity.log
 ```
+
+### Results so far
+
+**SANITY — both controls pass, both arms converge to H∞ within 0.005 bits:**
+
+| control | H∞ | CE_FW | CE_BW | ΔCE | verdict |
+|---|---|---|---|---|---|
+| Coin p=q=0.5 (positive) | 1.0000 | 1.0013 | 1.0043 | **+0.0029** | PASS — BW harder |
+| Flower n=1,m=2 (null) | 0.5000 | 0.5008 | 0.5006 | **−0.0002** | PASS — no asymmetry |
+
+The null control is the one that matters, and it holds: on a process that is
+exactly time-reversible the pipeline reports no asymmetry. Before the
+analysis-length fix this same control reported ΔCE = −0.4210.
+
+**QUICK — converged, and ΔCE is indistinguishable from zero everywhere:**
+
+| experiment | C⁺ | C⁻ | C⁻−C⁺ | ΔCE | verdict |
+|---|---|---|---|---|---|
+| `exp1_coin_p040_q080` | 0.9183 | 1.5656 | +0.6473 | −0.0015 | n.s. |
+| `exp1_2_coin_p010_q090` | 0.4690 | 0.8911 | +0.4221 | +0.0023 | n.s. |
+| `exp2_flower_n2_m6` | 1.5000 | 2.1137 | +0.6137 | +0.0009 | n.s. |
+| `exp2_flower_n4_m2` | 2.0000 | 1.4952 | −0.5048 | +0.0006 | n.s. |
+
+CE reached 0.893 against H∞ = 0.8879, i.e. converged to within 0.005 bits, and
+every ΔCE is ~0.001–0.002 bits with fold-to-fold sem of the same size.
+
+**This is a null result, and §1.1 predicts exactly that.** ΔCE is a difference
+of *residuals*: once both arms converge to H∞ the residuals both vanish and
+ΔCE → 0 no matter what C⁻ − C⁺ is. At `d_model=32` on a 3-token HMM there is
+ample capacity, so the asymmetry is fully absorbed.
+
+**It is therefore ambiguous, and cannot be written up as "no causal
+asymmetry".** Disambiguating it is precisely what the `d_model` sweep (plan
+Phase 4.5) is for: ΔCE should grow as capacity shrinks, and that curve is a far
+stronger result than any single point. **That sweep is now the highest-value
+next piece of work** — it is what converts this null into a finding.
+
+Two further observations from the runs:
+
+- **~15% of folds fail to escape a bad local optimum** at the sanity_check
+  hyperparameters (lr 5e-3, 60 epochs, d_model 64) — most folds land within
+  0.01 bits of H∞ while one in six sits 0.4–0.7 bits above. One such fold
+  dominates a 5-fold mean, which is why `paired_delta_ce` now reports the
+  converged-fold statistic separately (all folds gave +0.2229 ± 0.1432 on the
+  coin arm; converged folds gave +0.0004 ± 0.0012). QUICK's hyperparameters
+  did not show this. Worth a look before the seed-repeat harness is built.
+- The `results.pkl` for every run keeps the per-fold CE for both arms, so any
+  other convergence filter can be applied without re-running.
 
 **What to look for, in priority order:**
 
