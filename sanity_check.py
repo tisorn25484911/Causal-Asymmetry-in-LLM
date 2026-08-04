@@ -55,6 +55,7 @@ from Model_analysis import (
     statistical_complexity,
     statistical_complexity_empirical,
     savefig,
+    slim_results,
 )
 from Training_model import (
     _loader,
@@ -119,7 +120,8 @@ def mkdir(path):
 def save_pkl(obj, path):
     with open(path, "wb") as f:
         pickle.dump(obj, f, protocol=4)
-    print(f"  pickle -> {path}")
+    mb = os.path.getsize(path) / 1024**2
+    print(f"  pickle -> {path}  ({mb:.1f} MB)")
 
 
 def save_weights(model, path):
@@ -495,7 +497,7 @@ def exp_coin(cfg, out_root):
     res = dict(tag=tag, p=p, q=q, h_inf=h_inf,
                cv_fw=cv_fw, cv_bw=cv_bw, ana_fw=ana_fw, ana_bw=ana_bw,
                asymmetry=asym)
-    save_pkl(res, os.path.join(odir, "results.pkl"))
+    save_pkl(slim_results(res), os.path.join(odir, "results.pkl"))
     print(f"\n  Exp A done in {(time.time()-t0)/60:.1f} min")
     return res
 
@@ -600,7 +602,7 @@ def exp_flower(cfg, out_root):
     res = dict(tag=tag, n=n, m=m, h_inf=h_inf_flower,
                cv_fw=cv_fw, cv_bw=cv_bw, ana_fw=ana_fw, ana_bw=ana_bw,
                asymmetry=asym, dice_probs=dice_probs)
-    save_pkl(res, os.path.join(odir, "results.pkl"))
+    save_pkl(slim_results(res), os.path.join(odir, "results.pkl"))
     print(f"\n  Exp B done in {(time.time()-t0)/60:.1f} min")
     return res
 

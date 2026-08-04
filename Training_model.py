@@ -236,6 +236,13 @@ def train_model(
         devices="auto",
         log_every_n_steps=5,
         callbacks=[recorder],
+        # Nothing in this repo ever reads lightning_logs/version_N/*.ckpt --
+        # the weights that get used are written by save_weights(), and every
+        # curve that gets plotted comes off `recorder`.  Left on, one
+        # Main_call.py run drops ~230 checkpoint dirs on disk for nothing.
+        # See IMPROVEMENT_PLAN.md D5.
+        logger=False,
+        enable_checkpointing=False,
     )
     trainer.fit(model, train_loader)
 

@@ -85,6 +85,7 @@ from Flower_process_generation import FlowerDataset          # FIX-5
 from Model_analysis import (
     mkdir,
     save_pkl,
+    slim_results,
     _sub,
     savefig,
     save_weights,
@@ -464,10 +465,10 @@ def experiment_1(cfg, out_root, all_results):
     print(f"\n  Exp 1 done in {(time.time()-t0)/60:.1f} min")
     res = dict(tag=tag, p=p, q=q, theory=theory,
                cv_fw=cv_fw, cv_bw=cv_bw, ana_fw=ana_fw, ana_bw=ana_bw)
-    save_pkl(res, os.path.join(odir, "results.pkl"))
+    save_pkl(slim_results(res), os.path.join(odir, "results.pkl"))
     save_weights(cv_fw["best_model"], os.path.join(out_root, "models", f"{tag}_fw.pt"))
     save_weights(cv_bw["best_model"], os.path.join(out_root, "models", f"{tag}_bw.pt"))
-    all_results[tag] = res
+    all_results[tag] = slim_results(res)   # keep only metrics; frees models+latents
     cleanup()
 
 
@@ -585,10 +586,10 @@ def experiment_1_2(cfg, out_root, all_results):
                cv_fw=cv_fw, cv_bw=cv_bw, ana_fw=ana_fw, ana_bw=ana_bw,
                Ss_emp=Ss_emp, Ppl_emp=Ppl_emp, p_emp=p_emp, q_emp=q_emp,
                Ss_th_fw=Ss_th_fw, Ss_th_bw=Ss_th_bw, p_th=p_th, q_th=q_th)
-    save_pkl(res, os.path.join(odir, "results.pkl"))
+    save_pkl(slim_results(res), os.path.join(odir, "results.pkl"))
     save_weights(cv_fw["best_model"], os.path.join(out_root, "models", f"{tag}_fw.pt"))
     save_weights(cv_bw["best_model"], os.path.join(out_root, "models", f"{tag}_bw.pt"))
-    all_results[tag] = res
+    all_results[tag] = slim_results(res)   # keep only metrics; frees models+latents
     cleanup()
 
 
@@ -679,10 +680,10 @@ def experiment_2(cfg, out_root, all_results):
     print(f"\n  Exp 2 done in {(time.time()-t0)/60:.1f} min")
     res = dict(tag=tag, n=n, m=m, dice_probs=dice_probs,
                cv_fw=cv_fw, cv_bw=cv_bw, ana_fw=ana_fw, ana_bw=ana_bw)
-    save_pkl(res, os.path.join(odir, "results.pkl"))
+    save_pkl(slim_results(res), os.path.join(odir, "results.pkl"))
     save_weights(cv_fw["best_model"], os.path.join(out_root, "models", f"{tag}_fw.pt"))
     save_weights(cv_bw["best_model"], os.path.join(out_root, "models", f"{tag}_bw.pt"))
-    all_results[tag] = res
+    all_results[tag] = slim_results(res)   # keep only metrics; frees models+latents
     cleanup()
 
 
@@ -700,7 +701,7 @@ def main():
     experiment_1_2(CFG, OUT_ROOT, all_results)
     experiment_2  (CFG, OUT_ROOT, all_results)
 
-    save_pkl(all_results, os.path.join(OUT_ROOT, "all_results.pkl"))
+    save_pkl(all_results, os.path.join(OUT_ROOT, "all_results.pkl"))  # already slim
 
     total = (time.time() - t_start) / 60
     print(f"\n{'='*70}\n  ALL COMPLETE — {total:.1f} min")

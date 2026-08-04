@@ -54,7 +54,63 @@ def mkdir(path: str) -> str:
 def save_pkl(obj, path: str):
     with open(path, "wb") as f:
         pickle.dump(obj, f, protocol=4)
-    print(f"  pickle saved -> {path}")
+    mb = os.path.getsize(path) / 1024**2
+    print(f"  pickle saved -> {path}  ({mb:.1f} MB)")
+
+
+# ── Result-bundle slimming ─────────────────────────────────────────────────
+# A raw `res` bundle pickles to ~700 MB, split almost evenly between:
+#   * the five fold models and their recorders (~100 MB per direction) --
+#     and most of that is not weights but stale `last_attention` /
+#     `last_encodings` activation buffers still hanging off each module;
+#   * the raw latents, which are stored *twice*, once as `latents`
+#     (N, T, d_model) and again as the flattened view of the same array.
+# Neither is worth keeping: the best-fold weights are already written to
+# results/models/*.pt by save_weights, and latents are cheap to re-extract
+# from those weights.  See IMPROVEMENT_PLAN.md Phase 0.3.
+_DROP_KEYS      = ("latents", "flat_lat", "flat_inp", "inputs_arr")
+_RECORDER_SERIES = ("step_loss", "step_ppl", "step_val_loss",
+                    "step_val_ppl", "epoch_loss", "val_loss")
+
+
+def _recorder_curves(rec):
+    """Lift the plottable series off a Record_training, leaving its model behind."""
+    if rec is None:
+        return None
+    return {name: list(getattr(rec, name, None) or []) for name in _RECORDER_SERIES}
+
+
+def slim_results(obj):
+    """
+    Return a copy of a result bundle with the heavy objects stripped out.
+
+    Kept: every scalar and per-fold metric, the per-step train/val curves
+    lifted off the recorders (as `best_curves` / `fold_curves`), the UMAP
+    coordinates (expensive to recompute) and the complexity numbers.
+    Dropped: fold models, recorder objects, and raw latent arrays.
+
+    Recurses through dicts and lists, so it works equally on a single
+    experiment's `res` and on the combined `all_results` map.
+    """
+    if isinstance(obj, dict):
+        out = {}
+        for k, v in obj.items():
+            if k in _DROP_KEYS or k == "best_model":
+                continue
+            if k == "all_recorders":
+                out["fold_curves"] = [_recorder_curves(r) for r in (v or [])]
+            elif k == "best_recorder":
+                out["best_curves"] = _recorder_curves(v)
+            else:
+                out[k] = slim_results(v)
+        return out
+    if isinstance(obj, list):
+        return [slim_results(v) for v in obj]
+    if isinstance(obj, tuple):
+        return tuple(slim_results(v) for v in obj)
+    return obj
+
+
 def _sub(arr: np.ndarray, n: int = 1000) -> tuple:
     """Return (latent_subset, index_array) — first n rows, no shuffle."""
     n = min(n, len(arr))
