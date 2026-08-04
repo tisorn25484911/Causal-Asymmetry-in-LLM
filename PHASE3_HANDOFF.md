@@ -5,8 +5,9 @@ Branch: `phase0-unblock` (6 new commits on top of Phase 1/2, **not pushed**)
 Follows: `IMPROVEMENT_PLAN.md` §7 Phase 3, plus C6 from Tier C
 Previous: `PHASE1_2_HANDOFF.md`, `PHASE0_HANDOFF.md`
 
-**Status: C6 and all of Phase 3 complete, 52 tests passing.** SANITY re-run and
-QUICK re-run are complete on this code; LARGE is running.
+**Status: C6 and all of Phase 3 complete, 52 tests passing.** SANITY and QUICK
+are complete on this code; LARGE is running and its cross-validation results
+are dominated by training divergence — see §7.
 
 ---
 
@@ -275,7 +276,37 @@ for i,fc in enumerate(r['cv_fw']['fold_curves']):
 |---|---|---|---|
 | QUICK | `python run_experiments.py --config QUICK` | `run_quick.log` | complete, 8:44 |
 | SANITY | `python sanity_check.py` | `run_sanity.log` | complete, 6:54 (was 12.7 min) |
-| LARGE | `python run_experiments.py --config LARGE` | `run_large.log` | running, ~10 h |
+| LARGE | `python run_experiments.py --config LARGE` | `run_large.log` | running, ~9 h remaining |
+
+### LARGE — divergence is near-universal at 80 epochs
+
+**exp1 completed in 17.6 min** (was 69.3 min before D1 — a 3.9x speedup, better
+than the 2.58x measured in isolation). But **all 10 of its folds diverged**
+(5/5 forward, 5/5 backward), against H∞ = 0.9197:
+
+```
+fold 1: CE_FW=1.0063  CE_BW=0.9236  delta=-0.0827
+fold 2: CE_FW=1.2622  CE_BW=0.9430  delta=-0.3192   NOT CONVERGED
+fold 3: CE_FW=1.2780  CE_BW=1.3311  delta=+0.0532   NOT CONVERGED
+fold 4: CE_FW=1.5470  CE_BW=0.9242  delta=-0.6228   NOT CONVERGED
+fold 5: CE_FW=0.9434  CE_BW=1.1713  delta=+0.2279   NOT CONVERGED
+
+all folds      : mean=-0.1487  sem=0.1485
+converged only : mean=-0.0827  sem=nan   (1/5 folds, 4 dropped)
+```
+
+So at 80 epochs the rate is worse than the 4/6 measured at sanity_check's 60
+epochs — longer training means more opportunity for the logit gap to grow until
+a step overshoots.
+
+**LARGE's paired ΔCE is therefore not a measurement.** The surviving −0.0827 is
+one fold's optimisation luck. Decision taken (again) to let the run finish
+rather than change training: the weights, their sidecars, the figures and the
+pq heatmaps are all still produced and usable, and the pq sweep does not use
+cross-validation at all so it is unaffected.
+
+**QUICK remains the only run where all five folds converge, and is the one to
+report.**
 
 ### SANITY, on this code
 
