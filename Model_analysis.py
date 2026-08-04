@@ -524,6 +524,93 @@ def statistical_complexity(p, q, mode):
     for prob in state_prob:
         S += - prob * np.log2(prob + 1e-12)
     return S
+def _entropy_bits(probs) -> float:
+    """Shannon entropy in bits, ignoring zero-probability atoms."""
+    p = np.asarray(probs, dtype=float)
+    p = p[p > 0]
+    return float(-(p * np.log2(p)).sum())
+
+
+def flower_complexity(n: int, m: int, dice_probs) -> tuple[float, float]:
+    """
+    Closed-form (C+, C-) for the n-m flower process — IMPROVEMENT_PLAN.md A1.
+
+    The process alternates: die i ~ Uniform{0..n-1} emitted as token i, then
+    outcome j ~ dice_probs[i] emitted as token n+j.
+
+    FORWARD causal states: one "a roll just happened" state (the next token is
+    a uniform die selection, independent of everything before) plus one state
+    per die i (the next token is dice_probs[i]).  Their probabilities are 1/2
+    and 1/2 * 1/n each, so
+
+        C+ = 1 + (1/2) * log2(n)
+
+    BACKWARD causal states: one "the current token is a selection" state (the
+    previous token is a roll drawn from the marginal outcome distribution,
+    independent of which die) plus one state per *distinguishable* outcome.
+
+    The word distinguishable is what the repo's old m+1 formula missed.  Two
+    outcomes j and j' are the same backward state exactly when they induce the
+    same posterior P(die = i | outcome = j) ~ dice_probs[i,j]/n over dice --
+    i.e. when columns j and j' of dice_probs are proportional.  Merging those,
+
+        C- = 1 + (1/2) * H(pi_merged),   pi_j = (1/n) * sum_i dice_probs[i,j]
+
+    Two consequences the repo was getting wrong:
+
+      * n=1 degenerates.  With a single die P(die|outcome)=1 for every j, so
+        ALL m outcomes collapse to one state and C- = 1 = C+.  The n=1,m=2
+        sanity-check process 0,X,0,X,... with X iid uniform{1,2} is exactly
+        time-reversible; it is a null control, not a positive one.
+      * C- <= 1 + (1/2)log2(m), so C- > C+ requires m > n.  Every flower config
+        originally in the repo had n > m, i.e. tested the negation of the
+        hypothesis.
+
+    Verified against IMPROVEMENT_PLAN.md section 4: (1,2)->(1.0000, 1.0000),
+    (4,2)->(2.0000, 1.4952), (6,4)->(2.2925, 1.9899).
+    """
+    dp = np.asarray(dice_probs, dtype=float)
+    if dp.shape != (n, m):
+        raise ValueError(f"dice_probs must have shape ({n}, {m}), got {dp.shape}")
+    if not np.allclose(dp.sum(axis=1), 1.0):
+        raise ValueError(f"dice_probs rows must sum to 1, got {dp.sum(axis=1)}")
+
+    C_plus = 1.0 + 0.5 * np.log2(n)
+
+    pi_outcome = dp.mean(axis=0)                       # (1/n) sum_i dp[i, j]
+    col_mass   = dp.sum(axis=0)
+    merged: dict[tuple, float] = {}
+    for j in range(m):
+        if col_mass[j] <= 0:                           # outcome never occurs
+            continue
+        posterior = np.round(dp[:, j] / col_mass[j], 9)   # P(die | outcome j)
+        key = tuple(posterior)
+        merged[key] = merged.get(key, 0.0) + pi_outcome[j]
+
+    C_minus = 1.0 + 0.5 * _entropy_bits(list(merged.values()))
+    return float(C_plus), float(C_minus)
+
+
+def flower_entropy_rate(n: int, m: int, dice_probs) -> float:
+    """
+    Entropy rate H_inf (bits/token) of the n-m flower process.
+
+    Half the tokens are die selections, uniform over n, contributing log2(n)
+    bits each; the other half are rolls of a uniformly chosen die,
+    contributing the mean of H(dice_probs[i]).  So
+
+        H_inf = (1/2) log2(n) + (1/2) * mean_i H(dice_probs[i])
+
+    Time-reversal invariance means the same value applies to both directions,
+    which is why the runners pass one `theory` to both arms.  Gives flower runs
+    a real H_inf reference line instead of nan.  Check: n=1, m=2, fair die ->
+    0 + 0.5*1 = 0.5, matching the value sanity_check.py had hard-coded.
+    """
+    dp = np.asarray(dice_probs, dtype=float)
+    return float(0.5 * np.log2(n)
+                 + 0.5 * np.mean([_entropy_bits(dp[i]) for i in range(n)]))
+
+
 def statistical_complexity_empirical(model, data_loader, max_batches=None, use_t="last", k=2):
     model.eval()
     latents_all = []

@@ -1,36 +1,56 @@
 """
 sanity_check.py
 ===============
-Sanity check: verify that the coin HMM p=q=0.5 and the flower process n=1, m=2
-produce structurally consistent causal asymmetry results.
+Two contrasting controls for the causal-asymmetry experiment:
 
-Why these two processes?
-------------------------
-Coin p=q=0.5
-  - Fully symmetric transition probabilities, so H∞ = 1 bit exactly.
-  - C+ = 1 bit (2 states, equal probability).
-  - C- = 1.5 bits (3 backward causal states: the process is still causally
-    asymmetric even at p=q because the backward causal states are not equally
-    probable). delta_CE > 0 is still expected but smaller than for p≠q.
+  * a POSITIVE control (coin p=q=0.5) where C- > C+ and delta_CE > 0 is
+    predicted, and
+  * a NULL control (flower n=1, m=2) where C- = C+ exactly and delta_CE ~ 0
+    is predicted.
 
-Flower n=1, m=2 with dice_probs = [0.5, 0.5]
-  - 1 die (token 0 is always selected, deterministic), 2 equally likely outcomes
-    (tokens 1 and 2).
-  - Sequence structure: 0, X, 0, X, 0, X ... where X ∈ {1,2} with P=0.5 each.
-  - Forward causal states = n+1 = 2.
-  - Backward causal states = m+1 = 3 (token 1 and 2 both deterministically
-    precede token 0, while token 0 has uncertain history).
-  - This produces the same causal state count asymmetry (2 vs 3) as the coin.
+A result is only interpretable if both come out right.  A method that reports
+delta_CE > 0 on the null is measuring an artefact of the architecture, not
+causal asymmetry.
+
+Coin p=q=0.5  — POSITIVE control
+  - Symmetric transition probabilities, so H∞ = 1 bit exactly.
+  - C+ = 1 bit    (2 forward causal states, equally probable).
+  - C- = 1.5 bits (3 backward causal states, unequally probable).
+  - The coin is asymmetric for EVERY (p,q): the three backward states refine
+    the two forward states (token 1 == state 1; tokens 0 and 2 split state 0
+    by the previous state), so C- - C+ = P(state 0)*H(split) >= 0 identically.
+  - Predicted: both arms converge to H∞ = 1.0; delta_CE > 0.
+
+Flower n=1, m=2 with dice_probs = [[0.5, 0.5]]  — NULL control
+  - 1 die, so token 0 is always the selection; 2 equally likely outcomes
+    (tokens 1 and 2).  Sequence: 0, X, 0, X, ... with X ~ Uniform{1,2}.
+  - C+ = 1 + (1/2)log2(n) = 1.0 bit.
+  - C- = 1.0 bit as well, NOT 1.5.  This is the correction in
+    IMPROVEMENT_PLAN.md A1.  Backward causal states are one per
+    *distinguishable* outcome, where outcomes are distinguished by the
+    posterior P(die | outcome).  With a single die that posterior is 1 for
+    every outcome, so tokens 1 and 2 are indistinguishable looking backward
+    and collapse into ONE state -- giving 2 backward states, not 3.
+  - The old docstring here stated the refuting fact while drawing the opposite
+    conclusion: "token 1 and 2 both deterministically precede token 0" is
+    precisely why they cannot be told apart in reverse, and why the m+1 count
+    fails at n=1.
+  - The process 0,X,0,X,... reads identically backwards: it is exactly
+    time-reversible.  Predicted: |delta_CE| ~ 0.
+
+  This arm was previously labelled a positive case and its correct answer
+  (delta_CE ~ 0) was printed as "FAIL".  It is now scored as a null.
 
 Sanity checks
-  1. Both models (FW and BW) converge to H∞ — their CE loss approaches the
-     entropy rate of the respective process from above.
-  2. delta_CE = CE_BW - CE_FW > 0 in both cases (BW harder).
-  3. Empirical C+ ≈ theoretical C+ for the coin (2 clusters).
-  4. The flower FW model needs 2 latent clusters and BW needs 3 — matching
-     forward and backward causal state counts n+1=2 and m+1=3.
-  5. Both processes produce consistent UMAP structure: forward model latents
-     separate into 2 clusters regardless of input token label.
+  1. Both models converge to H∞ from above (H∞ is time-reversal invariant, so
+     the same H∞ applies to both arms of each process).
+  2. Coin:   delta_CE > 0                  (C- > C+, BW harder)
+     Flower: |delta_CE| < NULL_TOL         (C- = C+, no asymmetry)
+  3. Empirical C+ ~ theoretical C+ for the coin (2 clusters).
+  4. Flower clusters at k=2 for BOTH directions, since C+ and C- both
+     correspond to 2 causal states.  Forcing k=m+1=3 on a 2-state latent, as
+     this file used to, inflates the empirical C- by construction and then
+     "confirms" the 3 states it assumed.
 """
 
 import gc
@@ -49,7 +69,10 @@ from Data_generation import CoinDataset, coin_generation, flower_process_generat
 from Flower_process_generation import FlowerDataset
 from Model_analysis import (
     FW_BW_attention_comparison,
+    flower_complexity,
+    flower_entropy_rate,
     latent_extraction,
+    paired_delta_ce,
     plot_attention_heatmap,
     perplexity_calculation,
     statistical_complexity,
@@ -60,6 +83,7 @@ from Model_analysis import (
 from Training_model import (
     _loader,
     make_chunked_loader,
+    set_seed,
     train_test_val_pipeline,
 )
 
@@ -78,6 +102,7 @@ except Exception as _e:
 # CONFIG
 # =============================================================================
 CFG = dict(
+    seed           = 0,
     d_model        = 64,
     embed_type     = "onehot",
     n_folds        = 5,
@@ -88,7 +113,7 @@ CFG = dict(
     umap_n_pts     = 500,
     max_batches    = 20,
 
-    # Coin p=q=0.5
+    # Coin p=q=0.5  — POSITIVE control: C+=1.0, C-=1.5, predict delta_CE > 0
     coin_p         = 0.5,
     coin_q         = 0.5,
     coin_num_samples = 500,
@@ -96,15 +121,28 @@ CFG = dict(
     coin_max_epochs = 60,
     coin_batch     = 32,
     coin_num_token = 3,
+    coin_k_fw      = 2,      # 2 forward causal states
+    coin_k_bw      = 3,      # 3 backward causal states
 
-    # Flower n=1, m=2  (equal dice probs → max symmetry within this structure)
+    # Flower n=1, m=2 (fair die) — NULL control: C+ = C- = 1.0, predict ~0.
+    # See IMPROVEMENT_PLAN.md A1: with a single die every outcome induces the
+    # same posterior over dice, so the m outcomes collapse to ONE backward
+    # causal state and the process is exactly time-reversible.
     flower_n       = 1,
     flower_m       = 2,
     flower_num_samples = 500,
     flower_seq_len = 500,   # 500 cycles × 2 obs = 1000 tokens per sequence
     flower_max_epochs = 60,
     flower_batch   = 32,
+    flower_k_fw    = 2,      # 2 forward causal states
+    flower_k_bw    = 2,      # 2 backward causal states, NOT m+1=3
 )
+
+# Tolerance for the null control.  delta_CE is a difference of *residuals*
+# (IMPROVEMENT_PLAN.md 1.1), so a finite-capacity, finite-epoch model will not
+# hit exactly 0 even on a time-reversible process; this is the band inside
+# which the null is considered upheld.
+NULL_TOL = 0.02
 
 OUT_ROOT = "sanity_check_flower_process"
 
@@ -418,7 +456,7 @@ def compare_fw_bw(tag, cv_fw, cv_bw, ana_fw, ana_bw,
 # =============================================================================
 def exp_coin(cfg, out_root):
     """
-    Symmetric coin (p=q=0.5).
+    POSITIVE control — symmetric coin (p=q=0.5).
     H∞ = 1.0 bit exactly.
     C+ = 1.0 bit (2 forward causal states, both equally probable).
     C- = 1.5 bits (3 backward causal states with unequal probabilities).
@@ -445,7 +483,7 @@ def exp_coin(cfg, out_root):
         seq_len=cfg["coin_seq_len"], p=p, q=q)
     ds           = CoinDataset(data, seq_len=cfg["coin_seq_len"])
     loader_train = make_chunked_loader(ds, cfg["train_chunk_len"],
-                                       cfg["coin_batch"])
+                                       cfg["coin_batch"], seed=cfg["seed"])
     loader_ana   = _loader(ds, cfg["coin_batch"])
     sample_seq   = next(iter(loader_ana))[0][0]
     num_token    = cfg["coin_num_token"]
@@ -458,7 +496,7 @@ def exp_coin(cfg, out_root):
         embed_type=cfg["embed_type"], num_token=num_token,
         d_model=cfg["d_model"], max_len=max_len,
         max_epochs=cfg["coin_max_epochs"], lr=cfg["lr"], mode="forward",
-        save_plot=os.path.join(odir, f"{tag}_fw_cv.png"),
+        save_plot=os.path.join(odir, f"{tag}_fw_cv.png"), seed=cfg["seed"],
     ); cleanup()
 
     # Backward model
@@ -468,7 +506,7 @@ def exp_coin(cfg, out_root):
         embed_type=cfg["embed_type"], num_token=num_token,
         d_model=cfg["d_model"], max_len=max_len,
         max_epochs=cfg["coin_max_epochs"], lr=cfg["lr"], mode="backward",
-        save_plot=os.path.join(odir, f"{tag}_bw_cv.png"),
+        save_plot=os.path.join(odir, f"{tag}_bw_cv.png"), seed=cfg["seed"],
     ); cleanup()
 
     # Analyse
@@ -476,11 +514,11 @@ def exp_coin(cfg, out_root):
     ana_fw = analyse_model(
         f"{tag}_fw", cv_fw["best_model"], loader_ana, num_token, odir,
         sample_seq, p=p, q=q, mode="forward",
-        k=2, use_t="last", cfg=cfg); cleanup()
+        k=cfg["coin_k_fw"], use_t="last", cfg=cfg); cleanup()
     ana_bw = analyse_model(
         f"{tag}_bw", cv_bw["best_model"], loader_ana, num_token, odir,
         sample_seq, p=p, q=q, mode="backward",
-        k=3, use_t="first", cfg=cfg); cleanup()
+        k=cfg["coin_k_bw"], use_t="first", cfg=cfg); cleanup()
 
     # Compare
     print("\n  -- Comparison --")
@@ -488,6 +526,7 @@ def exp_coin(cfg, out_root):
         tag, cv_fw, cv_bw, ana_fw, ana_bw,
         loader_ana, num_token, odir, h_inf,
         sample_seq=sample_seq, p=p, q=q, cfg=cfg)
+    paired = paired_delta_ce(cv_fw, cv_bw, label=tag)
 
     # Save
     save_weights(cv_fw["best_model"],
@@ -496,7 +535,10 @@ def exp_coin(cfg, out_root):
                  os.path.join(out_root, "models", f"{tag}_bw.pt"))
     res = dict(tag=tag, p=p, q=q, h_inf=h_inf,
                cv_fw=cv_fw, cv_bw=cv_bw, ana_fw=ana_fw, ana_bw=ana_bw,
-               asymmetry=asym)
+               asymmetry=asym, paired=paired,
+               role="positive",
+               C_plus=statistical_complexity(p, q, "forward"),
+               C_minus=statistical_complexity(p, q, "backward"))
     save_pkl(slim_results(res), os.path.join(odir, "results.pkl"))
     print(f"\n  Exp A done in {(time.time()-t0)/60:.1f} min")
     return res
@@ -507,15 +549,24 @@ def exp_coin(cfg, out_root):
 # =============================================================================
 def exp_flower(cfg, out_root):
     """
-    Flower n=1, m=2 with dice_probs = [[0.5, 0.5]].
+    NULL CONTROL — flower n=1, m=2 with dice_probs = [[0.5, 0.5]].
+
     Sequence: 0, X, 0, X, ... where X ∈ {token 1, token 2} with P=0.5 each.
-    Token 0 is always selected (n=1, only one die).
+    Token 0 is always the die selection (n=1, only one die).
 
-    Forward causal states = n+1 = 2  (same count as coin p=q=0.5)
-    Backward causal states = m+1 = 3 (same count as coin p=q=0.5)
+    C+ = 1 + (1/2)log2(n) = 1.0 bit  (2 forward causal states)
+    C- = 1.0 bit                     (2 backward causal states)
 
-    Sanity check: both forward and backward models should converge to H∞
-    of the flower process. delta_CE > 0 expected (BW harder, C- > C+).
+    Both directions have TWO causal states, not 2 vs 3 — see the module
+    docstring and IMPROVEMENT_PLAN.md A1.  With one die every outcome induces
+    the same posterior over dice, so tokens 1 and 2 are indistinguishable
+    backward and merge into a single causal state.  The process is exactly
+    time-reversible.
+
+    Predicted: both arms converge to H∞ = 0.5 bits and |delta_CE| < NULL_TOL.
+    A large positive delta_CE here would mean the pipeline manufactures
+    asymmetry where the process has none — which is exactly what this control
+    exists to detect.
     """
     n, m    = cfg["flower_n"], cfg["flower_m"]
     tag     = f"flower_n{n}_m{m}_eq"
@@ -526,20 +577,20 @@ def exp_flower(cfg, out_root):
     # Equal probability dice → max symmetry within this structure
     dice_probs = np.array([[0.5, 0.5]], dtype=float)   # shape (1, 2)
 
-    # H∞ of this flower process (empirical estimate)
-    # Token 0 always follows tokens 1,2 (entropy 0)
-    # After token 0: P(token 1)=0.5, P(token 2)=0.5 (entropy 1 bit)
-    # π(token 0) = 0.5, π(token 1) = π(token 2) = 0.25
-    # H∞ = π(0)*H(0→?) + π(1)*H(1→?) + π(2)*H(2→?)
-    #     = 0.5 * 1.0   + 0.25 * 0.0  + 0.25 * 0.0  = 0.5 bits
-    h_inf_flower = 0.5
+    # Closed forms rather than the hand-derived constants that used to sit
+    # here (A1).  flower_entropy_rate(1, 2, fair) reproduces the old
+    # hard-coded 0.5 exactly; flower_complexity corrects C- from 1.5 to 1.0.
+    h_inf_flower = flower_entropy_rate(n, m, dice_probs)
+    C_plus, C_minus = flower_complexity(n, m, dice_probs)
+    k_fw, k_bw = cfg["flower_k_fw"], cfg["flower_k_bw"]
 
     print(f"\n{'='*65}")
-    print(f"  EXPERIMENT B — Flower n={n}  m={m}  (equal dice)")
+    print(f"  EXPERIMENT B — Flower n={n}  m={m}  (equal dice)  [NULL CONTROL]")
     print(f"  Vocabulary: token 0 = die selection, tokens 1-{n+m-1} = outcomes")
     print(f"  H∞ (analytic) = {h_inf_flower:.4f} bits")
-    print(f"  Forward causal states  = n+1 = {n+1}")
-    print(f"  Backward causal states = m+1 = {m+1}")
+    print(f"  C+ = {C_plus:.4f} bits  ({k_fw} forward causal states)")
+    print(f"  C- = {C_minus:.4f} bits  ({k_bw} backward causal states)")
+    print(f"  C- - C+ = {C_minus - C_plus:+.4f}  → predicted |delta_CE| < {NULL_TOL}")
     print(f"{'='*65}")
 
     # Data
@@ -550,7 +601,7 @@ def exp_flower(cfg, out_root):
     seq_len_actual = len(data[0])
     ds           = FlowerDataset(data, seq_len=seq_len_actual)
     loader_train = make_chunked_loader(ds, cfg["train_chunk_len"],
-                                       cfg["flower_batch"])
+                                       cfg["flower_batch"], seed=cfg["seed"])
     loader_ana   = _loader(ds, cfg["flower_batch"])
     sample_seq   = next(iter(loader_ana))[0][0]
     max_len      = seq_len_actual
@@ -562,7 +613,7 @@ def exp_flower(cfg, out_root):
         embed_type=cfg["embed_type"], num_token=num_token,
         d_model=cfg["d_model"], max_len=max_len,
         max_epochs=cfg["flower_max_epochs"], lr=cfg["lr"], mode="forward",
-        save_plot=os.path.join(odir, f"{tag}_fw_cv.png"),
+        save_plot=os.path.join(odir, f"{tag}_fw_cv.png"), seed=cfg["seed"],
     ); cleanup()
 
     # Backward model
@@ -572,20 +623,24 @@ def exp_flower(cfg, out_root):
         embed_type=cfg["embed_type"], num_token=num_token,
         d_model=cfg["d_model"], max_len=max_len,
         max_epochs=cfg["flower_max_epochs"], lr=cfg["lr"], mode="backward",
-        save_plot=os.path.join(odir, f"{tag}_bw_cv.png"),
+        save_plot=os.path.join(odir, f"{tag}_bw_cv.png"), seed=cfg["seed"],
     ); cleanup()
 
     # Analyse
+    # k=2 for BOTH directions: C+ and C- both correspond to 2 causal states
+    # here (A1).  This used to force k=m+1=3 on the backward arm, which
+    # inflates the empirical C- by construction — S = H(cluster occupancy) is
+    # bounded by log2(k), so handing the backward arm a larger k guarantees
+    # part of the "C- > C+" gap regardless of what the latents contain.
     print("\n  -- Analysis --")
-    # n+1=2 forward causal states, m+1=3 backward
     ana_fw = analyse_model(
         f"{tag}_fw", cv_fw["best_model"], loader_ana, num_token, odir,
         sample_seq, mode="forward",
-        k=n+1, use_t="last", cfg=cfg); cleanup()
+        k=k_fw, use_t="last", cfg=cfg); cleanup()
     ana_bw = analyse_model(
         f"{tag}_bw", cv_bw["best_model"], loader_ana, num_token, odir,
         sample_seq, mode="backward",
-        k=m+1, use_t="first", cfg=cfg); cleanup()
+        k=k_bw, use_t="first", cfg=cfg); cleanup()
 
     # Compare
     print("\n  -- Comparison --")
@@ -593,6 +648,7 @@ def exp_flower(cfg, out_root):
         tag, cv_fw, cv_bw, ana_fw, ana_bw,
         loader_ana, num_token, odir, h_inf_flower,
         sample_seq=sample_seq, cfg=cfg)
+    paired = paired_delta_ce(cv_fw, cv_bw, label=tag)
 
     # Save
     save_weights(cv_fw["best_model"],
@@ -601,7 +657,8 @@ def exp_flower(cfg, out_root):
                  os.path.join(out_root, "models", f"{tag}_bw.pt"))
     res = dict(tag=tag, n=n, m=m, h_inf=h_inf_flower,
                cv_fw=cv_fw, cv_bw=cv_bw, ana_fw=ana_fw, ana_bw=ana_bw,
-               asymmetry=asym, dice_probs=dice_probs)
+               asymmetry=asym, paired=paired, dice_probs=dice_probs,
+               role="null", C_plus=C_plus, C_minus=C_minus)
     save_pkl(slim_results(res), os.path.join(odir, "results.pkl"))
     print(f"\n  Exp B done in {(time.time()-t0)/60:.1f} min")
     return res
@@ -612,10 +669,10 @@ def exp_flower(cfg, out_root):
 # =============================================================================
 def plot_cross_comparison(res_coin, res_flower, out_root):
     """
-    Side-by-side summary comparing both experiments.
+    Side-by-side summary comparing the positive and null controls.
     Sanity checks visualised:
       - Both models converge toward their respective H∞
-      - delta_CE > 0 in both cases
+      - delta_CE > 0 for the coin (C- > C+) and ~0 for the flower (C- = C+)
       - Forward complexity matches theory (2 states)
     """
     fig, axes = plt.subplots(1, 3, figsize=(16, 5))
@@ -633,9 +690,9 @@ def plot_cross_comparison(res_coin, res_flower, out_root):
     w  = 0.3
     coin_ces   = [ac["ce_fw"],   ac["ce_bw"]]
     flower_ces = [af["ce_fw"],   af["ce_bw"]]
-    b1 = ax.bar(x - w/2, coin_ces,   w, label="Coin p=q=0.5",
+    b1 = ax.bar(x - w/2, coin_ces,   w, label="Coin p=q=0.5 (positive)",
                 color=colors, alpha=0.85, edgecolor="k")
-    b2 = ax.bar(x + w/2, flower_ces, w, label="Flower n=1 m=2",
+    b2 = ax.bar(x + w/2, flower_ces, w, label="Flower n=1 m=2 (null)",
                 color=colors, alpha=0.45, edgecolor="k", hatch="//")
     ax.bar_label(b1, fmt="%.4f", padding=2, fontsize=8)
     ax.bar_label(b2, fmt="%.4f", padding=2, fontsize=8)
@@ -648,18 +705,23 @@ def plot_cross_comparison(res_coin, res_flower, out_root):
     ax.set_title("CE loss: coin vs flower", fontweight="bold")
     ax.legend(fontsize=7); ax.grid(True, alpha=0.3, axis="y")
 
-    # Panel 2: delta CE comparison
+    # Panel 2: delta CE — each control against its own prediction
     ax = axes[1]
     deltas = [ac["delta"], af["delta"]]
-    names  = ["Coin\np=q=0.5", "Flower\nn=1, m=2"]
-    bar_c  = ["#4c72b0" if d > 0 else "#c44e52" for d in deltas]
+    names  = ["Coin\np=q=0.5\n(C- > C+)", "Flower\nn=1, m=2\n(C- = C+)"]
+    passed = [deltas[0] > 0, abs(deltas[1]) < NULL_TOL]
+    bar_c  = ["#4c72b0" if ok else "#c44e52" for ok in passed]
     bars   = ax.bar(names, deltas, color=bar_c, alpha=0.85, edgecolor="k")
     ax.bar_label(bars, fmt="%+.4f", padding=3, fontsize=10)
     ax.axhline(0, color="k", ls="--", lw=0.8)
+    # Null band: the flower arm passes by landing inside this, not above it.
+    ax.axhspan(-NULL_TOL, NULL_TOL, color="grey", alpha=0.18, zorder=0,
+               label=f"null band ±{NULL_TOL}")
     ax.set_ylabel("delta CE = CE_BW - CE_FW (bits)")
-    ax.set_title("Causal asymmetry signal\n(positive = BW harder, theory predicts > 0)",
+    ax.set_title("Causal asymmetry signal\n"
+                 "coin: predicted > 0   |   flower: predicted ≈ 0",
                  fontweight="bold")
-    ax.grid(True, alpha=0.3, axis="y")
+    ax.legend(fontsize=8); ax.grid(True, alpha=0.3, axis="y")
 
     # Panel 3: empirical complexity
     ax = axes[2]
@@ -669,9 +731,10 @@ def plot_cross_comparison(res_coin, res_flower, out_root):
     S_fl_bw    = res_flower["ana_bw"].get("S_emp", 0)
     x = np.arange(2)
     ax.bar(x - w/2, [S_coin_fw,  S_coin_bw],  w,
-           label="Coin p=q=0.5", color=colors, alpha=0.85, edgecolor="k")
+           label="Coin p=q=0.5 (positive)", color=colors, alpha=0.85,
+           edgecolor="k")
     ax.bar(x + w/2, [S_fl_fw,    S_fl_bw],    w,
-           label="Flower n=1 m=2", color=colors, alpha=0.45,
+           label="Flower n=1 m=2 (null)", color=colors, alpha=0.45,
            edgecolor="k", hatch="//")
     if res_coin["ana_fw"].get("S_theory") is not None:
         ax.axhline(res_coin["ana_fw"]["S_theory"], color="#4c72b0",
@@ -683,12 +746,13 @@ def plot_cross_comparison(res_coin, res_flower, out_root):
                    label=f"C- theory = {res_coin['ana_bw']['S_theory']:.4f}")
     ax.set_xticks(x); ax.set_xticklabels(["Forward (C+)", "Backward (C-)"])
     ax.set_ylabel("Empirical statistical complexity (bits)")
-    ax.set_title("Causal state complexity\n(both processes: C- > C+ expected)",
+    ax.set_title("Causal state complexity\ncoin: C- > C+   |   flower: C- = C+",
                  fontweight="bold")
     ax.legend(fontsize=7); ax.grid(True, alpha=0.3, axis="y")
 
-    fig.suptitle("Sanity Check: Coin p=q=0.5  vs  Flower n=1, m=2\n"
-                 "Both processes have 2 forward and 3 backward causal states",
+    fig.suptitle("Controls: Coin p=q=0.5 (positive)  vs  Flower n=1, m=2 (null)\n"
+                 "Coin has 2 forward / 3 backward causal states; "
+                 "the flower has 2 / 2 and is exactly time-reversible",
                  fontsize=11, fontweight="bold")
     fig.tight_layout()
     savefig(fig, os.path.join(out_root, "cross_comparison.png"))
@@ -700,13 +764,16 @@ def plot_cross_comparison(res_coin, res_flower, out_root):
 # =============================================================================
 def main():
     t_total = time.time()
+    set_seed(CFG["seed"])          # A2: reproducible end to end
     mkdir(OUT_ROOT)
     mkdir(os.path.join(OUT_ROOT, "models"))
 
     print("\n" + "="*65)
-    print("  SANITY CHECK — Coin p=q=0.5  vs  Flower n=1, m=2")
-    print("  Both processes have C+(FW) = 2 states, C-(BW) = 3 states.")
-    print("  Both should show delta_CE > 0 and converge to their H∞.")
+    print("  CONTROLS — Coin p=q=0.5 (positive)  vs  Flower n=1, m=2 (null)")
+    print("  Coin:   C+ = 1.0, C- = 1.5  → predict delta_CE > 0")
+    print(f"  Flower: C+ = 1.0, C- = 1.0  → predict |delta_CE| < {NULL_TOL}")
+    print("  Both should converge to their own H∞ from above.")
+    print(f"  seed = {CFG['seed']}  (forward and backward arms are paired)")
     print("="*65)
 
     # Run Experiment A: coin p=q=0.5
@@ -726,19 +793,41 @@ def main():
     ac = res_coin["asymmetry"]
     af = res_flower["asymmetry"]
     for label, res, asym in [
-        ("Coin p=q=0.5", res_coin,   ac),
-        ("Flower n=1,m=2", res_flower, af),
+        ("Coin p=q=0.5  [POSITIVE control]", res_coin,   ac),
+        ("Flower n=1,m=2  [NULL control]",   res_flower, af),
     ]:
         print(f"\n  {label}")
         print(f"    H∞              = {res['h_inf']:.4f} bits")
+        print(f"    C+ / C-         = {res['C_plus']:.4f} / {res['C_minus']:.4f} bits"
+              f"   (C- - C+ = {res['C_minus'] - res['C_plus']:+.4f})")
         print(f"    CE  FW / BW     = {asym['ce_fw']:.4f} / {asym['ce_bw']:.4f} bits")
-        print(f"    delta_CE        = {asym['delta']:+.4f}  "
-              f"({'BW harder — PASS' if asym['delta'] > 0 else 'FW harder — FAIL'})")
+
+        # Each control is scored against its OWN prediction (A1).  The flower
+        # arm predicts delta_CE ~ 0 because C- = C+; scoring it with the
+        # positive-control criterion "delta > 0 else FAIL", as this used to,
+        # reports the correct answer as a failure.
+        delta = asym["delta"]
+        if res["role"] == "null":
+            verdict = ("PASS — no asymmetry, as predicted"
+                       if abs(delta) < NULL_TOL else
+                       f"FAIL — |delta| >= {NULL_TOL}, asymmetry where the "
+                       "process has none")
+        else:
+            verdict = ("PASS — BW harder, as predicted"
+                       if delta > 0 else
+                       "FAIL — FW harder, opposite of C- > C+")
+        print(f"    delta_CE        = {delta:+.4f}  ({verdict})")
+
+        paired = res.get("paired")
+        if paired:
+            print(f"    paired delta_CE = {paired['mean']:+.4f} ± {paired['sem']:.4f} "
+                  f"(sem over {paired['n']} folds, t={paired['t']:+.2f})")
+
         conv_fw = abs(asym['ce_fw'] - res['h_inf'])
         conv_bw = abs(asym['ce_bw'] - res['h_inf'])
-        print(f"    FW convergence  = CE_FW - H∞ = {conv_fw:.4f}  "
+        print(f"    FW convergence  = |CE_FW - H∞| = {conv_fw:.4f}  "
               f"({'OK' if conv_fw < 0.3 else 'NOT CONVERGED'})")
-        print(f"    BW convergence  = CE_BW - H∞ = {conv_bw:.4f}  "
+        print(f"    BW convergence  = |CE_BW - H∞| = {conv_bw:.4f}  "
               f"({'OK' if conv_bw < 0.5 else 'NOT CONVERGED'})")
     print(f"\n  Total time: {(time.time()-t_total)/60:.1f} min")
     print(f"  Outputs in: {OUT_ROOT}/")
