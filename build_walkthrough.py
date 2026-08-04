@@ -605,17 +605,43 @@ matters: a pipeline reporting ΔCE > 0 on a time-reversible process is measuring
 an artefact.
 
 Before the analysis-length fix, the null reported **ΔCE = −0.4210**. After it,
-**−0.0002**.
+**≈ 0**.
+
+Read the positive control carefully. It returns ΔCE ≈ 0 too, and the honest
+verdict is **inconclusive, not a refutation**: both arms converged to within
+~0.006 bits of H∞, and once that happens the residuals vanish and ΔCE → 0
+whatever C⁻ − C⁺ is. An earlier version of this file scored it with a bare
+sign test and printed "FAIL" for a value of −0.0006 bits.
+
+Note also the divergence count printed below — at these settings most folds
+diverge, so the paired statistics for this file rest on one or two folds.
 """)
 
 code(r"""
-import re
-if os.path.exists("run_sanity.log"):
-    txt = open("run_sanity.log", errors="ignore").read()
-    m = re.search(r"SANITY CHECK SUMMARY.*?(?=\Z|\n\n\n)", txt, re.S)
-    print(m.group(0)[:1800] if m else "summary not found (run still in progress?)")
-else:
-    print("run:  python sanity_check.py")
+# Recomputed from the stored results rather than scraped from the log, so the
+# three-way verdict below is the CURRENT criterion even if the log on disk was
+# written by an earlier run whose criterion was a bare sign test.
+NULL_TOL = 0.02
+for tag, role, hinf in [("coin_p05_q05",   "positive", 1.0),
+                        ("flower_n1_m2_eq", "null",    0.5)]:
+    fp = f"sanity_check_flower_process/{tag}/results.pkl"
+    if not os.path.exists(fp):
+        print(f"{tag}: not present — run sanity_check.py"); continue
+    r = pickle.load(open(fp, "rb"))
+    a = r["asymmetry"]; d = a["delta"]
+    if role == "null":
+        v = "PASS (no asymmetry, as predicted)" if abs(d) < NULL_TOL else "FAIL"
+    elif abs(d) < NULL_TOL:
+        v = "INCONCLUSIVE (~0; capacity may have absorbed it)"
+    else:
+        v = "PASS (BW harder)" if d > 0 else "FAIL (FW harder)"
+    n_div = sum(x["diverged"] for x in r["cv_fw"].get("fold_divergence", [])) \
+          + sum(x["diverged"] for x in r["cv_bw"].get("fold_divergence", []))
+    print(f"{tag}  [{role} control]")
+    print(f"   H_inf = {hinf:.4f}   C+ = {r['C_plus']:.4f}   C- = {r['C_minus']:.4f}")
+    print(f"   CE  FW / BW = {a['ce_fw']:.4f} / {a['ce_bw']:.4f}")
+    print(f"   delta_CE    = {d:+.4f}   -> {v}")
+    print(f"   folds that DIVERGED during training: {n_div} of 10\n")
 """)
 
 md(r"""

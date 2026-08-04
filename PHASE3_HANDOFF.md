@@ -274,8 +274,28 @@ for i,fc in enumerate(r['cv_fw']['fold_curves']):
 | Run | Command | Log | Status |
 |---|---|---|---|
 | QUICK | `python run_experiments.py --config QUICK` | `run_quick.log` | complete, 8:44 |
-| SANITY | `python sanity_check.py` | `run_sanity.log` | re-running on this code |
-| LARGE | `python run_experiments.py --config LARGE` | `run_large.log` | queued behind SANITY, ~10 h |
+| SANITY | `python sanity_check.py` | `run_sanity.log` | complete, 6:54 (was 12.7 min) |
+| LARGE | `python run_experiments.py --config LARGE` | `run_large.log` | running, ~10 h |
+
+### SANITY, on this code
+
+| control | H∞ | CE_FW | CE_BW | ΔCE | verdict | folds diverged |
+|---|---|---|---|---|---|---|
+| Coin p=q=0.5 (positive) | 1.0000 | 1.0059 | 1.0053 | **−0.0006** | **INCONCLUSIVE** | 8/10 |
+| Flower n=1,m=2 (null) | 0.5000 | 0.5007 | 0.5006 | **−0.0001** | **PASS** | 6/10 |
+
+The null control holds: no asymmetry on a time-reversible process.
+
+The positive control returns ≈ 0 as well. That is **inconclusive, not a
+refutation** — both arms converged to within 0.006 bits of H∞, and once that
+happens the residuals vanish and ΔCE → 0 whatever C⁻ − C⁺ is. `sanity_check`
+originally scored this with a bare sign test and printed **FAIL** for
+−0.0006 bits; commit `9ac1626` gives it the same NULL_TOL band the null control
+uses, with a three-way PASS / INCONCLUSIVE / FAIL verdict.
+
+Both controls carry heavy divergence at these settings (8/10 and 6/10 folds),
+so their paired statistics rest on one or two folds and the `sem` is `nan`.
+**QUICK is the trustworthy run.**
 
 `./run_rest.sh` drives SANITY then LARGE. A `run_all_done.marker` file appears
 when both finish.
