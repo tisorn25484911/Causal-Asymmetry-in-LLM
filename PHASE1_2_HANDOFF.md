@@ -1,11 +1,11 @@
 # Phase 1 & 2 — Handoff
 
 Date: 2026-08-04
-Branch: `phase0-unblock` (6 new commits on top of Phase 0, **not pushed**)
+Branch: `phase0-unblock` (9 new commits on top of Phase 0, **not pushed**)
 Follows: `IMPROVEMENT_PLAN.md` §7 Phase 1 and Phase 2
 Previous: `PHASE0_HANDOFF.md`
 
-**Status: Phase 1 and Phase 2 complete in code, verified by 37 tests and a
+**Status: Phase 1 and Phase 2 complete in code, verified by 38 tests and a
 full SMOKE run.** Phase 1.9 ("re-run everything") is in progress — see §8.
 
 ---
@@ -45,7 +45,7 @@ assume was overlooked.
 
 ## 2. The commits, and why each is a unit
 
-Six commits. Each is self-contained and the tree runs at every one.
+Eight commits. Each is self-contained and the tree runs at every one.
 
 ### `f68437e` — Phase 1.4/1.5: fix the loss path (B3, B1, B2)
 
@@ -187,7 +187,61 @@ built and silently discarded. **B10** `FW_BW_loss_comparison` ended in a bare
 of the repo says must not be used for comparison; now reports both, correctly
 labelled. **C7** `make_loader`'s no-op `states` argument.
 
-### `f6f9ef1` — Phase 4.6 brought forward: 37 regression tests
+### `fe4e308` — Analysis must run at the **training chunk length** (corrects my own B4 fix)
+
+**This is the most important finding in the whole exercise, and the null
+control is what caught it.** It also means B4 as literally specified in the
+plan is wrong.
+
+B4 says analysis should run on full sequences, quoting README:233 — *"analysis
+on full sequences remains in-distribution"*. **That claim is false whenever
+`chunk_len` < full sequence length.** A chunk is fed to the model as a
+standalone sequence, so the positional-encoding index is the position *within
+the chunk*: the model only ever sees PE indices `[0, chunk)`. Evaluating at
+full length asks it to extrapolate to positions it has never seen.
+
+Measured on the sanity_check coin checkpoint (chunk 512, evaluated at T=999,
+H∞ = 1.0), CE by position block:
+
+| positions | CE |
+|---|---|
+| 0–511 (trained) | **1.0249** — converged |
+| 512–998 (never seen) | 1.5563 |
+| whole sequence | **1.2840** ← what was being reported |
+
+So the coin arm had converged all along. The 0.28-bit "failure to converge"
+was extrapolation error.
+
+**Why this is fatal rather than merely inaccurate:** it biases the two arms
+*asymmetrically*. `statistical_complexity_empirical` reads the forward arm at
+`use_t="last"` and the backward arm at `use_t="first"` — correctly, those are
+the max-context positions (A3). At full length that is position T−1 for
+forward, **untrained**, against position 0 for backward, **trained**. The two
+arms were measured under different amounts of extrapolation, and ΔCE is a
+difference between them. A study measuring hundredths of a bit cannot carry
+that.
+
+The first re-run of `sanity_check.py` reported **ΔCE = −0.4210 on a process
+that is exactly time-reversible** — precisely the failure the null control
+exists to detect. It worked.
+
+Fixed with `make_analysis_loader()`, emitting deterministic windows at the
+training chunk length from a seed offset from the training one. Effect on the
+same checkpoint:
+
+| | before | after | theory |
+|---|---|---|---|
+| CE | 1.2859 | **1.0235** | H∞ = 1.0000 |
+| C⁺ empirical | 0.9863 | **0.9982** | 1.0000 |
+| C⁻ empirical | 1.5458 | **1.5061** | 1.5000 |
+
+The empirical complexity now matches the closed form to three decimals, which
+it never did before.
+
+*(This commit also carries the removal of imports left dead by the move to
+`utils.py` — trivial, verified with pyflakes and a SMOKE run.)*
+
+### `f6f9ef1` — Phase 4.6 brought forward: 38 regression tests
 
 Brought forward because almost everything Phase 1 fixed was *silent* — nothing
 raised, the numbers were just wrong. Without tests a later edit re-introduces
@@ -198,7 +252,7 @@ the *generator* rather than only against itself: `coin_true_conditional` is
 compared to a Monte-Carlo estimate over 40×4000 tokens at three (p,q).
 
 ```
-conda activate qdrug && pytest tests/ -q      # 37 passed
+conda activate qdrug && pytest tests/ -q      # 38 passed
 ```
 
 ---
@@ -295,7 +349,7 @@ running, **four sign predictions** are now on the table instead of one.
 conda activate qdrug
 cd /Users/tisornnaphattalung/Desktop/Quantum/URECA/LLM_final_version
 
-pytest tests/ -q                              # 37 passed
+pytest tests/ -q                              # 38 passed
 python run_experiments.py --config SMOKE      # full suite, ~2 min
 
 # B3: the bug that was silent
