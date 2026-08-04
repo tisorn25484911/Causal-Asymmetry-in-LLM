@@ -11,10 +11,9 @@ import torch
 from Data_generation import CoinDataset, coin_generation
 from Flower_process_generation import FlowerDataset, flower_process_generation
 from OneHot_model import OneHotDecoder
-from Training_model import make_chunked_loader, _loader
+from Training_model import _loader
 from configs import CONFIGS
 from Model_analysis import (
-    latent_extraction,
     perplexity_calculation,
     plot_umap,
     statistical_complexity,

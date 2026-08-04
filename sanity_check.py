@@ -53,17 +53,13 @@ Sanity checks
      "confirms" the 3 states it assumed.
 """
 
-import gc
 import os
-import pickle
 import time
 
 import matplotlib
 matplotlib.use("Agg")
 import matplotlib.pyplot as plt
 import numpy as np
-import torch
-import torch.utils.data as tud
 
 from Data_generation import CoinDataset, coin_generation
 from Flower_process_generation import FlowerDataset, flower_process_generation
@@ -81,7 +77,7 @@ from Model_analysis import (
     slim_results,
 )
 from Training_model import (
-    _loader,
+    make_analysis_loader,
     make_chunked_loader,
     set_seed,
     train_test_val_pipeline,
@@ -454,7 +450,8 @@ def exp_coin(cfg, out_root):
     ds           = CoinDataset(data, seq_len=cfg["coin_seq_len"])
     loader_train = make_chunked_loader(ds, cfg["train_chunk_len"],
                                        cfg["coin_batch"], seed=cfg["seed"])
-    loader_ana   = _loader(ds, cfg["coin_batch"])
+    loader_ana   = make_analysis_loader(ds, cfg["train_chunk_len"],
+                                       cfg["coin_batch"], seed=cfg["seed"] + 1000)
     sample_seq   = next(iter(loader_ana))[0][0]
     num_token    = cfg["coin_num_token"]
     max_len      = cfg["coin_seq_len"]
@@ -572,7 +569,8 @@ def exp_flower(cfg, out_root):
     ds           = FlowerDataset(data, seq_len=seq_len_actual)
     loader_train = make_chunked_loader(ds, cfg["train_chunk_len"],
                                        cfg["flower_batch"], seed=cfg["seed"])
-    loader_ana   = _loader(ds, cfg["flower_batch"])
+    loader_ana   = make_analysis_loader(ds, cfg["train_chunk_len"],
+                                       cfg["flower_batch"], seed=cfg["seed"] + 1000)
     sample_seq   = next(iter(loader_ana))[0][0]
     max_len      = seq_len_actual
 

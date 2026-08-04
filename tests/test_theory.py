@@ -269,3 +269,32 @@ def test_chunk_dataset_returns_full_sequence_when_shorter_than_chunk():
     ds = ChunckDataset(base, 64, seed=0)
     inp, tgt = ds[0]
     assert inp.shape[0] == 8 and tgt.shape[0] == 8
+
+
+def test_analysis_loader_matches_training_length():
+    """
+    The analysis loader must emit sequences of the TRAINING chunk length.
+
+    A chunk is fed to the model as a standalone sequence, so the model only
+    ever sees positional-encoding indices [0, chunk).  Evaluating at full
+    length measures extrapolation to unseen positions -- measured at 1.556
+    bits beyond position 512 versus 1.025 within, against H_inf = 1.0 -- and
+    does so asymmetrically, since the forward arm's complexity is read at
+    use_t="last" (untrained at full length) and the backward arm's at
+    use_t="first" (always trained).
+    """
+    from Training_model import make_analysis_loader
+
+    base = _toy_base(n_seq=8, T=100)
+    chunk = 32
+    loader = make_analysis_loader(base, chunk, batch_size=4, seed=1000)
+    for inputs, targets in loader:
+        assert inputs.shape[1] == chunk, (
+            f"analysis loader emitted T={inputs.shape[1]}, expected the "
+            f"training chunk length {chunk}")
+        assert targets.shape[1] == chunk
+
+    # and it must not simply hand back the training windows
+    train = ChunckDataset(base, chunk, seed=0)
+    ana   = ChunckDataset(base, chunk, seed=1000)
+    assert any(not torch.equal(train[i][0], ana[i][0]) for i in range(len(base)))

@@ -1,11 +1,6 @@
-import gc
-import os
-import pickle
-import time
 import numpy as np
 import matplotlib.pyplot as plt
 from sklearn.decomposition import PCA
-from sklearn.manifold import TSNE
 import torch
 from sklearn.cluster import KMeans
 from OneHot_model import cross_ent_onehot
@@ -50,7 +45,7 @@ General purpose plotting:
 # C4: mkdir / save_pkl / save_weights / cleanup / entropy_rate_coin now have a
 # single definition in utils.py.  They are re-exported here because several
 # modules and the notebooks import them from Model_analysis.
-from utils import (            # noqa: E402  (re-export)
+from utils import (            # noqa: F401  -- deliberate re-export
     cleanup,
     coin_tag,
     entropy_bits,

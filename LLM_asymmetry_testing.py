@@ -13,7 +13,6 @@ from Flower_process_generation import FlowerDataset, flower_process_generation
 from OneHot_model import OneHotDecoder
 from Training_model import _loader
 from Model_analysis import (
-    coin_true_conditional,
     flower_complexity,
     perplexity_calculation,
     perplexity_ind_CE,

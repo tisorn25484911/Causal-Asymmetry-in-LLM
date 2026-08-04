@@ -43,10 +43,14 @@ BASE = dict(
     # reproducible run at ~6x the wall-clock.
     accelerator      = "auto",
     # ── analysis ───────────────────────────────────────────────────────
-    # Analysis runs on FULL sequences (B4) where attention is O(T^2), so the
-    # analysis batch is small to bound the transient (B, T, T) score matrix:
-    # at T=1999, B=8 costs ~0.12 GB per layer instead of ~0.48 GB at B=32.
-    ana_batch        = 8,
+    # Analysis runs at the TRAINING chunk length, not full sequence length --
+    # see Training_model.make_analysis_loader.  The model only ever sees
+    # positional-encoding indices [0, chunk), so evaluating at full length
+    # measures extrapolation rather than what was learned, and does so
+    # asymmetrically between the two arms.  Because T is back to chunk size,
+    # the attention matrix is the same size as in training and the analysis
+    # batch does not need to be shrunk.
+    ana_batch        = 32,
     max_batches      = 20,
     # B7: 15, not 200.  200 neighbours on 1000 points smears exactly the local
     # cluster structure the plot exists to show.  (This value was unreachable

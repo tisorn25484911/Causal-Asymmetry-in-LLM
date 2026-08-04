@@ -74,10 +74,8 @@ they cannot disagree with the parameters that produced them.
 """
 # ── stdlib ─────────────────────────────────────────────────────────────────
 import argparse
-import gc
 import json
 import os
-import pickle
 import time
 
 # ── third-party ────────────────────────────────────────────────────────────
@@ -85,8 +83,6 @@ import matplotlib
 matplotlib.use("Agg")
 import matplotlib.pyplot as plt
 import numpy as np
-import torch
-import torch.utils.data as tud
 
 # ── project ────────────────────────────────────────────────────────────────
 from configs import CONFIGS, QUICK
@@ -97,7 +93,6 @@ from Data_generation import CoinDataset, coin_generation
 from Flower_process_generation import FlowerDataset, flower_process_generation
 from Model_analysis import (
     slim_results,
-    _sub,
     savefig,
     _project2d,
     flower_complexity,
@@ -116,10 +111,10 @@ from utils import (
     save_weights, to_cpu_for_analysis,
 )
 from Training_model import (
-    ChunckDataset, _loader, make_chunked_loader, set_seed,
+    make_analysis_loader, make_chunked_loader, set_seed,
     train_test_val_pipeline,
 )
-from pq_experiment import heatmap_theory, plot_heatmap, pq_experiment, pq_experiment_full
+from pq_experiment import heatmap_theory, plot_heatmap, pq_experiment_full
 
 # ── UMAP — warm up JIT here so segfault (if any) happens at startup ───────
 # FIX-2: pre-compile numba kernels before training begins
@@ -424,7 +419,8 @@ def experiment_1(cfg, out_root, all_results):
     num_token = cfg["coin_num_token"]
     ds_fw = CoinDataset(data,     seq_len=cfg["coin_seq_len"])
     loader_fw     = make_chunked_loader(ds_fw, chunk, cfg["coin_batch"], seed=seed)
-    loader_fw_ana = _loader(ds_fw, cfg["ana_batch"])
+    loader_fw_ana = make_analysis_loader(ds_fw, chunk, cfg["ana_batch"],
+                                        seed=seed + 1000)
     sample_seq    = next(iter(loader_fw))[0][0]
 
     # B5: max_len is the FULL input length, not the chunk.  README:233 says the
@@ -515,7 +511,8 @@ def experiment_1_2(cfg, out_root, all_results):
 
     ds_fw = CoinDataset(data,     seq_len=cfg["coin_seq_len_12"])
     loader_fw     = make_chunked_loader(ds_fw, chunk, cfg["coin_batch"], seed=seed)
-    loader_fw_ana = _loader(ds_fw, cfg["ana_batch"])
+    loader_fw_ana = make_analysis_loader(ds_fw, chunk, cfg["ana_batch"],
+                                        seed=seed + 1000)
     sample_seq    = next(iter(loader_fw))[0][0]
 
     max_len = full_seq_len(ds_fw)                       # B5
@@ -680,7 +677,8 @@ def experiment_2(cfg, out_root, all_results, n, m, role):
     # the code did (forward data -> backward model).  Deleted.
     ds_fw = FlowerDataset(data, seq_len=seq_len_f)
     loader_fw     = make_chunked_loader(ds_fw, chunk, cfg["flower_batch"], seed=seed)
-    loader_fw_ana = _loader(ds_fw, cfg["ana_batch"])
+    loader_fw_ana = make_analysis_loader(ds_fw, chunk, cfg["ana_batch"],
+                                        seed=seed + 1000)
     sample_seq    = next(iter(loader_fw))[0][0]
 
     max_len = full_seq_len(ds_fw)                        # B5

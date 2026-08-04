@@ -108,10 +108,64 @@ def make_chunked_loader(
         persistent_workers=False,
     )
 def _loader(dataset: tud.Dataset, batch_size: int, shuffle: bool = False) -> tud.DataLoader:
-    """Plain loader — FIX-3 only (no chunking; used for analysis)."""
+    """
+    Plain full-length loader (no chunking).
+
+    WARNING: do NOT use this for analysis when the model was trained on chunks.
+    See make_analysis_loader below for why.  It remains here because the
+    post-hoc evaluators load models whose max_len covers the full sequence.
+    """
     return tud.DataLoader(
         dataset, batch_size=batch_size,
         shuffle=shuffle, num_workers=0, persistent_workers=False,
+    )
+
+
+def make_analysis_loader(
+    dataset: tud.Dataset, chunk_len: int, batch_size: int, seed: int = 0,
+) -> tud.DataLoader:
+    """
+    Loader for post-training analysis, at the SAME sequence length the model
+    was trained on.
+
+    Why not the full-length loader.  IMPROVEMENT_PLAN.md B4 says analysis
+    should run on full sequences, quoting README:233 -- "analysis on full
+    sequences remains in-distribution".  **That claim is false whenever
+    chunk_len < full sequence length.**  A chunk is fed to the model as a
+    standalone sequence, so the positional encoding index is the position
+    *within the chunk*: the model only ever sees PE indices [0, chunk_len).
+    Evaluating at full length asks it to extrapolate to positions it has never
+    been trained on.
+
+    Measured on the sanity_check coin checkpoint (trained at chunk 512,
+    evaluated at T=999, H_inf = 1.0):
+
+        positions    0-511  (trained)     CE = 1.0249   <- converged
+        positions  512-998  (never seen)  CE = 1.5563
+        whole sequence                    CE = 1.2840   <- what was reported
+
+    So the "unconverged" CE was extrapolation error, not a failure to learn.
+
+    Worse, it biases the FW/BW comparison *asymmetrically*, which is fatal for
+    a study measuring a difference between the two arms.
+    statistical_complexity_empirical reads the forward arm at use_t="last" and
+    the backward arm at use_t="first" (correctly -- those are the max-context
+    positions, A3).  At full length that is position T-1 for forward, which is
+    untrained, versus position 0 for backward, which is trained.  The two arms
+    are then measured under different amounts of extrapolation, and the
+    difference between them is contaminated by an artefact of chunked
+    training.  At chunk length both positions are in-distribution.
+
+    Windows are drawn deterministically (as in ChunckDataset) from a seed
+    offset from the training one, so analysis sees fresh windows of the same
+    length rather than exactly the windows that were trained on.
+    """
+    return tud.DataLoader(
+        ChunckDataset(dataset, chunk_len, seed=seed),
+        batch_size=batch_size,
+        shuffle=False,
+        num_workers=0,
+        persistent_workers=False,
     )
 
 # ─────────────────────────────────────────────────────────────────────────────
