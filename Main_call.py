@@ -90,15 +90,21 @@ from Model_analysis import (
     savefig,
     save_weights,
     _project2d,
+    flower_complexity,
+    flower_entropy_rate,
+    paired_delta_ce,
     plot_umap,
-    plot_diff_heatmap, 
+    plot_diff_heatmap,
     FW_BW_attention_comparison,
     latent_extraction,
     plot_attention_heatmap,
     statistical_complexity,
     statistical_complexity_empirical,
 )
-from Training_model import ChunckDataset, _loader, make_chunked_loader, _eval_loss_on_loader, train_test_val_pipeline
+from Training_model import (
+    ChunckDataset, _loader, make_chunked_loader, set_seed,
+    train_test_val_pipeline,
+)
 from pq_experiment import heatmap_theory, plot_heatmap, pq_experiment, pq_experiment_full
 
 # ── UMAP — warm up JIT here so segfault (if any) happens at startup ───────
@@ -120,6 +126,8 @@ except Exception as _e:
 # GLOBAL CONFIG
 # ══════════════════════════════════════════════════════════════════════════
 CFG = dict(
+    # ── reproducibility (A2) ───────────────────────────────────────────
+    seed          = 0,
     # ── model ──────────────────────────────────────────────────────────
     d_model       = 32,
     embed_type    = "onehot",
@@ -128,7 +136,14 @@ CFG = dict(
     # ── FIX-1: limit T to avoid O(T²) OOM ─────────────────────────────
     train_chunk_len = 256,   # tokens seen per training step
     attn_vis_len    = 64,    # tokens used for attention heatmap plots
-    umap_n_neighbors = 200,  # UMAP neighbourhood size (reference: 100 for 1000 pts)
+    # Analysis runs on FULL sequences (B4), where attention is O(T^2).  A
+    # smaller batch there keeps the transient (B, T, T) score matrix bounded:
+    # at T=1999, B=8 is ~0.12 GB per layer instead of ~0.48 GB at B=32.
+    ana_batch       = 8,
+    # B7: 200 neighbours on 1000 points smears the local cluster structure the
+    # plot exists to show.  This value was also unreachable until B7 was fixed.
+    umap_n_neighbors = 15,
+    umap_n_pts       = 1000,
     # ── coin exp 1 ─────────────────────────────────────────────────────
     coin_p1          = 0.4,  coin_q1          = 0.8,
     coin_num_samples = 500,  coin_seq_len     = 2000,
@@ -138,9 +153,19 @@ CFG = dict(
     coin_p2             = 0.1,  coin_q2             = 0.9,
     coin_num_samples_12 = 500,  coin_seq_len_12     = 500,
     # ── flower exp 2 ───────────────────────────────────────────────────
-    flower_n           = 4,  flower_m           = 2,
+    # Two configurations, because the sign of delta_CE should track the sign
+    # of (C- - C+) -- IMPROVEMENT_PLAN.md A1.  C- <= 1 + (1/2)log2(m) while
+    # C+ = 1 + (1/2)log2(n), so C- > C+ requires m > n.  Every flower config
+    # originally in this repo had n > m, i.e. all of them tested the negation
+    # of the hypothesis while being labelled as confirming it.
+    flower_configs = [
+        # (n, m, role)   role drives the predicted sign, not the analysis
+        (2, 6, "positive"),   # C+=1.500  C-~2.111   predict delta_CE > 0
+        (4, 2, "reversed"),   # C+=2.000  C-~1.495   predict delta_CE < 0
+    ],
     flower_num_samples = 500, flower_seq_len    = 2000,
     flower_max_epochs  = 10,  flower_batch      = 32,
+    flower_dice_seed   = 42,
     # ── pq heatmap ─────────────────────────────────────────────────────
     pq_grid   = [0.05, 0.15, 0.25, 0.35, 0.45, 0.55, 0.65, 0.75, 0.85, 0.95],
     pq_epochs = 5,  pq_samples = 500,  pq_len = 200,
@@ -193,6 +218,33 @@ def to_cpu_for_analysis(model: torch.nn.Module) -> torch.nn.Module:
 # ══════════════════════════════════════════════════════════════════════════
 # UTILITIES
 # ══════════════════════════════════════════════════════════════════════════
+
+def coin_tag(prefix: str, p: float, q: float) -> str:
+    """
+    Derive an experiment tag from the parameters it was actually run at.
+
+    IMPROVEMENT_PLAN.md B8/A4.  Tags used to be string literals, so
+    Main_call.py wrote "exp1_coin_p03_q04" while its CFG said p=0.4, q=0.8 --
+    main_large's parameters.  Deriving the tag makes that class of error
+    impossible: a tag can no longer disagree with the config that produced it.
+    p=0.4, q=0.8 -> "exp1_coin_p040_q080".
+    """
+    return f"{prefix}_coin_p{round(p*100):03d}_q{round(q*100):03d}"
+
+
+def flower_tag(prefix: str, n: int, m: int) -> str:
+    return f"{prefix}_flower_n{n}_m{m}"
+
+
+def full_seq_len(dataset) -> int:
+    """
+    Length of the model's input sequence, i.e. len(seq) - 1 given that the
+    Datasets emit (x[:-1], x[1:]).  Used for max_len so the positional
+    encoding table covers the whole range at analysis time (B5).
+    """
+    inp, _ = dataset[0]
+    return int(inp.shape[0])
+
 
 def entropy_rate_coin(p: float, q: float) -> float:
     """
@@ -266,7 +318,21 @@ def plot_loss_theory(rec_fw, rec_bw, theory_fw, theory_bw, title="", save_path=N
 
 def analyse_model(tag, model, loader, num_token, out_dir,
                   sample_seq=None, p=None, q=None, mode="forward",
-                  k=2, use_t="last", attn_vis_len=64):
+                  k=2, use_t="last", attn_vis_len=64,
+                  umap_n_pts=1000, umap_n_neighbors=15):
+    """
+    `loader` must be the FULL-SEQUENCE analysis loader, not the chunked
+    training loader — IMPROVEMENT_PLAN.md B4.  README:233 states the design
+    ("Chunked training, full-length analysis... analysis on full sequences
+    remains in-distribution"); the runners used to build loader_*_ana and then
+    hand analyse_model the chunked loader instead, so UMAP and complexity ran
+    on 256-token windows.
+
+    `use_t` selects the position the complexity is read at, and it must match
+    the direction (A3).  With a tril mask the last position has seen the whole
+    past; with a triu mask position t attends to [t, T-1], so the LAST position
+    attends to itself alone and maximum context is at position 0.
+    """
     res = {"tag": tag}
 
     # ── Move to CPU so Metal heap is freed before analysis ────────────────
@@ -289,7 +355,8 @@ def analyse_model(tag, model, loader, num_token, out_dir,
         lat_for_plot = lat_slice
         inp_for_plot = inp_slice
         _, coords = plot_umap(lat_for_plot, inp_for_plot, num_token, title=tag,
-                              save_path=os.path.join(out_dir, f"{tag}_umap.png"))
+                              save_path=os.path.join(out_dir, f"{tag}_umap.png"),
+                              n_pts=umap_n_pts, n_neighbors=umap_n_neighbors)
         res.update({"latents": latents, "inputs_arr": inp_arr, "umap_coords": coords})
     except Exception as e:
         print(f"  UMAP failed: {e}")
@@ -313,8 +380,23 @@ def analyse_model(tag, model, loader, num_token, out_dir,
     return res
 
 
-def compare_fw_bw(tag, cv_fw, cv_bw, ana_fw, ana_bw, loader_fw, loader_bw, num_token, out_dir,
-                  sample_seq, theory_fw, theory_bw, attn_vis_len=64, p=None, q=None):
+def compare_fw_bw(tag, cv_fw, cv_bw, ana_fw, ana_bw, loader_ana, num_token, out_dir,
+                  sample_seq, theory_fw, theory_bw, attn_vis_len=64, p=None, q=None,
+                  cfg=None):
+    """
+    `loader_ana` is the full-sequence analysis loader (B4).  The old signature
+    took both loader_fw and loader_bw; every call site passed loader_fw twice
+    and the loader_bw parameter was never read, so it has been removed.
+
+    `cfg` is now a real parameter (B7).  The UMAP call used to read
+    `cfg.get('umap_n_neighbors', 200) if 'cfg' in dir() else 200` — dir() with
+    no argument lists the *local* scope, cfg was neither a parameter nor a
+    local, and dir() would not see a global anyway, so the condition was always
+    False and the value was always the hard-coded 200.
+    """
+    cfg = cfg or {}
+    n_nbr = cfg.get("umap_n_neighbors", 15)
+    n_pts_cfg = cfg.get("umap_n_pts", 1000)
     mfw = cv_fw["best_model"];  mbw = cv_bw["best_model"]
     rfw = cv_fw["best_recorder"];  rbw = cv_bw["best_recorder"]
 
@@ -336,35 +418,30 @@ def compare_fw_bw(tag, cv_fw, cv_bw, ana_fw, ana_bw, loader_fw, loader_bw, num_t
     except Exception as e:
         print(f"  attn compare failed: {e}")
 
-    # (c) shared-range UMAP
-    # Use the position that has the MOST context for each direction:
-    #   Forward  → last  position (has seen the whole past)
-    #   Backward → first position (attends to the whole future)
-    # Flattening all positions mixes high-context and low-context latents,
-    # producing elongated smears instead of tight clusters.
+    # (c) side-by-side UMAP of the two models' latents on the same data.
+    # Both arms see the same forward-generated sequences; they differ in the
+    # attention mask and the batch convention.  Latents from every position are
+    # flattened together here (the per-direction max-context slice is what the
+    # complexity estimator uses, via use_t).
     try:
-        lfw, ifw, _ = latent_extraction(mfw, loader_fw, max_batches=20)
-        lbw, ibw, _ = latent_extraction(mbw, loader_fw, max_batches=20)
-        # lfw/lbw shape: (N, T, d_model) — slice the max-context position
-        # Both models are forward-mode (reversed data → forward model)
-        # → last position has the most context for both
-        lat_fw = lfw.reshape(-1, lfw.shape[-1])   # last pos: full past context
-        lat_bw = lbw.reshape(-1, lbw.shape[-1])   # last pos: full reversed-past context
-        inp_fw = ifw.reshape(-1)      # token at last input position
+        lfw, ifw, _ = latent_extraction(mfw, loader_ana, max_batches=20)
+        lbw, ibw, _ = latent_extraction(mbw, loader_ana, max_batches=20)
+        lat_fw = lfw.reshape(-1, lfw.shape[-1])
+        lat_bw = lbw.reshape(-1, lbw.shape[-1])
+        inp_fw = ifw.reshape(-1)
         inp_bw = ibw.reshape(-1)
-        # subsample to 1000 points (first N, ordered)
-        n_pts = min(1000, len(lat_fw), len(lat_bw))
+        n_pts = min(n_pts_cfg, len(lat_fw), len(lat_bw))
         fl_fw, fl_bw = lat_fw[:n_pts], lat_bw[:n_pts]
         si_fw, si_bw = inp_fw[:n_pts], inp_bw[:n_pts]
-        c_fw, mlbl = _project2d(fl_fw, n_neighbors=cfg.get('umap_n_neighbors', 200) if 'cfg' in dir() else 200)
-        c_bw, _    = _project2d(fl_bw, n_neighbors=cfg.get('umap_n_neighbors', 200) if 'cfg' in dir() else 200)
+        c_fw, mlbl = _project2d(fl_fw, n_neighbors=n_nbr)
+        c_bw, _    = _project2d(fl_bw, n_neighbors=n_nbr)
 
         # Independent projections — no shared axis range
         cmap = plt.cm.tab10
         fig, axes = plt.subplots(1, 2, figsize=(12, 5))
         for ax, coords, raw_inp, lbl in zip(
             axes, [c_fw, c_bw], [si_fw, si_bw],
-            [f"fw_data_fw_model ({mlbl})", f"fw_data_bw_model ({mlbl})"]
+            [f"Forward model ({mlbl})", f"Backward model ({mlbl})"]
         ):
             for tok in range(num_token):
                 mask = raw_inp == tok
@@ -404,28 +481,33 @@ def compare_fw_bw(tag, cv_fw, cv_bw, ana_fw, ana_bw, loader_fw, loader_bw, num_t
 # EXPERIMENT 1 — Coin HMM  p=0.4, q=0.8
 # ══════════════════════════════════════════════════════════════════════════
 def experiment_1(cfg, out_root, all_results):
-    tag  = "exp1_coin_p03_q04"
-    odir = mkdir(os.path.join(out_root, tag))
     p, q = cfg["coin_p1"], cfg["coin_q1"]
+    # B8: derive the tag from the parameters instead of hard-coding it.  The
+    # literal used to be "exp1_coin_p03_q04" while CFG said p=0.4, q=0.8, so
+    # this runner's output was labelled with main_large's parameters.
+    tag  = coin_tag("exp1", p, q)
+    odir = mkdir(os.path.join(out_root, tag))
+    seed = cfg["seed"]
     t0   = time.time()
     print(f"\n{'='*70}\n  EXP 1 — Coin HMM  p={p}  q={q}\n{'='*70}")
 
     data, states = coin_generation(
         num_samples=cfg["coin_num_samples"], seq_len=cfg["coin_seq_len"], p=p, q=q)
-    #data_rev, states_rev = Rev_HMM_generation(data, states)
     chunk     = cfg["train_chunk_len"]
     num_token = cfg["coin_num_token"]
     ds_fw = CoinDataset(data,     seq_len=cfg["coin_seq_len"])
-    #ds_bw = CoinDataset(data_rev, seq_len=cfg["coin_seq_len"])
-    loader_fw     = make_chunked_loader(ds_fw, chunk, cfg["coin_batch"])
-    #loader_bw     = make_chunked_loader(ds_bw, chunk, cfg["coin_batch"])
-    loader_fw_ana = _loader(ds_fw, cfg["coin_batch"])
-    #loader_bw_ana = _loader(ds_bw, cfg["coin_batch"])
+    loader_fw     = make_chunked_loader(ds_fw, chunk, cfg["coin_batch"], seed=seed)
+    loader_fw_ana = _loader(ds_fw, cfg["ana_batch"])
     sample_seq    = next(iter(loader_fw))[0][0]
 
-    max_len = chunk
+    # B5: max_len is the FULL input length, not the chunk.  README:233 says the
+    # PE table must cover the entire range; with max_len=chunk the table was
+    # rebuilt at inference time on the analysis batch, at positions the model
+    # was never trained on.  Harmless while B4 was unfixed (analysis also ran
+    # at T=chunk) — fixing B4 without this would have exposed it.
+    max_len = full_seq_len(ds_fw)
     theory  = entropy_rate_coin(p, q)
-    print(f"  H∞={theory:.4f} bits  |  chunk={chunk}")
+    print(f"  H∞={theory:.4f} bits  |  chunk={chunk}  max_len={max_len}  seed={seed}")
 
     print("\n  -- 1a Forward CV --")
     cv_fw = train_test_val_pipeline(
@@ -433,7 +515,7 @@ def experiment_1(cfg, out_root, all_results):
         embed_type=cfg["embed_type"], num_token=num_token,
         d_model=cfg["d_model"], max_len=max_len,
         max_epochs=cfg["coin_max_epochs"], lr=cfg["lr"], mode="forward",
-        save_plot=os.path.join(odir, f"{tag}_fw_cv.png"),
+        save_plot=os.path.join(odir, f"{tag}_fw_cv.png"), seed=seed,
     )
     cleanup()  # FIX-4
 
@@ -443,27 +525,37 @@ def experiment_1(cfg, out_root, all_results):
         embed_type=cfg["embed_type"], num_token=num_token,
         d_model=cfg["d_model"], max_len=max_len,
         max_epochs=cfg["coin_max_epochs"], lr=cfg["lr"], mode="backward",  # forward data → backward model
-        save_plot=os.path.join(odir, f"{tag}_bw_cv.png"),
+        save_plot=os.path.join(odir, f"{tag}_bw_cv.png"), seed=seed,
     )
     cleanup()  # FIX-4
 
     print("\n  -- 1c Analysis --")
-    ana_fw = analyse_model(f"{tag}_fw", cv_fw["best_model"], loader_fw,
+    ana_fw = analyse_model(f"{tag}_fw", cv_fw["best_model"], loader_fw_ana,
                            num_token, odir, sample_seq, p, q, "forward",
-                           k=2, use_t="last", attn_vis_len=cfg["attn_vis_len"])
+                           k=2, use_t="last", attn_vis_len=cfg["attn_vis_len"],
+                           umap_n_pts=cfg["umap_n_pts"],
+                           umap_n_neighbors=cfg["umap_n_neighbors"])
     cleanup()  # GC between fw and bw analysis (model already moved to CPU)
-    ana_bw = analyse_model(f"{tag}_bw", cv_bw["best_model"], loader_fw,
+    # A3: use_t="first" for the backward arm.  With a triu mask position T-1
+    # attends to itself only, so reading complexity at "last" read latents that
+    # encode a single token — which cannot express more than token identity.
+    ana_bw = analyse_model(f"{tag}_bw", cv_bw["best_model"], loader_fw_ana,
                            num_token, odir, sample_seq, p, q, "backward",
-                           k=3, use_t="last", attn_vis_len=cfg["attn_vis_len"])  # forward model → last pos
+                           k=3, use_t="first", attn_vis_len=cfg["attn_vis_len"],
+                           umap_n_pts=cfg["umap_n_pts"],
+                           umap_n_neighbors=cfg["umap_n_neighbors"])
     cleanup()
 
     print("\n  -- 1d Comparison --")
     compare_fw_bw(tag, cv_fw, cv_bw, ana_fw, ana_bw,
-                  loader_fw, loader_fw, num_token, odir, sample_seq,
-                  theory, theory, cfg["attn_vis_len"], p, q)
+                  loader_fw_ana, num_token, odir, sample_seq,
+                  theory, theory, cfg["attn_vis_len"], p, q, cfg=cfg)
+    paired = paired_delta_ce(cv_fw, cv_bw, label=tag)
 
     print(f"\n  Exp 1 done in {(time.time()-t0)/60:.1f} min")
-    res = dict(tag=tag, p=p, q=q, theory=theory,
+    res = dict(tag=tag, p=p, q=q, theory=theory, seed=seed, paired=paired,
+               C_plus=statistical_complexity(p, q, "forward"),
+               C_minus=statistical_complexity(p, q, "backward"),
                cv_fw=cv_fw, cv_bw=cv_bw, ana_fw=ana_fw, ana_bw=ana_bw)
     save_pkl(slim_results(res), os.path.join(odir, "results.pkl"))
     save_weights(cv_fw["best_model"], os.path.join(out_root, "models", f"{tag}_fw.pt"))
@@ -476,37 +568,34 @@ def experiment_1(cfg, out_root, all_results):
 # EXPERIMENT 1.2 — Coin HMM  p=0.1, q=0.9  + heatmaps
 # ══════════════════════════════════════════════════════════════════════════
 def experiment_1_2(cfg, out_root, all_results):
-    tag  = "exp1_2_coin_p01_q09"
-    odir = mkdir(os.path.join(out_root, tag))
     p, q = cfg["coin_p2"], cfg["coin_q2"]
+    tag  = coin_tag("exp1_2", p, q)                     # B8
+    odir = mkdir(os.path.join(out_root, tag))
+    seed = cfg["seed"]
     t0   = time.time()
     print(f"\n{'='*70}\n  EXP 1.2 — Coin HMM  p={p}  q={q}\n{'='*70}")
 
     data, states = coin_generation(
         num_samples=cfg["coin_num_samples_12"], seq_len=cfg["coin_seq_len_12"], p=p, q=q)
-    #data_rev, _ = Rev_HMM_generation(data, states)
 
     chunk     = min(cfg["train_chunk_len"], cfg["coin_seq_len_12"] - 1)
     num_token = cfg["coin_num_token"]
 
     ds_fw = CoinDataset(data,     seq_len=cfg["coin_seq_len_12"])
-    #ds_bw = CoinDataset(data_rev, seq_len=cfg["coin_seq_len_12"])
-    loader_fw     = make_chunked_loader(ds_fw, chunk, cfg["coin_batch"])
-    #loader_bw     = make_chunked_loader(ds_bw, chunk, cfg["coin_batch"])
-    loader_fw_ana = _loader(ds_fw, cfg["coin_batch"])
-    #loader_bw_ana = _loader(ds_bw, cfg["coin_batch"])
+    loader_fw     = make_chunked_loader(ds_fw, chunk, cfg["coin_batch"], seed=seed)
+    loader_fw_ana = _loader(ds_fw, cfg["ana_batch"])
     sample_seq    = next(iter(loader_fw))[0][0]
 
-    max_len = chunk
+    max_len = full_seq_len(ds_fw)                       # B5
     theory  = entropy_rate_coin(p, q)
-    print(f"  H∞={theory:.4f} bits")
+    print(f"  H∞={theory:.4f} bits  |  chunk={chunk}  max_len={max_len}  seed={seed}")
 
     cv_fw = train_test_val_pipeline(
         loader_fw, test_ratio=(0.20, 0.80), n_folds=cfg["n_folds"],
         embed_type=cfg["embed_type"], num_token=num_token,
         d_model=cfg["d_model"], max_len=max_len,
         max_epochs=cfg["coin_max_epochs"], lr=cfg["lr"], mode="forward",
-        save_plot=os.path.join(odir, f"{tag}_fw_cv.png"),
+        save_plot=os.path.join(odir, f"{tag}_fw_cv.png"), seed=seed,
     )
     cleanup()
     cv_bw = train_test_val_pipeline(
@@ -514,21 +603,26 @@ def experiment_1_2(cfg, out_root, all_results):
         embed_type=cfg["embed_type"], num_token=num_token,
         d_model=cfg["d_model"], max_len=max_len,
         max_epochs=cfg["coin_max_epochs"], lr=cfg["lr"], mode="backward",  # forward data → backward model
-        save_plot=os.path.join(odir, f"{tag}_bw_cv.png"),
+        save_plot=os.path.join(odir, f"{tag}_bw_cv.png"), seed=seed,
     )
     cleanup()
 
-    ana_fw = analyse_model(f"{tag}_fw", cv_fw["best_model"], loader_fw,
+    ana_fw = analyse_model(f"{tag}_fw", cv_fw["best_model"], loader_fw_ana,
                            num_token, odir, sample_seq, p, q, "forward",
-                           k=2, use_t="last", attn_vis_len=cfg["attn_vis_len"])
+                           k=2, use_t="last", attn_vis_len=cfg["attn_vis_len"],
+                           umap_n_pts=cfg["umap_n_pts"],
+                           umap_n_neighbors=cfg["umap_n_neighbors"])
     cleanup()
-    ana_bw = analyse_model(f"{tag}_bw", cv_bw["best_model"], loader_fw,
+    ana_bw = analyse_model(f"{tag}_bw", cv_bw["best_model"], loader_fw_ana,
                            num_token, odir, sample_seq, p, q, "backward",
-                           k=3, use_t="last", attn_vis_len=cfg["attn_vis_len"])  # forward model → last pos
+                           k=3, use_t="first", attn_vis_len=cfg["attn_vis_len"],  # A3
+                           umap_n_pts=cfg["umap_n_pts"],
+                           umap_n_neighbors=cfg["umap_n_neighbors"])
     cleanup()
     compare_fw_bw(tag, cv_fw, cv_bw, ana_fw, ana_bw,
-                  loader_fw, loader_fw, num_token, odir, sample_seq,
-                  theory, theory, cfg["attn_vis_len"], p, q)
+                  loader_fw_ana, num_token, odir, sample_seq,
+                  theory, theory, cfg["attn_vis_len"], p, q, cfg=cfg)
+    paired = paired_delta_ce(cv_fw, cv_bw, label=tag)
 
     # p-q heatmaps
     print("\n  -- Theoretical heatmap --")
@@ -564,7 +658,7 @@ def experiment_1_2(cfg, out_root, all_results):
                         save_path=os.path.join(odir, f"{tag}_diff_ppl.png"),
                         vcenter=0)
 
-    if "exp1_coin_p03_q04" in all_results:
+    if coin_tag("exp1", cfg["coin_p1"], cfg["coin_q1"]) in all_results:
         p1, q1 = cfg["coin_p1"], cfg["coin_q1"]
         bar_vals = [statistical_complexity(p1, q1, "forward"),
                     statistical_complexity(p1, q1, "backward"),
@@ -582,7 +676,9 @@ def experiment_1_2(cfg, out_root, all_results):
         savefig(fig, os.path.join(odir, f"{tag}_complexity_exp1_vs_12.png"))
 
     print(f"\n  Exp 1.2 done in {(time.time()-t0)/60:.1f} min")
-    res = dict(tag=tag, p=p, q=q, theory=theory,
+    res = dict(tag=tag, p=p, q=q, theory=theory, seed=seed, paired=paired,
+               C_plus=statistical_complexity(p, q, "forward"),
+               C_minus=statistical_complexity(p, q, "backward"),
                cv_fw=cv_fw, cv_bw=cv_bw, ana_fw=ana_fw, ana_bw=ana_bw,
                Ss_emp=Ss_emp, Ppl_emp=Ppl_emp, p_emp=p_emp, q_emp=q_emp,
                Ss_th_fw=Ss_th_fw, Ss_th_bw=Ss_th_bw, p_th=p_th, q_th=q_th)
@@ -596,38 +692,61 @@ def experiment_1_2(cfg, out_root, all_results):
 # ══════════════════════════════════════════════════════════════════════════
 # EXPERIMENT 2 — Flower HMM  n=4, m=2
 # ══════════════════════════════════════════════════════════════════════════
-def experiment_2(cfg, out_root, all_results):
-    tag       = "exp2_flower_n4_m2"
-    odir      = mkdir(os.path.join(out_root, tag))
-    n, m      = cfg["flower_n"], cfg["flower_m"]
-    num_token = n + m
-    t0        = time.time()
-    print(f"\n{'='*70}\n  EXP 2 — Flower HMM  n={n}  m={m}  vocab={num_token}\n{'='*70}")
+def experiment_2(cfg, out_root, all_results, n, m, role):
+    """
+    Flower experiment at a given (n, m).
 
-    rng        = np.random.default_rng(42)
+    `role` records what the theory predicts for this configuration, so the
+    output can be scored against its own prediction rather than against a
+    blanket "C- > C+ expected" (A1):
+
+        "positive"  m > n  ->  C- > C+  ->  predict delta_CE > 0
+        "reversed"  n > m  ->  C+ > C-  ->  predict delta_CE < 0
+
+    Both are run, because a result where the *sign* of delta_CE tracks the sign
+    of (C- - C+) across configurations is much stronger evidence than a single
+    positive case.
+    """
+    tag       = flower_tag("exp2", n, m)                 # A4/B8: derived
+    odir      = mkdir(os.path.join(out_root, tag))
+    num_token = n + m
+    seed      = cfg["seed"]
+    t0        = time.time()
+
+    rng        = np.random.default_rng(cfg["flower_dice_seed"])
     dice_probs = rng.dirichlet(np.ones(m), size=n)
+
+    # A1: real closed forms instead of nan.  C+ = 1 + (1/2)log2(n);
+    # C- = 1 + (1/2)H(pi_outcome) over *distinguishable* outcomes.
+    C_plus, C_minus = flower_complexity(n, m, dice_probs)
+    theory = flower_entropy_rate(n, m, dice_probs)       # H_inf, same both ways
+    predicted = "delta_CE > 0" if C_minus > C_plus else "delta_CE < 0"
+
+    print(f"\n{'='*70}\n  EXP 2 — Flower HMM  n={n}  m={m}  vocab={num_token}"
+          f"  [{role}]\n{'='*70}")
     print(f"  dice_probs:\n{dice_probs}")
+    print(f"  H∞ = {theory:.4f} bits")
+    print(f"  C+ = {C_plus:.4f}   C- = {C_minus:.4f}   C- - C+ = {C_minus-C_plus:+.4f}")
+    print(f"  prediction: {predicted}")
 
     data, states = flower_process_generation(
         num_samples=cfg["flower_num_samples"], seq_len=cfg["flower_seq_len"],
         n=n, m=m, dice_probs=dice_probs)
-    seqs_bw = [list(reversed(s)) for s in data]
 
-    chunk    = cfg["train_chunk_len"]
+    chunk     = cfg["train_chunk_len"]
     seq_len_f = len(data[0])
 
-    # FIX-5: parametric FlowerDataset from Flower_process_generation
-    ds_fw = FlowerDataset(data,    seq_len=seq_len_f)
-    ds_bw = FlowerDataset(seqs_bw, seq_len=seq_len_f)
-    loader_fw     = make_chunked_loader(ds_fw, chunk, cfg["flower_batch"])
-    loader_bw     = make_chunked_loader(ds_bw, chunk, cfg["flower_batch"])
-    loader_fw_ana = _loader(ds_fw, cfg["flower_batch"])
-    loader_bw_ana = _loader(ds_bw, cfg["flower_batch"])
+    # FIX-5: parametric FlowerDataset from Flower_process_generation.
+    # B4: the ds_bw / loader_bw / loader_bw_ana chain that used to be built
+    # here was never used — cv_bw trained on loader_fw, and the comment
+    # "reversed data -> forward model" described the exact opposite of what
+    # the code did (forward data -> backward model).  Deleted.
+    ds_fw = FlowerDataset(data, seq_len=seq_len_f)
+    loader_fw     = make_chunked_loader(ds_fw, chunk, cfg["flower_batch"], seed=seed)
+    loader_fw_ana = _loader(ds_fw, cfg["ana_batch"])
     sample_seq    = next(iter(loader_fw))[0][0]
 
-    max_len   = chunk
-    theory_fw = float("nan")
-    theory_bw = float("nan")
+    max_len = full_seq_len(ds_fw)                        # B5
 
     print("\n  -- 2a Forward CV --")
     cv_fw = train_test_val_pipeline(
@@ -635,7 +754,7 @@ def experiment_2(cfg, out_root, all_results):
         embed_type=cfg["embed_type"], num_token=num_token,
         d_model=cfg["d_model"], max_len=max_len,
         max_epochs=cfg["flower_max_epochs"], lr=cfg["lr"], mode="forward",
-        save_plot=os.path.join(odir, f"{tag}_fw_cv.png"),
+        save_plot=os.path.join(odir, f"{tag}_fw_cv.png"), seed=seed,
     )
     cleanup()
 
@@ -644,41 +763,67 @@ def experiment_2(cfg, out_root, all_results):
         loader_fw, test_ratio=(0.20, 0.80), n_folds=cfg["n_folds"],
         embed_type=cfg["embed_type"], num_token=num_token,
         d_model=cfg["d_model"], max_len=max_len,
-        max_epochs=cfg["flower_max_epochs"], lr=cfg["lr"], mode="backward",  # reversed data → forward model
-        save_plot=os.path.join(odir, f"{tag}_bw_cv.png"),
+        max_epochs=cfg["flower_max_epochs"], lr=cfg["lr"], mode="backward",  # forward data → backward model
+        save_plot=os.path.join(odir, f"{tag}_bw_cv.png"), seed=seed,
     )
     cleanup()
 
+    # B6: k = n+1 forward and m+1 backward, the actual causal-state counts.
+    # This used to be k=n+m for both, which for n=4,m=2 asks k-means for 6
+    # clusters when the forward model has 5 states and the backward model 3.
+    # Since S = H(cluster occupancy) <= log2(k), an inflated k inflates both
+    # numbers and destroys the comparison.
     print("\n  -- 2c Analysis --")
-    ana_fw = analyse_model(f"{tag}_fw", cv_fw["best_model"], loader_fw,
+    ana_fw = analyse_model(f"{tag}_fw", cv_fw["best_model"], loader_fw_ana,
                            num_token, odir, sample_seq, None, None, "forward",
-                           k=n+m, use_t="last", attn_vis_len=cfg["attn_vis_len"])
+                           k=n+1, use_t="last", attn_vis_len=cfg["attn_vis_len"],
+                           umap_n_pts=cfg["umap_n_pts"],
+                           umap_n_neighbors=cfg["umap_n_neighbors"])
+    ana_fw["S_theory"] = C_plus
     cleanup()
-    ana_bw = analyse_model(f"{tag}_bw", cv_bw["best_model"], loader_fw,
+    ana_bw = analyse_model(f"{tag}_bw", cv_bw["best_model"], loader_fw_ana,
                            num_token, odir, sample_seq, None, None, "backward",
-                           k=n+m, use_t="last", attn_vis_len=cfg["attn_vis_len"])  # forward model → last pos
+                           k=m+1, use_t="first", attn_vis_len=cfg["attn_vis_len"],  # A3
+                           umap_n_pts=cfg["umap_n_pts"],
+                           umap_n_neighbors=cfg["umap_n_neighbors"])
+    ana_bw["S_theory"] = C_minus
     cleanup()
 
     print("\n  -- 2d Comparison --")
     compare_fw_bw(tag, cv_fw, cv_bw, ana_fw, ana_bw,
-                  loader_fw, loader_fw, num_token, odir, sample_seq,
-                  theory_fw, theory_bw, cfg["attn_vis_len"])
+                  loader_fw_ana, num_token, odir, sample_seq,
+                  theory, theory, cfg["attn_vis_len"], cfg=cfg)
+    paired = paired_delta_ce(cv_fw, cv_bw, label=tag)
+    if paired:
+        agrees = (paired["mean"] > 0) == (C_minus > C_plus)
+        print(f"  sign of delta_CE {'MATCHES' if agrees else 'CONTRADICTS'} "
+              f"sign of (C- - C+)  [{role}]")
 
     try:
-        fig_cx, ax_cx = plt.subplots(figsize=(7, 5))
-        vals = [ana_fw.get("S_emp", 0), ana_bw.get("S_emp", 0)]
-        bars = ax_cx.bar(["Forward", "Backward"], vals,
-                         color=["#4c72b0", "#dd8452"], alpha=0.85, edgecolor="k")
-        ax_cx.bar_label(bars, fmt="%.4f", padding=3, fontsize=10)
-        ax_cx.set_ylabel("Empirical Complexity (bits)")
-        ax_cx.set_title(f"{tag} — empirical complexity")
-        ax_cx.grid(True, alpha=0.3, axis="y"); fig_cx.tight_layout()
+        fig_cx, ax_cx = plt.subplots(figsize=(8, 5))
+        x = np.arange(2)
+        emp = [ana_fw.get("S_emp", 0), ana_bw.get("S_emp", 0)]
+        th  = [C_plus, C_minus]
+        b1 = ax_cx.bar(x - 0.2, emp, 0.35, label="Empirical",
+                       color=["#4c72b0", "#dd8452"], alpha=0.85, edgecolor="k")
+        b2 = ax_cx.bar(x + 0.2, th, 0.35, label="Theoretical",
+                       color=["#4c72b0", "#dd8452"], alpha=0.45, edgecolor="k",
+                       hatch="//")
+        ax_cx.bar_label(b1, fmt="%.4f", padding=3, fontsize=9)
+        ax_cx.bar_label(b2, fmt="%.4f", padding=3, fontsize=9)
+        ax_cx.set_xticks(x); ax_cx.set_xticklabels(["Forward (C+)", "Backward (C-)"])
+        ax_cx.set_ylabel("Statistical Complexity (bits)")
+        ax_cx.set_title(f"{tag} — complexity  (n={n}, m={m}: "
+                        f"{'C- > C+' if C_minus > C_plus else 'C+ > C-'})")
+        ax_cx.legend(); ax_cx.grid(True, alpha=0.3, axis="y"); fig_cx.tight_layout()
         savefig(fig_cx, os.path.join(odir, f"{tag}_complexity.png"))
     except Exception as e:
         print(f"  complexity bar: {e}")
 
     print(f"\n  Exp 2 done in {(time.time()-t0)/60:.1f} min")
-    res = dict(tag=tag, n=n, m=m, dice_probs=dice_probs,
+    res = dict(tag=tag, n=n, m=m, dice_probs=dice_probs, role=role,
+               theory=theory, C_plus=C_plus, C_minus=C_minus,
+               seed=seed, paired=paired,
                cv_fw=cv_fw, cv_bw=cv_bw, ana_fw=ana_fw, ana_bw=ana_bw)
     save_pkl(slim_results(res), os.path.join(odir, "results.pkl"))
     save_weights(cv_fw["best_model"], os.path.join(out_root, "models", f"{tag}_fw.pt"))
@@ -692,6 +837,7 @@ def experiment_2(cfg, out_root, all_results):
 # ══════════════════════════════════════════════════════════════════════════
 def main():
     OUT_ROOT = "results"
+    set_seed(CFG["seed"])                    # A2: reproducible end to end
     mkdir(OUT_ROOT)
     mkdir(os.path.join(OUT_ROOT, "models"))
     all_results = {}
@@ -699,7 +845,8 @@ def main():
 
     experiment_1  (CFG, OUT_ROOT, all_results)
     experiment_1_2(CFG, OUT_ROOT, all_results)
-    experiment_2  (CFG, OUT_ROOT, all_results)
+    for n, m, role in CFG["flower_configs"]:
+        experiment_2(CFG, OUT_ROOT, all_results, n=n, m=m, role=role)
 
     save_pkl(all_results, os.path.join(OUT_ROOT, "all_results.pkl"))  # already slim
 

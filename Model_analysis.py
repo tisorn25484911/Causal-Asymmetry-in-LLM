@@ -209,17 +209,25 @@ def _project2d(flat: np.ndarray, n_neighbors: int = 200) -> tuple:
     from sklearn.decomposition import PCA
     return PCA(n_components=2).fit_transform(flat), "PCA"
 def plot_umap(latents, inputs_arr, num_token, title="", save_path=None,
-              xlim=None, ylim=None, n_pts: int = 1000):
+              xlim=None, ylim=None, n_pts: int = 1000, n_neighbors: int = 15):
     """
     Plot 2-D UMAP coloured by token id.
-    n_pts: number of consecutive latent vectors to embed (default 1000).
+
+    n_pts       : number of consecutive latent vectors to embed (default 1000).
+    n_neighbors : UMAP neighbourhood size.  This used to be unreachable -- the
+                  call below passed no n_neighbors, so every plot silently used
+                  the default of 200 no matter what the config said
+                  (IMPROVEMENT_PLAN.md B7).  200 neighbours on 1000 points is a
+                  very large neighbourhood and smears exactly the local cluster
+                  structure the plot exists to show; 15-50 is appropriate, and
+                  sanity_check.py already used 15.
     """
     flat_l = latents.reshape(-1, latents.shape[-1])
     flat_i = inputs_arr.reshape(-1)
     sub_l, idx = _sub(flat_l, n_pts)
     sub_i = flat_i[idx]
 
-    coords, mlbl = _project2d(sub_l)
+    coords, mlbl = _project2d(sub_l, n_neighbors=n_neighbors)
     cmap = plt.cm.tab10
     fig, ax = plt.subplots(figsize=(7, 6))
     for tok in range(num_token):
@@ -245,14 +253,18 @@ def plot_attention_heatmap(model, input_seq):
     device = next(model.parameters()).device
     input_seq = input_seq.unsqueeze(0).to(device)  # (1, T)
 
-    _ = model(input_seq)
-
-    attention = model.last_attention.squeeze(0).cpu().numpy()  # (T, T)
+    # D3: attention is not retained unless explicitly requested, and no_grad
+    # so a plot does not build an autograd graph over a (1, T, T) map.
+    with torch.no_grad(), model.capture_attention():
+        _ = model(input_seq)
+        attention = model.last_attention.squeeze(0).cpu().numpy()  # (T, T)
+        n_layers = len(model.last_attention_layers)
 
     cax = ax.matshow(attention, cmap='viridis')
     fig.colorbar(cax)
 
-    ax.set_title("Attention Heatmap")
+    # C8: say which layer this is.  It has always been the last one.
+    ax.set_title(f"Attention Heatmap (layer {n_layers} of {n_layers})")
     ax.set_xlabel("Key")
     ax.set_ylabel("Query")
 
@@ -776,13 +788,15 @@ def FW_BW_attention_comparison(model_fw, model_bw, input_seq, title_prefix=""):
     device = next(model_fw.parameters()).device
     input_seq = input_seq.unsqueeze(0).to(device)  # (1, T)
 
-    # --- Forward model ---
-    _ = model_fw(input_seq)
-    attention_fw = model_fw.last_attention.squeeze(0).detach().cpu().numpy()  # (T, T)
-
-    # --- Backward model ---
-    _ = model_bw(input_seq)
-    attention_bw = model_bw.last_attention.squeeze(0).detach().cpu().numpy()  # (T, T)
+    # --- Forward / backward (D3: attention retained only inside the block) ---
+    with torch.no_grad():
+        with model_fw.capture_attention():
+            _ = model_fw(input_seq)
+            attention_fw = model_fw.last_attention.squeeze(0).cpu().numpy()  # (T,T)
+            n_layers = len(model_fw.last_attention_layers)
+        with model_bw.capture_attention():
+            _ = model_bw(input_seq)
+            attention_bw = model_bw.last_attention.squeeze(0).cpu().numpy()  # (T,T)
 
     # --- Shared color limits ---
     vmin = min(attention_fw.min(), attention_bw.min())
@@ -793,7 +807,8 @@ def FW_BW_attention_comparison(model_fw, model_bw, input_seq, title_prefix=""):
 
     # Plot FW
     im0 = axes[0].imshow(attention_fw, cmap="viridis", vmin=vmin, vmax=vmax, origin="upper")
-    axes[0].set_title(f"{title_prefix}Forward Model Attention", fontsize=14, fontweight="bold", pad=10)
+    axes[0].set_title(f"{title_prefix}Forward Model Attention (layer {n_layers})",
+                      fontsize=14, fontweight="bold", pad=10)
     axes[0].set_xlabel("Key", fontsize=12)
     axes[0].set_ylabel("Query", fontsize=12)
     axes[0].set_box_aspect(1)          # <-- makes the axes box square
@@ -801,7 +816,8 @@ def FW_BW_attention_comparison(model_fw, model_bw, input_seq, title_prefix=""):
 
     # Plot BW
     im1 = axes[1].imshow(attention_bw, cmap="viridis", vmin=vmin, vmax=vmax, origin="upper")
-    axes[1].set_title(f"{title_prefix}Backward Model Attention", fontsize=14, fontweight="bold", pad=10)
+    axes[1].set_title(f"{title_prefix}Backward Model Attention (layer {n_layers})",
+                      fontsize=14, fontweight="bold", pad=10)
     axes[1].set_xlabel("Key", fontsize=12)
     axes[1].set_ylabel("Query", fontsize=12)
     axes[1].set_box_aspect(1)          # <-- makes the axes box square

@@ -1,4 +1,5 @@
 import math
+from contextlib import contextmanager
 
 import torch
 import torch.nn as nn
@@ -176,7 +177,31 @@ class OneHotDecoder(L.LightningModule):
         self.save_hyperparameters()
 
         self.last_encodings = None
-        self.last_attention = None  # (B, T, T)
+        self.last_attention = None  # (B, T, T) — only when store_attention
+
+        # IMPROVEMENT_PLAN.md D3.  The (B, T, T) attention map used to be
+        # retained on every single forward pass.  At training time T = chunk,
+        # so that is 8-34 MB and nobody noticed.  It only bites at full
+        # sequence length -- and B4 (running analysis on the full-length loader,
+        # as the README says it should) is exactly what takes T from 256 to
+        # ~2000.  At T=1999, B=32 that is 32 * 1999^2 * 4 B = 511 MB retained
+        # per pass.  So B4 and D3 have to land together: fixing B4 alone
+        # creates the memory problem, gating alone leaves B4 unfixed.
+        #
+        # Only the two attention *plotting* helpers ever read this, and they
+        # run on a 64-128 token prefix.  Default off; turn it on with the
+        # capture_attention() context manager.
+        self.store_attention = False
+
+    @contextmanager
+    def capture_attention(self):
+        """Temporarily retain last_attention (see store_attention, D3)."""
+        prev = self.store_attention
+        self.store_attention = True
+        try:
+            yield self
+        finally:
+            self.store_attention = prev
 
     def forward(self, tokens):
         # --- sanitize tokens dtype/device ---
@@ -205,19 +230,31 @@ class OneHotDecoder(L.LightningModule):
         else:
             raise ValueError(f"Invalid mode: {self.mode}. Must be 'forward' or 'backward'")
 
-        for attn, ffn, ln1, ln2 in zip(self.attn_layers, self.ffn_layers, 
+        want_attn = self.store_attention
+        attn_maps = []
+        for attn, ffn, ln1, ln2 in zip(self.attn_layers, self.ffn_layers,
                                          self.ln_attn, self.ln_ffn):
             # attention with pre-norm
             normed = ln1(x)
-            attn_out, attn_prob = attn(normed, normed, normed, mask=mask, return_attn=True)
+            if want_attn:
+                attn_out, attn_prob = attn(normed, normed, normed, mask=mask,
+                                           return_attn=True)
+                attn_maps.append(attn_prob.detach())
+            else:
+                attn_out = attn(normed, normed, normed, mask=mask,
+                                return_attn=False)
             x = x + attn_out
-            
+
             # feedforward with pre-norm
             normed = ln2(x)
             x = x + ffn(normed)
 
         self.last_encodings = x.detach()
-        self.last_attention = attn_prob.detach()
+        # C8: keep every layer, not just the last.  `last_attention` stays the
+        # final layer for backwards compatibility, but callers that want to
+        # label a heatmap with its layer index can read last_attention_layers.
+        self.last_attention_layers = attn_maps if want_attn else None
+        self.last_attention = attn_maps[-1] if attn_maps else None
 
         logits = self.output_prj(x)  # (B, T, V)
         return logits
