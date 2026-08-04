@@ -176,4 +176,37 @@ LARGE = _cfg(
 )
 
 
-CONFIGS = {"SMOKE": SMOKE, "QUICK": QUICK, "LARGE": LARGE}
+# ─────────────────────────────────────────────────────────────────────────────
+# QUICK_LARGE_HMM — QUICK's scale, capacity and learning rate, run on LARGE's
+# PROCESSES.  Writes into the same out_root as QUICK.
+#
+# Why this exists.  QUICK and LARGE differ along four axes at once: data volume
+# (8x the training tokens), capacity (d_model 32 vs 64), optimisation (lr 1e-2
+# vs 5e-3, 100 vs 1600 steps per fold) AND the processes themselves -- they are
+# trained on different HMMs with different entropy rates and different
+# theoretical asymmetries.  That last one makes the two runs non-comparable:
+# any difference between them confounds scale, capacity and process.
+#
+# Running LARGE's processes at QUICK's settings holds the process fixed, so
+# QUICK vs LARGE becomes a controlled comparison of scale+capacity+lr.
+#
+# Only the processes MISSING from QUICK are listed.  LARGE's exp1.2 coin
+# (p=0.4, q=0.8) is already QUICK's exp1, so it is not repeated -- and because
+# tags are derived from parameter values (A4), re-running it would have landed
+# on the same tag rather than creating a duplicate.
+#
+#     python run_experiments.py --config QUICK_LARGE_HMM --only exp1
+#     python run_experiments.py --config QUICK_LARGE_HMM --only exp2
+#
+# exp1_2 is deliberately not run: it would repeat a process QUICK already has
+# and re-run the pq sweep for no new information.
+# ─────────────────────────────────────────────────────────────────────────────
+QUICK_LARGE_HMM = dict(QUICK)
+QUICK_LARGE_HMM.update(
+    coin_p1        = LARGE["coin_p1"],   coin_q1 = LARGE["coin_q1"],   # 0.3, 0.4
+    flower_configs = list(LARGE["flower_configs"]),                    # (2,8), (6,4)
+)
+
+
+CONFIGS = {"SMOKE": SMOKE, "QUICK": QUICK, "LARGE": LARGE,
+           "QUICK_LARGE_HMM": QUICK_LARGE_HMM}

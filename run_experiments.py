@@ -76,6 +76,7 @@ they cannot disagree with the parameters that produced them.
 import argparse
 import json
 import os
+import pickle
 import time
 
 # ── third-party ────────────────────────────────────────────────────────────
@@ -826,10 +827,13 @@ def main(argv=None):
     mkdir(out_root)
     mkdir(os.path.join(out_root, "models"))
 
-    # Record exactly what produced this directory, next to the outputs.
-    with open(os.path.join(out_root, "run_config.json"), "w") as f:
-        json.dump({"config": args.config, "only": args.only, **cfg}, f,
-                  indent=2, default=str)
+    # Record exactly what produced this directory, next to the outputs.  Named
+    # per config so a second config sharing an out_root cannot overwrite the
+    # first one's provenance.
+    with open(os.path.join(out_root, f"run_config_{args.config}.json"), "w") as f:
+        json.dump({"config": args.config, "only": args.only,
+                   "utc": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
+                   **cfg}, f, indent=2, default=str)
 
     print(f"\n{'='*70}")
     print(f"  config={args.config}  seed={cfg['seed']}  out_root={out_root}")
@@ -847,13 +851,34 @@ def main(argv=None):
         for n, m, role in cfg["flower_configs"]:
             experiment_2(cfg, out_root, all_results, n=n, m=m, role=role)
 
-    save_pkl(all_results, os.path.join(out_root, "all_results.pkl"))  # already slim
+    # Merge into any existing bundle rather than replacing it.  With --only,
+    # or when a second config writes to the same out_root, overwriting would
+    # silently destroy the record of every experiment not run this time --
+    # the .pkl and .pt files on disk would survive but all_results.pkl, which
+    # is what the analysis notebooks read, would list only the latest subset.
+    # Keyed by tag, and tags are derived from config values (A4), so a re-run
+    # of the same experiment replaces its own entry and nothing else.
+    combined_path = os.path.join(out_root, "all_results.pkl")
+    combined = {}
+    if os.path.exists(combined_path):
+        try:
+            with open(combined_path, "rb") as f:
+                combined = pickle.load(f)
+            kept = [k for k in combined if k not in all_results]
+            if kept:
+                print(f"\n  merging into existing all_results.pkl; keeping "
+                      f"{len(kept)} earlier experiment(s): {', '.join(sorted(kept))}")
+        except Exception as e:
+            print(f"  ! could not read existing all_results.pkl ({e}) — writing fresh")
+            combined = {}
+    combined.update(all_results)
+    save_pkl(combined, combined_path)                                 # already slim
 
     # ── Cross-experiment summary: does sign(delta_CE) track sign(C- - C+)? ──
-    print(f"\n{'='*70}\n  ASYMMETRY SUMMARY\n{'='*70}")
+    print(f"\n{'='*70}\n  ASYMMETRY SUMMARY  (every experiment in {out_root})\n{'='*70}")
     print(f"  {'experiment':<26} {'C+':>7} {'C-':>7} {'C- - C+':>9} "
           f"{'delta_CE':>10} {'sem':>8} {'verdict':>10}")
-    for tag, r in all_results.items():
+    for tag, r in sorted(combined.items()):
         pd = r.get("paired")
         cp, cm = r.get("C_plus"), r.get("C_minus")
         if pd is None or cp is None or cm is None:
