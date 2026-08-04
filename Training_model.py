@@ -244,6 +244,7 @@ class Record_training(L.Callback):
         record_probs: bool = False,
         max_batches_per_epoch: int | None = None,
         val_loader=None,
+        val_every_n_steps: int = 25,
     ):
         super().__init__()
         self.record_every_n_steps   = record_every_n_steps
@@ -251,12 +252,25 @@ class Record_training(L.Callback):
         self.record_probs           = record_probs
         self.max_batches_per_epoch  = max_batches_per_epoch
         self.val_loader             = val_loader
+        # D1: the train curve and the validation pass are gated SEPARATELY.
+        # Recording the training loss is free (it is already computed and
+        # returned by training_step), whereas each validation point costs a
+        # full pass over the val set.  The plan's single record_every_n_steps
+        # =25 would have thrown away 96% of the free series to save the
+        # expensive one -- QUICK has only 100 steps per fold, so it would have
+        # produced FOUR points on every curve.
+        self.val_every_n_steps      = max(1, int(val_every_n_steps))
 
         # ── per-step series ──────────────────────────────────────────────
         self.step_loss     = []     # training loss at each recorded step
-        self.step_ppl      = []     # training perplexity at each recorded step (NEW)
-        self.step_val_loss = []     # validation loss at each recorded step (NEW)
-        self.step_val_ppl  = []     # validation perplexity at each recorded step (NEW)
+        self.step_ppl      = []     # training perplexity at each recorded step
+        self.step_at       = []     # global_step for each step_loss entry
+        self.step_val_loss = []     # validation loss, on its own cadence
+        self.step_val_ppl  = []     # validation perplexity, on its own cadence
+        # D1: val points are sparser than train points, so they need their own
+        # x-axis.  Plotting step_val_loss against its list index would compress
+        # the whole run into the first few percent of the axis.
+        self.step_val_at   = []     # global_step for each step_val_loss entry
 
         # ── per-epoch series ─────────────────────────────────────────────
         self.epoch_loss = []
@@ -296,29 +310,44 @@ class Record_training(L.Callback):
         self._epoch_loss_sum   += loss
         self._epoch_loss_count += 1
 
-        # ── Per-step series — sub-sampled by record_every_n_steps ────────
-        if trainer.global_step % self.record_every_n_steps != 0:
-            return
+        step = trainer.global_step
 
-        self.step_loss.append(loss)
-        # B1: the loss is in BITS (cross_ent_onehot divides by ln 2), so the
-        # matching perplexity is 2**loss.  This was math.exp(loss), which put
-        # panel 3 (train PPL) on a different scale from panel 4 (val PPL, base
-        # 2 via _eval_loss_on_loader) while plotting them side by side.
-        self.step_ppl.append(2.0 ** loss)
+        # ── Train series — FREE, so keep it at full resolution ───────────
+        if step % self.record_every_n_steps == 0:
+            self.step_loss.append(loss)
+            self.step_at.append(step)
+            # B1: the loss is in BITS (cross_ent_onehot divides by ln 2), so
+            # the matching perplexity is 2**loss.  This was math.exp(loss),
+            # which put panel 3 (train PPL) on a different scale from panel 4
+            # (val PPL, base 2) while plotting them side by side.
+            self.step_ppl.append(2.0 ** loss)
 
-        # ── Validation loss at this step ─────────────────────────────────
+        # ── Validation — EXPENSIVE, so gate it separately (D1) ───────────
+        # This is the whole of the D1 speedup: a full pass over the val set was
+        # running at every gradient step.  Measured overhead of that, against
+        # training with no validation recording at all: 1.63x at QUICK sizes
+        # (10 train / 3 val batches) and 2.58x at LARGE sizes (20 train / 5 val
+        # batches).  The plan estimated 2-4x; the upper half of that is right
+        # for LARGE, the lower for QUICK.
+        #
+        # Note the pq sweep calls train_model WITHOUT a val_loader, so it never
+        # paid this cost and D1 does not speed it up.
         if self.val_loader is not None:
-            val_loss, val_ppl = _eval_loss_on_loader(pl_module, self.val_loader)
-            self.step_val_loss.append(val_loss)
-            self.step_val_ppl.append(val_ppl)
-            pl_module.train()                           # ensure still in train mode
+            if step % self.val_every_n_steps == 0:
+                val_loss, val_ppl = _eval_loss_on_loader(pl_module, self.val_loader)
+                self.step_val_loss.append(val_loss)
+                self.step_val_ppl.append(val_ppl)
+                self.step_val_at.append(step)
+                pl_module.train()                       # ensure still in train mode
+        else:
+            # Fall back to whatever Lightning logged, on the train cadence.
+            if step % self.record_every_n_steps == 0:
+                val_loss_metric = trainer.callback_metrics.get("val_loss", None)
+                if val_loss_metric is not None:
+                    self.val_loss.append(val_loss_metric.detach().float().cpu().item())
 
-        # ── Optional legacy Lightning val metric ─────────────────────────
-        if self.val_loader is None:                     # fall back to logged metric
-            val_loss_metric = trainer.callback_metrics.get("val_loss", None)
-            if val_loss_metric is not None:
-                self.val_loss.append(val_loss_metric.detach().float().cpu().item())
+        if step % self.record_every_n_steps != 0:
+            return
 
         # ── Optional heavy data ──────────────────────────────────────────
         if self.record_latents or self.record_probs:
@@ -359,6 +388,7 @@ def train_model(
     val_loader       = None,
     n_layers:  int   = 2,
     accelerator: str = "auto",
+    val_every_n_steps: int = 25,
 ):
     """
     Trains a OneHotDecoder and returns a Record_training object.
@@ -393,6 +423,7 @@ def train_model(
         record_probs=False,
         max_batches_per_epoch=None,
         val_loader=val_loader,
+        val_every_n_steps=val_every_n_steps,   # D1
     )
 
     # A note on reproducibility (A2).  Seeding makes the forward and backward
@@ -488,6 +519,7 @@ def train_test_val_pipeline(
     seed:        int   = 0,
     n_layers:    int   = 2,
     accelerator: str   = "auto",
+    val_every_n_steps: int = 25,
 ):
     """
     Full cross-validation pipeline with step-level training + validation curves.
@@ -594,6 +626,7 @@ def train_test_val_pipeline(
             val_loader=fold_val_loader,
             n_layers=n_layers,            # B11
             accelerator=accelerator,
+            val_every_n_steps=val_every_n_steps,   # D1
         )
         all_recorders.append(recorder)
 
@@ -661,14 +694,18 @@ def train_test_val_pipeline(
     for i, rec in enumerate(all_recorders):
         is_best = (i == best_fold)
         if rec.step_val_loss:
+            # D1: val runs on its own cadence -> use the recorded step index.
+            xs = getattr(rec, "step_val_at", None) or range(len(rec.step_val_loss))
             ax2.plot(
-                rec.step_val_loss,
+                list(xs), rec.step_val_loss,
                 color=line_colors[i],
                 linewidth=2.5 if is_best else 1.0,
                 alpha=1.0 if is_best else 0.40,
+                marker="." if len(rec.step_val_loss) < 120 else None, ms=3,
                 label=fold_labels[i] + (" ★" if is_best else ""),
             )
-    ax2.set_title("Validation Loss / Step", fontsize=12, fontweight="bold")
+    ax2.set_title(f"Validation Loss / Step  (every {val_every_n_steps} steps)",
+                  fontsize=12, fontweight="bold")
     ax2.set_xlabel("Gradient Step")
     ax2.set_ylabel("Val Loss (bits)")
     ax2.legend(fontsize=8, ncol=2)
@@ -696,14 +733,17 @@ def train_test_val_pipeline(
     for i, rec in enumerate(all_recorders):
         is_best = (i == best_fold)
         if rec.step_val_ppl:
+            xs = getattr(rec, "step_val_at", None) or range(len(rec.step_val_ppl))
             ax4.plot(
-                rec.step_val_ppl,
+                list(xs), rec.step_val_ppl,
                 color=line_colors[i],
                 linewidth=2.5 if is_best else 1.0,
                 alpha=1.0 if is_best else 0.40,
+                marker="." if len(rec.step_val_ppl) < 120 else None, ms=3,
                 label=fold_labels[i] + (" ★" if is_best else ""),
             )
-    ax4.set_title("Validation Perplexity / Step", fontsize=12, fontweight="bold")
+    ax4.set_title(f"Validation Perplexity / Step  (every {val_every_n_steps} steps)",
+                  fontsize=12, fontweight="bold")
     ax4.set_xlabel("Gradient Step")
     ax4.set_ylabel("Val Perplexity")
     ax4.legend(fontsize=8, ncol=2)
@@ -804,4 +844,5 @@ def train_test_val_pipeline(
         "all_recorders" : all_recorders,
         "seed"          : seed,
         "n_layers"      : n_layers,
+        "val_every_n_steps": val_every_n_steps,
     }

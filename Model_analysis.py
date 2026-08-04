@@ -69,8 +69,9 @@ from utils import (            # noqa: F401  -- deliberate re-export
 # results/models/*.pt by save_weights, and latents are cheap to re-extract
 # from those weights.  See IMPROVEMENT_PLAN.md Phase 0.3.
 _DROP_KEYS      = ("latents", "flat_lat", "flat_inp", "inputs_arr")
-_RECORDER_SERIES = ("step_loss", "step_ppl", "step_val_loss",
-                    "step_val_ppl", "epoch_loss", "val_loss")
+_RECORDER_SERIES = ("step_loss", "step_ppl", "step_at",
+                    "step_val_loss", "step_val_ppl", "step_val_at",
+                    "epoch_loss", "val_loss")
 
 
 def _recorder_curves(rec):

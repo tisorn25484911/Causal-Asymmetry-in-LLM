@@ -363,3 +363,87 @@ def test_random_sampling_is_without_replacement_and_seeded():
     assert not np.array_equal(a, c)                 # seed matters
     pairs = {(int(r[0]), int(r[1])) for r in a}
     assert len(pairs) == len(a)                     # no duplicates
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Recording cadence — D1 + B12
+# ─────────────────────────────────────────────────────────────────────────────
+class _FakeTrainer:
+    def __init__(self):
+        self.global_step = 0
+        self.callback_metrics = {}
+
+
+def _drive_recorder(rec, n_steps, epochs=1):
+    """Feed a Record_training synthetic steps without running Lightning."""
+    tr = _FakeTrainer()
+    per_epoch = n_steps // epochs
+    for e in range(epochs):
+        for i in range(per_epoch):
+            loss = torch.tensor(1.0 + 0.001 * tr.global_step)
+            rec.on_train_batch_end(tr, None, loss, None, i)
+            tr.global_step += 1
+        rec.on_train_epoch_end(tr, None)
+    return rec
+
+
+def test_train_curve_stays_full_resolution_while_val_is_subsampled():
+    """
+    D1.  The training loss is already computed, so recording it is free; only
+    the validation pass is expensive.  Gating them together (the plan's literal
+    record_every_n_steps=25) would leave QUICK with 4 points per curve.
+    """
+    from Training_model import Record_training
+    rec = Record_training(record_every_n_steps=1, val_every_n_steps=25,
+                          val_loader=None)
+    _drive_recorder(rec, n_steps=100)
+    assert len(rec.step_loss) == 100          # free series: every step
+    assert rec.step_at == list(range(100))
+
+
+def test_epoch_loss_is_a_true_epoch_mean_at_any_stride():
+    """
+    B12 regression, and the reason B12 had to land before D1: epoch_loss must
+    average EVERY step, not only recorded ones.
+    """
+    from Training_model import Record_training
+    for stride in (1, 7, 25):
+        rec = Record_training(record_every_n_steps=stride, val_loader=None)
+        _drive_recorder(rec, n_steps=60, epochs=3)
+        assert len(rec.epoch_loss) == 3, "one entry per epoch regardless of stride"
+        # every step contributed: mean of 1.0 + 0.001*step over each 20-step epoch
+        expected = [np.mean([1.0 + 0.001 * (e * 20 + i) for i in range(20)])
+                    for e in range(3)]
+        assert np.allclose(rec.epoch_loss, expected), (
+            f"stride={stride}: epoch_loss became the mean over recorded steps only")
+
+
+def test_val_cadence_records_its_own_x_axis():
+    """Without step_val_at, a sparse val curve plotted against its list index
+    would compress the run into the first few percent of the axis."""
+    from Training_model import Record_training
+
+    class _Loader:                      # minimal 1-batch loader
+        def __iter__(self):
+            yield (torch.zeros(2, 4, dtype=torch.long),
+                   torch.zeros(2, 4, dtype=torch.long))
+
+    class _M(torch.nn.Module):
+        mode = "forward"
+        def __init__(s):
+            super().__init__(); s.p = torch.nn.Parameter(torch.zeros(1))
+        def forward(s, x):
+            return torch.zeros(x.shape[0], x.shape[1], 3)
+        def train(s, mode=True):
+            return s
+
+    rec = Record_training(record_every_n_steps=1, val_every_n_steps=10,
+                          val_loader=_Loader())
+    tr = _FakeTrainer()
+    m = _M()
+    for i in range(50):
+        rec.on_train_batch_end(tr, m, torch.tensor(1.0), None, i)
+        tr.global_step += 1
+    assert rec.step_val_at == [0, 10, 20, 30, 40]
+    assert len(rec.step_val_loss) == len(rec.step_val_at)
+    assert len(rec.step_loss) == 50            # train curve untouched

@@ -226,10 +226,16 @@ def plot_loss_theory(rec_fw, rec_bw, theory_fw, theory_bw, title="", save_path=N
         ["FW val", "BW val"], ["steelblue", "darkorange"]
     ):
         if rec.step_val_loss:
-            ax2.plot(rec.step_val_loss, color=col, lw=1.0, alpha=0.75, label=lbl)
+            # D1: validation is recorded on its own, sparser cadence, so plot
+            # it against the recorded global_step.  Plotting against the list
+            # index would squeeze the whole run into the first few percent of
+            # the axis and make it look as if training stopped early.
+            xs = getattr(rec, "step_val_at", None) or range(len(rec.step_val_loss))
+            ax2.plot(list(xs), rec.step_val_loss, color=col, lw=1.0,
+                     alpha=0.75, marker=".", ms=3, label=lbl)
         if th == th:
             ax2.axhline(th, color=col, ls="--", lw=1.5, alpha=0.6, label=f"H∞ {lbl[:2]}={th:.4f}")
-    ax2.set_xlabel("Step"); ax2.set_ylabel("Val Loss (bits)")
+    ax2.set_xlabel("Gradient step"); ax2.set_ylabel("Val Loss (bits)")
     ax2.set_title(f"Validation Loss — {title}", fontweight="bold")
     ax2.legend(fontsize=8); ax2.grid(True, alpha=0.3)
 
@@ -439,6 +445,7 @@ def experiment_1(cfg, out_root, all_results):
         max_epochs=cfg["coin_max_epochs"], lr=cfg["lr"], mode="forward",
         save_plot=os.path.join(odir, f"{tag}_fw_cv.png"), seed=seed,
         n_layers=cfg["n_layers"], accelerator=cfg["accelerator"],
+        val_every_n_steps=cfg["val_every_n_steps"],
     )
     cleanup()  # FIX-4
 
@@ -450,6 +457,7 @@ def experiment_1(cfg, out_root, all_results):
         max_epochs=cfg["coin_max_epochs"], lr=cfg["lr"], mode="backward",  # forward data → backward model
         save_plot=os.path.join(odir, f"{tag}_bw_cv.png"), seed=seed,
         n_layers=cfg["n_layers"], accelerator=cfg["accelerator"],
+        val_every_n_steps=cfg["val_every_n_steps"],
     )
     cleanup()  # FIX-4
 
@@ -529,6 +537,7 @@ def experiment_1_2(cfg, out_root, all_results):
         max_epochs=cfg["coin_max_epochs"], lr=cfg["lr"], mode="forward",
         save_plot=os.path.join(odir, f"{tag}_fw_cv.png"), seed=seed,
         n_layers=cfg["n_layers"], accelerator=cfg["accelerator"],
+        val_every_n_steps=cfg["val_every_n_steps"],
     )
     cleanup()
     cv_bw = train_test_val_pipeline(
@@ -538,6 +547,7 @@ def experiment_1_2(cfg, out_root, all_results):
         max_epochs=cfg["coin_max_epochs"], lr=cfg["lr"], mode="backward",  # forward data → backward model
         save_plot=os.path.join(odir, f"{tag}_bw_cv.png"), seed=seed,
         n_layers=cfg["n_layers"], accelerator=cfg["accelerator"],
+        val_every_n_steps=cfg["val_every_n_steps"],
     )
     cleanup()
 
@@ -698,6 +708,7 @@ def experiment_2(cfg, out_root, all_results, n, m, role):
         max_epochs=cfg["flower_max_epochs"], lr=cfg["lr"], mode="forward",
         save_plot=os.path.join(odir, f"{tag}_fw_cv.png"), seed=seed,
         n_layers=cfg["n_layers"], accelerator=cfg["accelerator"],
+        val_every_n_steps=cfg["val_every_n_steps"],
     )
     cleanup()
 
@@ -709,6 +720,7 @@ def experiment_2(cfg, out_root, all_results, n, m, role):
         max_epochs=cfg["flower_max_epochs"], lr=cfg["lr"], mode="backward",  # forward data → backward model
         save_plot=os.path.join(odir, f"{tag}_bw_cv.png"), seed=seed,
         n_layers=cfg["n_layers"], accelerator=cfg["accelerator"],
+        val_every_n_steps=cfg["val_every_n_steps"],
     )
     cleanup()
 

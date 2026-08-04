@@ -37,6 +37,12 @@ BASE = dict(
     embed_type       = "onehot",
     n_folds          = 5,
     n_layers         = 2,
+    # D1: the train-loss curve stays at every step (free -- the loss is
+    # already computed); only the expensive validation pass is sub-sampled.
+    # Measured overhead of validating every step, vs not validating at all:
+    # 1.63x at QUICK sizes and 2.58x at LARGE sizes.  Note the pq sweep trains
+    # without a val_loader, so it never paid this and D1 does not speed it up.
+    val_every_n_steps = 25,
     # "auto" uses Apple MPS here, which is ~6x faster than CPU at these sizes
     # but is NOT bit-reproducible across runs (see Training_model.train_model).
     # Pairing of the two arms is unaffected.  Set "cpu" for an exactly
@@ -95,6 +101,7 @@ SMOKE = _cfg(
     attn_vis_len        = 32,
     ana_batch           = 4,
     max_batches         = 2,
+    val_every_n_steps   = 5,     # SMOKE folds are only ~15 steps long
     umap_n_pts          = 200,
     coin_p1             = 0.4,  coin_q1             = 0.8,
     coin_num_samples    = 40,   coin_seq_len        = 200,

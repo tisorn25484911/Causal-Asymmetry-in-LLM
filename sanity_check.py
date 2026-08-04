@@ -107,6 +107,7 @@ except Exception as _e:
 CFG = dict(
     seed           = 0,
     accelerator    = "auto",   # see configs.py / train_model on MPS determinism
+    val_every_n_steps = 25,    # D1: validation cadence (train curve stays at 1)
     d_model        = 64,
     embed_type     = "onehot",
     n_folds        = 5,
@@ -215,14 +216,18 @@ def plot_loss_theory(rec_fw, rec_bw, h_inf, title="", save_path=None):
     ax.grid(True, alpha=0.3)
 
     ax = axes[2]
-    vl_fw = np.array(rec_fw.step_val_loss)
-    vl_bw = np.array(rec_bw.step_val_loss)
-    nv = min(len(vl_fw), len(vl_bw))
-    ax.plot(vl_fw[:nv], color="#4c72b0", lw=1,   label="Forward val")
-    ax.plot(vl_bw[:nv], color="#dd8452", lw=1,   label="Backward val")
+    # D1: validation has its own cadence -> plot against the recorded step.
+    for rec, col, lbl in [(rec_fw, "#4c72b0", "Forward val"),
+                          (rec_bw, "#dd8452", "Backward val")]:
+        vl = np.asarray(rec.step_val_loss, dtype=float)
+        if vl.size == 0:
+            continue
+        xs = getattr(rec, "step_val_at", None) or list(range(len(vl)))
+        ax.plot(list(xs)[:len(vl)], vl, color=col, lw=1, marker=".", ms=3,
+                label=lbl)
     ax.axhline(h_inf, color="crimson", ls="--", lw=1.5,
                label=f"H∞ = {h_inf:.4f}")
-    ax.set_xlabel("Step"); ax.set_ylabel("Val CE loss (bits)")
+    ax.set_xlabel("Gradient step"); ax.set_ylabel("Val CE loss (bits)")
     ax.set_title("Validation loss", fontweight="bold")
     ax.legend(fontsize=8); ax.grid(True, alpha=0.3)
 
@@ -464,6 +469,7 @@ def exp_coin(cfg, out_root):
         d_model=cfg["d_model"], max_len=max_len,
         max_epochs=cfg["coin_max_epochs"], lr=cfg["lr"], mode="forward",
         save_plot=os.path.join(odir, f"{tag}_fw_cv.png"), seed=cfg["seed"], accelerator=cfg["accelerator"],
+        val_every_n_steps=cfg["val_every_n_steps"],
     ); cleanup()
 
     # Backward model
@@ -474,6 +480,7 @@ def exp_coin(cfg, out_root):
         d_model=cfg["d_model"], max_len=max_len,
         max_epochs=cfg["coin_max_epochs"], lr=cfg["lr"], mode="backward",
         save_plot=os.path.join(odir, f"{tag}_bw_cv.png"), seed=cfg["seed"], accelerator=cfg["accelerator"],
+        val_every_n_steps=cfg["val_every_n_steps"],
     ); cleanup()
 
     # Analyse
@@ -582,6 +589,7 @@ def exp_flower(cfg, out_root):
         d_model=cfg["d_model"], max_len=max_len,
         max_epochs=cfg["flower_max_epochs"], lr=cfg["lr"], mode="forward",
         save_plot=os.path.join(odir, f"{tag}_fw_cv.png"), seed=cfg["seed"], accelerator=cfg["accelerator"],
+        val_every_n_steps=cfg["val_every_n_steps"],
     ); cleanup()
 
     # Backward model
@@ -592,6 +600,7 @@ def exp_flower(cfg, out_root):
         d_model=cfg["d_model"], max_len=max_len,
         max_epochs=cfg["flower_max_epochs"], lr=cfg["lr"], mode="backward",
         save_plot=os.path.join(odir, f"{tag}_bw_cv.png"), seed=cfg["seed"], accelerator=cfg["accelerator"],
+        val_every_n_steps=cfg["val_every_n_steps"],
     ); cleanup()
 
     # Analyse
