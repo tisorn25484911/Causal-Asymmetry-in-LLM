@@ -32,3 +32,7 @@ numba==0.66.0          # transitively required by umap; pinned because it gates 
 
 matplotlib==3.10.8
 pandas==3.0.1          # used by lightning's CSVLogger
+
+# Test suite (pytest tests/) added in Phase 1/2: regression tests for the
+# closed forms and the loss path, including the B3 silent-NaN case.
+pytest==9.1.1
