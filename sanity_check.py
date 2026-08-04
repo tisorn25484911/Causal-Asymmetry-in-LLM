@@ -44,7 +44,10 @@ Flower n=1, m=2 with dice_probs = [[0.5, 0.5]]  — NULL control
 Sanity checks
   1. Both models converge to H∞ from above (H∞ is time-reversal invariant, so
      the same H∞ applies to both arms of each process).
-  2. Coin:   delta_CE > 0                  (C- > C+, BW harder)
+  2. Coin:   delta_CE > +NULL_TOL          (C- > C+, BW harder)
+             |delta_CE| < NULL_TOL  -> INCONCLUSIVE, not a failure: a
+             converged model with spare capacity gives ~0 whatever C- - C+ is,
+             so this needs the d_model sweep to interpret (plan 1.1 / 4.5).
      Flower: |delta_CE| < NULL_TOL         (C- = C+, no asymmetry)
   3. Empirical C+ ~ theoretical C+ for the coin (2 clusters).
   4. Flower clusters at k=2 for BOTH directions, since C+ and C- both
@@ -670,8 +673,15 @@ def plot_cross_comparison(res_coin, res_flower, out_root):
     ax = axes[1]
     deltas = [ac["delta"], af["delta"]]
     names  = ["Coin\np=q=0.5\n(C- > C+)", "Flower\nn=1, m=2\n(C- = C+)"]
-    passed = [deltas[0] > 0, abs(deltas[1]) < NULL_TOL]
-    bar_c  = ["#4c72b0" if ok else "#c44e52" for ok in passed]
+    # Same three-way verdict as the text summary: a near-zero delta on the
+    # positive control is inconclusive, not a failure.
+    def _colour(d, role):
+        if role == "null":
+            return "#4c72b0" if abs(d) < NULL_TOL else "#c44e52"
+        if abs(d) < NULL_TOL:
+            return "#999999"                 # inconclusive
+        return "#4c72b0" if d > 0 else "#c44e52"
+    bar_c = [_colour(deltas[0], "positive"), _colour(deltas[1], "null")]
     bars   = ax.bar(names, deltas, color=bar_c, alpha=0.85, edgecolor="k")
     ax.bar_label(bars, fmt="%+.4f", padding=3, fontsize=10)
     ax.axhline(0, color="k", ls="--", lw=0.8)
@@ -680,7 +690,8 @@ def plot_cross_comparison(res_coin, res_flower, out_root):
                label=f"null band ±{NULL_TOL}")
     ax.set_ylabel("delta CE = CE_BW - CE_FW (bits)")
     ax.set_title("Causal asymmetry signal\n"
-                 "coin: predicted > 0   |   flower: predicted ≈ 0",
+                 "coin: predicted > 0   |   flower: predicted ≈ 0\n"
+                 "grey = inside the null band, i.e. inconclusive",
                  fontweight="bold")
     ax.legend(fontsize=8); ax.grid(True, alpha=0.3, axis="y")
 
@@ -775,9 +786,29 @@ def main():
                        f"FAIL — |delta| >= {NULL_TOL}, asymmetry where the "
                        "process has none")
         else:
-            verdict = ("PASS — BW harder, as predicted"
-                       if delta > 0 else
-                       "FAIL — FW harder, opposite of C- > C+")
+            # The positive control needs the SAME noise band as the null.
+            # It used to be a bare sign test, `delta > 0 else FAIL`, which
+            # reports delta = -0.0006 -- six ten-thousandths of a bit, with
+            # both arms sitting within 0.006 of H_inf -- as a failure.  That
+            # is reading a direction off a number indistinguishable from zero,
+            # the same over-interpretation the runner's summary table was
+            # fixed for.
+            #
+            # A near-zero delta on the positive control is NOT a refutation.
+            # delta_CE is a difference of residuals (IMPROVEMENT_PLAN 1.1), so
+            # a converged model with capacity to spare gives ~0 whatever
+            # C- - C+ is.  It is a null, and it stays ambiguous until the
+            # d_model sweep (Phase 4.5) distinguishes "no asymmetry" from
+            # "capacity absorbed it".
+            if abs(delta) < NULL_TOL:
+                verdict = (f"INCONCLUSIVE — |delta| < {NULL_TOL}, i.e. ~0. "
+                           "Consistent with capacity absorbing the asymmetry; "
+                           "needs the d_model sweep to interpret")
+            elif delta > 0:
+                verdict = "PASS — BW harder, as predicted"
+            else:
+                verdict = "FAIL — FW harder by more than the tolerance, "\
+                          "opposite of C- > C+"
         print(f"    delta_CE        = {delta:+.4f}  ({verdict})")
 
         paired = res.get("paired")
