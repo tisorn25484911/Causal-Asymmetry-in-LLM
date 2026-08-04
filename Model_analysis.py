@@ -111,6 +111,49 @@ def slim_results(obj):
     return obj
 
 
+def paired_delta_ce(cv_fw, cv_bw, label=""):
+    """
+    Paired delta-CE = CE_BW - CE_FW, fold by fold, on the held-out test set.
+
+    This is only meaningful because A2 made the two arms paired: with the same
+    seed, fold k of the forward run and fold k of the backward run share a
+    hold-out test set, fold membership, batch order and weight init, so their
+    difference isolates the mask/convention change.  Before A2 the two arms had
+    different splits, and differencing them mixed the effect with split noise
+    of unknown size -- for an effect expected to be a few hundredths of a bit.
+
+    Reports the mean paired difference with its standard error across folds and
+    a paired t-statistic.  Note the caveat in IMPROVEMENT_PLAN.md 1.1/4.2: five
+    folds of one seed share a training set, so this quantifies fold-to-fold
+    variability, NOT sampling variability over datasets.  It is a lower bound
+    on the uncertainty, and the seed-repeat harness (Phase 4.2) is what turns
+    it into evidence.
+    """
+    fw = np.asarray(cv_fw.get("fold_test_loss", []), dtype=float)
+    bw = np.asarray(cv_bw.get("fold_test_loss", []), dtype=float)
+    if fw.size == 0 or fw.size != bw.size:
+        return None
+
+    if cv_fw.get("seed") != cv_bw.get("seed"):
+        print("  ! paired_delta_ce: arms were run with different seeds "
+              f"({cv_fw.get('seed')} vs {cv_bw.get('seed')}) — NOT paired")
+
+    d    = bw - fw
+    n    = d.size
+    mean = float(d.mean())
+    sd   = float(d.std(ddof=1)) if n > 1 else 0.0
+    sem  = sd / np.sqrt(n) if n > 1 else float("nan")
+    t    = mean / sem if sem and np.isfinite(sem) and sem > 0 else float("nan")
+
+    print(f"\n  Paired delta-CE (BW - FW) over {n} folds{' — ' + label if label else ''}")
+    for k, (a, b) in enumerate(zip(fw, bw)):
+        print(f"    fold {k+1}: CE_FW={a:.4f}  CE_BW={b:.4f}  delta={b-a:+.4f}")
+    print(f"    mean={mean:+.4f}  sd={sd:.4f}  sem={sem:.4f}  t={t:+.2f}")
+
+    return dict(fold_ce_fw=fw.tolist(), fold_ce_bw=bw.tolist(),
+                fold_delta=d.tolist(), mean=mean, sd=sd, sem=sem, t=t, n=n)
+
+
 def _sub(arr: np.ndarray, n: int = 1000) -> tuple:
     """Return (latent_subset, index_array) — first n rows, no shuffle."""
     n = min(n, len(arr))

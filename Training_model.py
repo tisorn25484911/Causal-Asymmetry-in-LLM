@@ -1,3 +1,5 @@
+import random
+
 import lightning as L
 from OneHot_model import OneHotDecoder, WordEmbDecoder, cross_ent_onehot
 import torch
@@ -12,31 +14,98 @@ import numpy as np
 # ─────────────────────────────────────────────────────────────────────────────
 # class and functions for large training sequence
 # ────────────────────────────────────────────────────────────────────────────
+def set_seed(seed: int = 0) -> int:
+    """
+    Seed every global RNG this repo draws from, and return the seed.
+
+    Covers `random`, `numpy.random` (which `coin_generation` and
+    `flower_process_generation` use via np.random.rand / randint / choice)
+    and `torch` (model init, DataLoader shuffling, random_split).  Call this
+    at the top of every runner so a run is reproducible end to end.
+
+    IMPROVEMENT_PLAN.md A2.  Note this is necessary but not sufficient on its
+    own: the pairing of the forward and backward arms also needs the seeded
+    `random_split` and the deterministic `ChunckDataset` below, because a
+    global seed does not stop the forward run from *advancing* a shared RNG
+    before the backward run starts.
+    """
+    random.seed(seed)
+    np.random.seed(seed)
+    torch.manual_seed(seed)
+    if torch.cuda.is_available():
+        torch.cuda.manual_seed_all(seed)
+    return seed
+
+
 class ChunckDataset(tud.Dataset):
+    """
+    Fixed-length windows into a dataset of longer sequences.
+
+    Each sequence gets ONE window, chosen once at construction from `seed`.
+    `__getitem__` is therefore a pure function of `idx` -- IMPROVEMENT_PLAN.md
+    A2.
+
+    Why this changed.  The offsets used to come from a single stateful
+    `np.random.default_rng(seed)` consumed at access time, which had three
+    consequences, none of them intended:
+
+      * The forward and backward pipelines were handed the *same* loader
+        object.  The forward run advanced the generator, so the backward run
+        trained on different windows of the same sequences -- and the headline
+        number is a difference between the two arms, expected to be a few
+        hundredths of a bit.
+      * `sample_seq = next(iter(loader_fw))[0][0]` in the runners advanced it
+        once more before either arm started.
+      * Validation re-drew fresh windows at *every* recorded step, so the
+        step_val_loss curve carried window noise on top of learning signal,
+        and "best fold" was selected partly on which fold drew easy windows.
+
+    The cost is that a sequence now only ever contributes one window instead
+    of a new one each epoch.  That is a deliberate trade: exact pairing of the
+    two arms is what the whole study rests on, whereas the lost window
+    diversity is recoverable by generating more sequences.
+    """
+
     def __init__(self, base: tud.Dataset, chunck_len: int, seed: int = 0):
         self.base = base
         self.chunck_len = chunck_len
-        self.rng = np.random.default_rng(seed)
+        self.seed = seed
+
+        # One offset per sequence, drawn once, in index order so the table is
+        # a pure function of (seed, sequence lengths) and independent of the
+        # order in which items are later requested.
+        rng = np.random.default_rng(seed)
+        self.offsets = []
+        for i in range(len(base)):
+            inp, _ = base[i]
+            T = inp.shape[0]
+            span = T - chunck_len + 1
+            self.offsets.append(0 if span <= 1 else int(rng.integers(0, span)))
+
     def __len__(self):
         return len(self.base)
+
     def __getitem__(self, idx):
-        input, target = self.base[idx] #(T, )
-        T = input.shape[0] # length T of the sequence
+        input, target = self.base[idx]          # (T,)
+        T = input.shape[0]
         if T <= self.chunck_len:
             return input, target
-        start = self.rng.integers(0, T - self.chunck_len +1)
-        end = start + self.chunck_len
+        start = self.offsets[idx]
+        end   = start + self.chunck_len
         return input[start:end], target[start:end]
-    
+
+
 def make_chunked_loader(
-    dataset: tud.Dataset, chunk_len: int, batch_size: int, shuffle: bool = True
+    dataset: tud.Dataset, chunk_len: int, batch_size: int,
+    shuffle: bool = True, seed: int = 0,
 ) -> tud.DataLoader:
     return tud.DataLoader(
-        ChunckDataset(dataset, chunk_len),
+        ChunckDataset(dataset, chunk_len, seed=seed),
         batch_size=batch_size,
         shuffle=shuffle,
-        num_workers=0,             
-        persistent_workers=False,  
+        generator=torch.Generator().manual_seed(seed) if shuffle else None,
+        num_workers=0,
+        persistent_workers=False,
     )
 def _loader(dataset: tud.Dataset, batch_size: int, shuffle: bool = False) -> tud.DataLoader:
     """Plain loader — FIX-3 only (no chunking; used for analysis)."""
@@ -288,8 +357,18 @@ def train_model(
 # Utility: initial train/test split
 # ─────────────────────────────────────────────────────────────────────────────
 def test_train_validation(
-    train_loader, test_ratio, train_ratio
+    train_loader, test_ratio, train_ratio, seed: int = 0
 ) -> tuple[torch.utils.data.DataLoader, torch.utils.data.DataLoader]:
+    """
+    Hold-out split.  `seed` is required for the forward and backward arms to
+    receive the SAME hold-out test set -- IMPROVEMENT_PLAN.md A2.
+
+    `random_split` used to be called with no `generator=`, so it consumed the
+    global torch RNG.  This function is called once per direction, so the two
+    arms drew different test sets and different train/val pools.  Seeding the
+    fold *permutation* (which was already done) does not help, because the
+    pool being permuted was itself different.
+    """
     if test_ratio + train_ratio != 1.0:
         s = test_ratio + train_ratio
         test_ratio  /= s
@@ -304,12 +383,14 @@ def test_train_validation(
     print(f"Splitting into: {num_train} train, {num_test} test samples")
 
     train_set, test_set = torch.utils.data.random_split(
-        train_loader.dataset, [num_train, num_test]
+        train_loader.dataset, [num_train, num_test],
+        generator=torch.Generator().manual_seed(seed),
     )
     print(f"Actual split sizes: Train={len(train_set)}, Test={len(test_set)}")
 
     train_loader_out = torch.utils.data.DataLoader(
-        train_set, batch_size=train_loader.batch_size, shuffle=True
+        train_set, batch_size=train_loader.batch_size, shuffle=True,
+        generator=torch.Generator().manual_seed(seed),
     )
     test_loader_out = torch.utils.data.DataLoader(
         test_set, batch_size=train_loader.batch_size, shuffle=False
@@ -332,9 +413,18 @@ def train_test_val_pipeline(
     lr:          float = 1e-2,
     mode:        str   = "forward",
     save_plot:   str   = "cv_results.png",
+    seed:        int   = 0,
 ):
     """
     Full cross-validation pipeline with step-level training + validation curves.
+
+    `seed` makes the forward and backward arms *paired* -- IMPROVEMENT_PLAN.md
+    A2.  Called twice with the same seed and the same dataset, the two arms get
+    an identical hold-out test set, identical fold membership, identical batch
+    order, and identical weight initialisation.  The only remaining difference
+    is the one under study: the attention mask and the batch convention.  That
+    turns delta-CE from an unpaired comparison contaminated by split noise into
+    a paired one where per-fold differences are meaningful.
 
     Returns
     -------
@@ -342,12 +432,14 @@ def train_test_val_pipeline(
         best_fold      - 0-based index of the winning fold
         best_recorder  - Record_training from the best fold
         best_model     - trained model from the best fold
-        fold_val_loss  - list[float]: mean val loss per fold
-        fold_val_ppl   - list[float]: mean val perplexity per fold
-        fold_test_ppl  - list[float]: test PPL for *every* fold model (NEW)
+        fold_val_loss  - list[float]: val CE (bits) per fold
+        fold_val_ppl   - list[float]: val perplexity per fold
+        fold_test_loss - list[float]: test CE (bits) for *every* fold model
+        fold_test_ppl  - list[float]: test PPL for *every* fold model
         test_loss      - float: test CE loss for the best-fold model
         test_ppl       - float: test perplexity for the best-fold model
         all_recorders  - list of all fold recorders
+        seed           - the seed used, so a paired comparison can assert on it
     """
     import matplotlib
     matplotlib.use("Agg")
@@ -363,7 +455,7 @@ def train_test_val_pipeline(
     # ── 1. Hold-out test split ───────────────────────────────────────────
     print(f"Initial split ratios: test={test}, train_val={train_val}")
     trainval_loader, test_loader = test_train_validation(
-        train_loader, test_ratio=test, train_ratio=train_val
+        train_loader, test_ratio=test, train_ratio=train_val, seed=seed
     )
     trainval_set = trainval_loader.dataset
     test_set     = test_loader.dataset
@@ -378,13 +470,13 @@ def train_test_val_pipeline(
     print(f"  Train+Val pool   : {n_trainval}")
     print(f"  Folds            : {n_folds}")
     print(f"  Mode             : {mode}  |  embed: {embed_type}")
-    print(f"  d_model={d_model}  max_epochs={max_epochs}  lr={lr}")
+    print(f"  d_model={d_model}  max_epochs={max_epochs}  lr={lr}  seed={seed}")
     print(f"{'='*65}\n")
 
     # ── 2. n-fold cross-validation ───────────────────────────────────────
     fold_size     = n_trainval // n_folds
     indices       = torch.randperm(
-        n_trainval, generator=torch.Generator().manual_seed(0)
+        n_trainval, generator=torch.Generator().manual_seed(seed)
     ).tolist()
 
     fold_val_loss  = []
@@ -401,13 +493,18 @@ def train_test_val_pipeline(
         fold_val   = torch.utils.data.Subset(trainval_set, val_idx)
 
         fold_train_loader = torch.utils.data.DataLoader(
-            fold_train, batch_size=batch_size, shuffle=True
+            fold_train, batch_size=batch_size, shuffle=True,
+            generator=torch.Generator().manual_seed(seed + fold),
         )
         fold_val_loader = torch.utils.data.DataLoader(
             fold_val, batch_size=batch_size, shuffle=False
         )
 
         print(f"  Train samples: {len(fold_train)}  |  Val samples: {len(fold_val)}")
+
+        # Identical weight init across directions for this fold, so the paired
+        # difference is not partly an initialisation difference (A2).
+        torch.manual_seed(seed * 1000 + fold)
 
         # ── Train – pass the val loader so step-level val is recorded ──
         recorder = train_model(
@@ -623,8 +720,10 @@ def train_test_val_pipeline(
         "best_model"    : best_model,
         "fold_val_loss" : fold_val_loss,
         "fold_val_ppl"  : fold_val_ppl,
-        "fold_test_ppl" : fold_test_ppl,      
+        "fold_test_loss": fold_test_loss,     # per-fold CE in bits — needed for
+        "fold_test_ppl" : fold_test_ppl,      # the paired delta-CE (A2)
         "test_loss"     : test_loss,
         "test_ppl"      : test_ppl,
         "all_recorders" : all_recorders,
+        "seed"          : seed,
     }
