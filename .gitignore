@@ -36,3 +36,5 @@ env/
 .DS_Store
 .claude/settings.local.json
 *.code-workspace
+# Run logs from the Phase 1.9 re-runs
+run_*.log
