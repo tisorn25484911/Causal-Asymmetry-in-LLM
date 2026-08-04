@@ -732,9 +732,14 @@ def experiment_2(cfg, out_root, all_results, n, m, role):
                   theory, theory, cfg["attn_vis_len"], cfg=cfg)
     paired = paired_delta_ce(cv_fw, cv_bw, label=tag, theory=theory)
     if paired:
-        agrees = (paired["mean"] > 0) == (C_minus > C_plus)
-        print(f"  sign of delta_CE {'MATCHES' if agrees else 'CONTRADICTS'} "
-              f"sign of (C- - C+)  [{role}]")
+        mean, sem = paired["mean"], paired.get("sem", float("nan"))
+        if np.isfinite(sem) and abs(mean) < 2 * sem:
+            print(f"  delta_CE = {mean:+.4f} ± {sem:.4f} — not distinguishable "
+                  f"from zero, so the sign carries no information  [{role}]")
+        else:
+            agrees = (mean > 0) == (C_minus > C_plus)
+            print(f"  sign of delta_CE {'MATCHES' if agrees else 'CONTRADICTS'} "
+                  f"sign of (C- - C+)  [{role}]")
 
     try:
         fig_cx, ax_cx = plt.subplots(figsize=(8, 5))
@@ -830,16 +835,33 @@ def main(argv=None):
 
     # ── Cross-experiment summary: does sign(delta_CE) track sign(C- - C+)? ──
     print(f"\n{'='*70}\n  ASYMMETRY SUMMARY\n{'='*70}")
-    print(f"  {'experiment':<28} {'C+':>7} {'C-':>7} {'C- - C+':>9} "
-          f"{'delta_CE':>10} {'sign':>9}")
+    print(f"  {'experiment':<26} {'C+':>7} {'C-':>7} {'C- - C+':>9} "
+          f"{'delta_CE':>10} {'sem':>8} {'verdict':>10}")
     for tag, r in all_results.items():
         pd = r.get("paired")
         cp, cm = r.get("C_plus"), r.get("C_minus")
         if pd is None or cp is None or cm is None:
             continue
-        agrees = "match" if (pd["mean"] > 0) == (cm > cp) else "MISMATCH"
-        print(f"  {tag:<28} {cp:>7.4f} {cm:>7.4f} {cm-cp:>+9.4f} "
-              f"{pd['mean']:>+10.4f} {agrees:>9}")
+        mean, sem = pd["mean"], pd.get("sem", float("nan"))
+        # Only call a sign when it is distinguishable from zero.  delta_CE is a
+        # difference of residuals (IMPROVEMENT_PLAN.md 1.1): a converged,
+        # sufficient-capacity predictor gives 0 whatever C- - C+ is, so a
+        # near-zero value is a null result, NOT evidence for or against the
+        # sign of C- - C+.  Reading a sign off +0.0006 +/- 0.0011 is exactly
+        # the over-interpretation this repo has been prone to.
+        if np.isfinite(sem) and abs(mean) < 2 * sem:
+            verdict = "n.s."
+        elif (mean > 0) == (cm > cp):
+            verdict = "match"
+        else:
+            verdict = "MISMATCH"
+        print(f"  {tag:<26} {cp:>7.4f} {cm:>7.4f} {cm-cp:>+9.4f} "
+              f"{mean:>+10.4f} {sem:>8.4f} {verdict:>10}")
+    print(f"{'='*70}")
+    print("  n.s. = |delta_CE| < 2 sem, i.e. not distinguishable from zero.")
+    print("  delta_CE is a difference of RESIDUALS, so a converged predictor")
+    print("  with enough capacity gives ~0 regardless of C- - C+.  A null here")
+    print("  is ambiguous until the d_model sweep (plan Phase 4.5) is run.")
     print(f"{'='*70}")
 
     total = (time.time() - t_start) / 60
