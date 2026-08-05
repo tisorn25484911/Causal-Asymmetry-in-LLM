@@ -687,3 +687,79 @@ def test_S_hat_is_entropy_over_recovered_clusters():
     counts = np.bincount(r["labels"], minlength=r["k_hat"]).astype(float)
     assert r["S_hat"] == pytest.approx(entropy_bits(counts / counts.sum()))
     assert r["S_hat"] <= math.log2(r["k_hat"]) + 1e-9      # S <= log2(k)
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Distances on the probability simplex
+# ─────────────────────────────────────────────────────────────────────────────
+def test_distance_matrices_match_reference_implementations():
+    from scipy.spatial.distance import pdist, squareform
+    from Model_analysis import (euclidean_distance_matrix, tv_distance_matrix,
+                                js_distance_matrix)
+    P = np.random.default_rng(0).dirichlet(np.ones(4), size=40)
+    assert np.allclose(euclidean_distance_matrix(P), squareform(pdist(P, "euclidean")))
+    assert np.allclose(tv_distance_matrix(P), squareform(0.5 * pdist(P, "cityblock")))
+    J = js_distance_matrix(P)
+    assert np.isfinite(J).all(), "scipy's jensenshannon returns nan here; ours must not"
+    assert np.allclose(J, J.T)
+    assert np.allclose(np.diag(J), 0.0)
+
+
+def test_js_is_a_bounded_metric():
+    """
+    JS distance = sqrt(JSD) is bounded by 1 bit and satisfies the triangle
+    inequality (Endres & Schindelin 2003) -- the property a distance-threshold
+    clusterer needs and that raw KL does not have.
+    """
+    from Model_analysis import js_distance_matrix
+    P = np.random.default_rng(1).dirichlet(np.ones(5), size=30)
+    J = js_distance_matrix(P)
+    assert J.max() <= 1.0 + 1e-9
+    for i, j, k in [(0,1,2), (3,7,11), (5,9,20)]:
+        assert J[i, k] <= J[i, j] + J[j, k] + 1e-9
+
+
+def test_js_survives_zero_probabilities_where_kl_would_diverge():
+    """A trained model drives probabilities to ~1e-6; KL would be infinite."""
+    from Model_analysis import js_distance_matrix
+    P = np.array([[1.0, 0.0, 0.0],
+                  [0.0, 1.0, 0.0],
+                  [0.5, 0.5, 0.0]])
+    J = js_distance_matrix(P)
+    assert np.isfinite(J).all()
+    assert J[0, 1] == pytest.approx(1.0, abs=1e-6)   # disjoint support -> 1 bit
+
+
+def test_metrics_agree_on_a_clean_two_state_case():
+    from Model_analysis import recover_causal_states
+    rows = [[0.6, 0.4, 0.0], [0.0, 0.2, 0.8], [0.6, 0.4, 0.0]]
+    for metric in ("euclidean", "tv", "js"):
+        r = recover_causal_states(_StubDecoder(rows), _stub_loader(3),
+                                  use_t="last", max_batches=None,
+                                  metric=metric, n_pts=400)
+        assert r["k_hat"] == 2, f"{metric} gave {r['k_hat']}"
+        assert r["metric"] == metric
+
+
+def test_split_indices_reproduce_the_pipeline_split_exactly():
+    """
+    The train/held-out panels are only meaningful if the split is the SAME one
+    training used.  random_split draws randperm(N, generator) and slices it, so
+    it depends only on N and the seed -- not on dataset contents.
+    """
+    import io, contextlib
+    from plot_state_clusters import split_indices
+    from Training_model import test_train_validation, make_chunked_loader
+    from Data_generation import CoinDataset, coin_generation
+
+    set_seed(0)
+    d, _ = coin_generation(num_samples=200, seq_len=300, p=0.4, q=0.8)
+    loader = make_chunked_loader(CoinDataset(d, seq_len=300), 64, 16, seed=0)
+    with contextlib.redirect_stdout(io.StringIO()):
+        tv_loader, te_loader = test_train_validation(loader, 0.20, 0.80, seed=0)
+
+    tr_idx, te_idx = split_indices(200, seed=0, test_ratio=0.20)
+    assert list(tv_loader.dataset.indices) == tr_idx
+    assert list(te_loader.dataset.indices) == te_idx
+    assert set(tr_idx).isdisjoint(te_idx)
+    assert len(te_idx) == 40

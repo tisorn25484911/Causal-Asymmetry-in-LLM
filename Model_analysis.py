@@ -897,8 +897,106 @@ def flower_entropy_rate(n: int, m: int, dice_probs) -> float:
                  + 0.5 * np.mean([entropy_bits(dp[i]) for i in range(n)]))
 
 
+# ── Distances between predictive distributions ─────────────────────────────
+# Points live on the probability simplex Δ^(V-1) = {p >= 0, sum p = 1}: for a
+# 3-token vocabulary that is a triangle in R^3, a 2-D object stored as 3
+# numbers.  Euclidean geometry on that triangle is not the natural geometry of
+# distributions, hence the alternatives.
+#
+# Ranges differ, so a distance THRESHOLD has to be recalibrated per metric:
+#     euclidean  [0, sqrt(2)]      L2, the sklearn default
+#     tv         [0, 1]            total variation = (1/2) L1
+#     js         [0, 1] bits       sqrt(Jensen-Shannon divergence)
+
+def tv_distance_matrix(P) -> np.ndarray:
+    """
+    Total variation, TV(p,q) = (1/2) sum_i |p_i - q_i|.
+
+    Interpretation: the largest amount by which the two distributions can
+    disagree about the probability of any single event.  Bounded in [0, 1].
+    """
+    P = np.asarray(P, dtype=float)
+    return 0.5 * np.abs(P[:, None, :] - P[None, :, :]).sum(-1)
+
+
+def js_distance_matrix(P, eps: float = 1e-12) -> np.ndarray:
+    """
+    Jensen-Shannon DISTANCE = sqrt(JSD), in bits.
+
+    KL(P||Q) = sum_i p_i log2(p_i / q_i) is the natural divergence between
+    distributions but is unusable as a clustering metric: asymmetric,
+    unbounded, and INFINITE wherever q_i = 0 < p_i -- which is fatal here,
+    because a trained model drives probabilities to ~1e-6.
+
+    JS repairs all three by comparing both to their mixture M = (P+Q)/2:
+
+        JSD(P||Q) = (1/2) KL(P||M) + (1/2) KL(Q||M)
+                  = H(M) - (1/2)(H(P) + H(Q))          <- the form used here
+
+    and it is
+      * symmetric by construction,
+      * bounded: 0 <= JSD <= 1 bit,
+      * always finite, since M's support contains both,
+      * and sqrt(JSD) satisfies the triangle inequality (Endres & Schindelin
+        2003), i.e. it is a true metric -- which is what a distance-threshold
+        clusterer actually requires.
+
+    Interpretation: JSD is the mutual information between a sample and the
+    label of which distribution produced it, when P and Q are chosen with
+    probability 1/2 each.  1 bit means one sample identifies the source
+    perfectly; 0 means the two are indistinguishable.
+
+    Implementation notes.  scipy.spatial.distance.jensenshannon returns NaN on
+    this data: for near-identical rows the computed JSD lands at about -1e-17
+    and sqrt of that is NaN.  Hence the clip to [0, 1] before the sqrt.  Rows
+    are clipped away from 0 and renormalised so they stay on the simplex.
+    Memory is O(n^2 V) for the pairwise mixture tensor -- 6 MB at n=500, V=3,
+    but 320 MB at n=2000, V=10, so chunk if you scale this up.
+    """
+    P = np.clip(np.asarray(P, dtype=float), eps, None)
+    P = P / P.sum(1, keepdims=True)
+
+    def _H(x):
+        return -(x * np.log2(np.clip(x, eps, None))).sum(-1)
+
+    M   = 0.5 * (P[:, None, :] + P[None, :, :])
+    JSD = _H(M) - 0.5 * (_H(P)[:, None] + _H(P)[None, :])
+    return np.sqrt(np.clip(JSD, 0.0, 1.0))
+
+
+def euclidean_distance_matrix(P) -> np.ndarray:
+    """Plain L2 between probability vectors -- sklearn's default."""
+    P = np.asarray(P, dtype=float)
+    d2 = ((P[:, None, :] - P[None, :, :]) ** 2).sum(-1)
+    return np.sqrt(np.clip(d2, 0.0, None))
+
+
+DISTANCE_MATRICES = {
+    "euclidean": euclidean_distance_matrix,
+    "tv":        tv_distance_matrix,
+    "js":        js_distance_matrix,
+}
+
+# Per-metric default thresholds.  NOT interchangeable -- the metrics have
+# different ranges.  Each is the value that maximised agreement with the closed
+# forms over the 14 arms in results_quick, swept on a 10-point grid:
+#
+#     euclidean  tol=0.100   13/14 correct
+#     tv         tol=0.075   13/14
+#     js         tol=0.075   12/14
+#
+# Worth stating plainly: JS has the better THEORY -- bounded, symmetric, a true
+# metric, finite in the presence of zeros -- but on this data it is very
+# slightly WORSE than plain L2.  An earlier note in this repo claimed JS
+# "doubles the safe window"; that was measured on the two arms of a single
+# experiment and does not survive the full 14.  All three agree on 12-13 of 14
+# and disagree only on the high-k flower backward arms, where the model itself
+# under-resolves the states.
+DEFAULT_STATE_TOL = {"euclidean": 0.10, "tv": 0.075, "js": 0.075}
+
+
 def recover_causal_states(model, data_loader, use_t="last", max_batches=20,
-                          state_tol=0.10, n_pts=2000, seed=0,
+                          state_tol=None, n_pts=2000, seed=0, metric="euclidean",
                           tol_grid=(0.02, 0.05, 0.10, 0.15, 0.20, 0.30, 0.40, 0.60)):
     """
     DISCOVER the number of causal states and their occupancy entropy, instead
@@ -948,9 +1046,23 @@ def recover_causal_states(model, data_loader, use_t="last", max_batches=20,
             model.output_prj(torch.from_numpy(pts).to(
                 next(model.parameters()).device)), dim=-1).cpu().numpy()
 
+    if metric not in DISTANCE_MATRICES:
+        raise ValueError(f"metric must be one of {sorted(DISTANCE_MATRICES)}")
+    if state_tol is None:
+        state_tol = DEFAULT_STATE_TOL[metric]
+
+    # One distance matrix, reused for every threshold on the grid.
+    D = DISTANCE_MATRICES[metric](probs)
+
     def _fit(tol):
+        # complete linkage: two clusters merge only if EVERY cross-pair is
+        # within tol, so a cluster is a set whose members are all mutually
+        # within tol -- the literal reading of "same predictive distribution to
+        # within tolerance".  single linkage would merge on the closest pair
+        # and chain distinct states together.
         return AgglomerativeClustering(n_clusters=None, distance_threshold=tol,
-                                       linkage="complete").fit_predict(probs)
+                                       metric="precomputed",
+                                       linkage="complete").fit_predict(D)
 
     labels = _fit(state_tol)
     k_hat  = int(len(np.unique(labels)))
@@ -966,7 +1078,7 @@ def recover_causal_states(model, data_loader, use_t="last", max_batches=20,
     plateau = max(spans, key=spans.get) if spans else k_hat
 
     return dict(k_hat=k_hat, S_hat=float(S_hat), labels=labels, tokens=toks,
-                probs=probs, state_tol=float(state_tol),
+                probs=probs, state_tol=float(state_tol), metric=metric,
                 stability=stability, plateau=int(plateau))
 
 
