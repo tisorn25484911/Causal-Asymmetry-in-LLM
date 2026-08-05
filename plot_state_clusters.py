@@ -109,9 +109,22 @@ def load_arm(out_root, tag, arm, num_token, max_len, d_model, n_layers):
 # ─────────────────────────────────────────────────────────────────────────────
 # One panel
 # ─────────────────────────────────────────────────────────────────────────────
+# Marker per recovered state.  Colour is reserved for the input TOKEN so it
+# stays consistent with every other UMAP in the repo, which means the two
+# encodings are independent and the reader can see the mapping between them --
+# e.g. the coin's forward arm shows tokens 0 and 2 in DIFFERENT colours but the
+# SAME marker, which is precisely the claim "two tokens, one causal state".
+_STATE_MARKERS = ["o", "s", "^", "D", "v", "P", "X", "*", "<", ">", "h", "p"]
+
+
 def draw_panel(ax, model, loader, use_t, metric, tol, k_theory, n_pts,
                n_neighbors, seed, split_name, arm_name):
-    """UMAP of the predictive distribution, coloured by RECOVERED state."""
+    """
+    UMAP of the predictive distribution.
+
+    colour = input TOKEN            (same convention as the other UMAP figures)
+    marker = RECOVERED causal state (from recover_causal_states)
+    """
     try:
         r = recover_causal_states(model, loader, use_t=use_t, max_batches=None,
                                   metric=metric, state_tol=tol,
@@ -130,19 +143,45 @@ def draw_panel(ax, model, loader, use_t, metric, tol, k_theory, n_pts,
     coords, mlbl = _project2d(P + rng.normal(0, tol / 4.0, P.shape),
                               n_neighbors=min(n_neighbors, max(len(P) - 1, 2)))
 
+    from matplotlib.lines import Line2D
     cmap = plt.cm.tab10
-    for c in sorted(np.unique(lab)):
+    n_tok = int(toks.max()) + 1
+    states = sorted(np.unique(lab))
+    tok_colour = lambda t: cmap(t / max(n_tok - 1, 1))
+
+    # One scatter per (state, token) pair actually present, so colour and
+    # marker vary independently.
+    for si, c in enumerate(states):
+        for t in range(n_tok):
+            sel = (lab == c) & (toks == t)
+            if not sel.any():
+                continue
+            ax.scatter(coords[sel, 0], coords[sel, 1],
+                       color=tok_colour(t), marker=_STATE_MARKERS[si % len(_STATE_MARKERS)],
+                       s=22, alpha=0.75, linewidths=0.4, edgecolors="none")
+
+    # Two legends: colour->token and marker->state, since they are independent.
+    tok_handles = [Line2D([], [], marker="o", linestyle="", color=tok_colour(t),
+                          markersize=6, label=f"Token {t}")
+                   for t in range(n_tok) if (toks == t).any()]
+    st_handles = []
+    for si, c in enumerate(states):
         sel = lab == c
-        comp = np.bincount(toks[sel], minlength=int(toks.max()) + 1)
-        top = ",".join(str(t) for t in np.argsort(comp)[::-1][:3] if comp[t] > 0)
-        ax.scatter(coords[sel, 0], coords[sel, 1],
-                   color=cmap(c % 10), s=12, alpha=0.75,
-                   label=f"state {c} (tok {top}) n={sel.sum()}")
+        comp = np.bincount(toks[sel], minlength=n_tok)
+        members = ",".join(str(t) for t in np.argsort(comp)[::-1] if comp[t] > 0)
+        st_handles.append(Line2D([], [], marker=_STATE_MARKERS[si % len(_STATE_MARKERS)],
+                                 linestyle="", color="0.35", markersize=6,
+                                 label=f"state {c}: tok {members}  (n={int(sel.sum())})"))
+    leg1 = ax.legend(handles=tok_handles, title="colour = token", fontsize=6,
+                     title_fontsize=6, loc="upper right", framealpha=0.9)
+    ax.add_artist(leg1)
+    ax.legend(handles=st_handles, title="marker = recovered state", fontsize=6,
+              title_fontsize=6, loc="lower right", framealpha=0.9)
+
     ok = "OK" if r["k_hat"] == k_theory else "!="
     ax.set_title(f"{arm_name} — {split_name}   ({mlbl})\n"
                  f"k̂={r['k_hat']} {ok} theory {k_theory}   "
                  f"S={r['S_hat']:.4f}   n={len(P)}", fontsize=9, fontweight="bold")
-    ax.legend(fontsize=6, markerscale=1.5, loc="best")
     ax.grid(True, alpha=0.2)
     return r
 
