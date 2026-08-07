@@ -324,11 +324,3 @@ class OneHotDecoder(L.LightningModule):
     def configure_optimizers(self):
         return Adam(self.parameters(), lr=self.lr)
 
-# WordEmbDecoder was deleted here -- IMPROVEMENT_PLAN.md C5.
-#
-# No runner ever set embed_type="wordemb", so it was unreachable.  It was also
-# not, as v1 of the plan supposed, a near-twin of OneHotDecoder: it was a
-# SINGLE attention layer with no FFN, no LayerNorm and no n_layers argument,
-# while OneHotDecoder is n-layer with pre-norm LayerNorm, FFN and residuals.
-# Unifying them would have meant inventing a shared abstraction for two
-# genuinely different architectures; deleting the unused one is the honest fix.

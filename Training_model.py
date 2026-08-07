@@ -67,7 +67,7 @@ def set_seed(seed: int = 0) -> int:
     and `torch` (model init, DataLoader shuffling, random_split).  Call this
     at the top of every runner so a run is reproducible end to end.
 
-    IMPROVEMENT_PLAN.md A2.  Note this is necessary but not sufficient on its
+    Note this is necessary but not sufficient on its
     own: the pairing of the forward and backward arms also needs the seeded
     `random_split` and the deterministic `ChunckDataset` below, because a
     global seed does not stop the forward run from *advancing* a shared RNG
@@ -86,8 +86,7 @@ class ChunckDataset(tud.Dataset):
     Fixed-length windows into a dataset of longer sequences.
 
     Each sequence gets ONE window, chosen once at construction from `seed`.
-    `__getitem__` is therefore a pure function of `idx` -- IMPROVEMENT_PLAN.md
-    A2.
+    `__getitem__` is therefore a pure function of `idx` 
 
     Why this changed.  The offsets used to come from a single stateful
     `np.random.default_rng(seed)` consumed at access time, which had three
@@ -218,9 +217,7 @@ def make_analysis_loader(
 # ─────────────────────────────────────────────────────────────────────────────
 def _eval_loss_on_loader(model, loader) -> tuple[float, float]:
     """
-    Return (dataset-level cross-entropy in bits, matching perplexity 2**CE).
-
-    Two bugs fixed here (IMPROVEMENT_PLAN.md B2).
+    Return (dataset-level cross-entropy in bits, matching perplexity 2**CE)..
 
     1. This used to return ``mean(2**CE_batch)`` rather than ``2**mean(CE)``.
        By Jensen's inequality mean(2^x) >= 2^mean(x), so the reported
@@ -366,7 +363,7 @@ class Record_training(L.Callback):
             # (val PPL, base 2) while plotting them side by side.
             self.step_ppl.append(2.0 ** loss)
 
-        # ── Validation — EXPENSIVE, so gate it separately (D1) ───────────
+        # ── Validation — EXPENSIVE, so gate it separately ───────────
         # This is the whole of the D1 speedup: a full pass over the val set was
         # running at every gradient step.  Measured overhead of that, against
         # training with no validation recording at all: 1.63x at QUICK sizes

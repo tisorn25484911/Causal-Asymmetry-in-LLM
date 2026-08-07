@@ -1,15 +1,6 @@
 """
 configs.py — every experiment configuration in one place.
 
-IMPROVEMENT_PLAN.md A4.  `Main_call.py` and `main_large.py` were two copies of
-the same 700-line runner differing only in their CFG block and two tag
-literals, and *both* hard-coded `OUT_ROOT = "results"`.  Both also used the tag
-"exp1_coin_p03_q04" for experiment 1 -- at different parameters (0.4/0.8 vs
-0.3/0.4) and different d_model (32 vs 64).  There was exactly one
-results/models/exp1_coin_p03_q04_{fw,bw}.pt pair, so whichever runner finished
-last owned it, and results/models/ ended up holding a mixture from at least two
-runs.
-
 That is not untidiness, it is a correctness bug: LLM_asymmetry_testing.py and
 Test_data_eval.py hard-code main_large's tags *and* its CFG, so running either
 after Main_call.py would load weights trained at p=0.4,q=0.8 and score them

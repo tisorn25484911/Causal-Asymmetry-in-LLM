@@ -819,7 +819,7 @@ def statistical_complexity(p, q, mode):
     return S
 def flower_complexity(n: int, m: int, dice_probs) -> tuple[float, float]:
     """
-    Closed-form (C+, C-) for the n-m flower process — IMPROVEMENT_PLAN.md A1.
+    Closed-form (C+, C-) for the n-m flower process
 
     The process alternates: die i ~ Uniform{0..n-1} emitted as token i, then
     outcome j ~ dice_probs[i] emitted as token n+j.
@@ -852,8 +852,6 @@ def flower_complexity(n: int, m: int, dice_probs) -> tuple[float, float]:
         originally in the repo had n > m, i.e. tested the negation of the
         hypothesis.
 
-    Verified against IMPROVEMENT_PLAN.md section 4: (1,2)->(1.0000, 1.0000),
-    (4,2)->(2.0000, 1.4952), (6,4)->(2.2925, 1.9899).
     """
     dp = np.asarray(dice_probs, dtype=float)
     if dp.shape != (n, m):
