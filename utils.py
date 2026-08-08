@@ -130,10 +130,6 @@ def cleanup():
 def to_cpu_for_analysis(model):
     """
     Move a trained model to CPU in-place and return it.
-
-    Why: torch.mps.empty_cache() segfaults on PyTorch <= 2.1 on macOS.  Moving
-    the model to CPU is the only reliable way to release the Metal heap between
-    the forward and backward analysis passes.
     """
     model.cpu()
     gc.collect()
@@ -161,8 +157,7 @@ def entropy_rate_coin(p: float, q: float) -> float:
 
     H_inf is time-reversal invariant, so the same value applies to both
     directions -- which is why the runners pass one `theory` to both arms, and
-    why delta_CE is a difference of *residuals* rather than of entropy rates
-    (IMPROVEMENT_PLAN.md 1.1).
+    why delta_CE is a difference of *residuals* rather than of entropy rates.
 
     H_inf = pi0*H2(p) + pi1*H2(q),  pi0 = q/(p+q),  pi1 = p/(p+q).
     """

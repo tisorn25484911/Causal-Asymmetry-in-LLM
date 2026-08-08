@@ -257,7 +257,7 @@ def _resolve_t(use_t, T: int) -> int:
 def _sample_latents(latents, inputs_arr, mode="per_sequence", use_t="last",
                     n_pts=1000, burn_in=32, seed=0):
     """
-    Choose which latent vectors to embed — IMPROVEMENT_PLAN.md C6.
+    Choose which latent vectors to embed
 
     latents    : (N, T, d)      inputs_arr : (N, T)
     returns    : (points (M, d), tokens (M,), human-readable label)
@@ -282,9 +282,6 @@ def _sample_latents(latents, inputs_arr, mode="per_sequence", use_t="last",
         context lengths, which is what produces elongated smears rather than
         tight clusters.
 
-    "prefix"
-        The old C6 behaviour, kept so the difference can be shown rather than
-        asserted.  Do not use for results.
     """
     lat = np.asarray(latents)
     inp = np.asarray(inputs_arr)
@@ -998,7 +995,7 @@ def recover_causal_states(model, data_loader, use_t="last", max_batches=20,
                           tol_grid=(0.02, 0.05, 0.10, 0.15, 0.20, 0.30, 0.40, 0.60)):
     """
     DISCOVER the number of causal states and their occupancy entropy, instead
-    of assuming it -- IMPROVEMENT_PLAN.md C1.
+    of assuming it.
 
     Why this is the right quantity.  A causal state is an equivalence class of
     histories that induce the SAME distribution over the future
@@ -1014,10 +1011,8 @@ def recover_causal_states(model, data_loader, use_t="last", max_batches=20,
     1.065.  Both carry the state structure, but the latent also carries token
     identity that the state does not depend on.
 
-    `statistical_complexity_empirical` (kept, unchanged) runs k-means at a k
-    the CALLER supplies, so S = H(occupancy) <= log2(k) and it will confirm
-    whatever k it is handed.  This function instead uses agglomerative
-    clustering with a distance threshold, so k falls out of the data.
+    This function uses agglomerative
+    clustering with a distance threshold.
 
     THE THRESHOLD IS A REAL FREE PARAMETER AND NO SINGLE VALUE IS CORRECT.
     The smallest true separation between backward states varies by an order of

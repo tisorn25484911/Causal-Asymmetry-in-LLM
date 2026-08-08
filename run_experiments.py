@@ -141,7 +141,7 @@ CFG = dict(QUICK)
 
 def weight_meta(cfg, tag, num_token, max_len, res) -> dict:
     """
-    Sidecar written next to every .pt — IMPROVEMENT_PLAN.md B11 / A4.
+    Sidecar written next to every .pt
 
     Records the architecture a loader must rebuild (d_model, n_layers,
     token_size, max_len) and the process the weights were trained on (p/q or
@@ -180,7 +180,7 @@ def plot_loss_theory(rec_fw, rec_bw, theory_fw, theory_bw, title="", save_path=N
     """
     3-panel loss figure:
       Left  : FW train loss + BW train loss on the same axes (like reference image 3)
-      Middle: Loss difference BW − FW (like reference image 4)
+      Middle: Loss difference BW − FW 
       Right : Individual val-loss curves with theory H∞ lines
     """
     # Align lengths (different folds may produce slightly different step counts)
@@ -252,8 +252,7 @@ def analyse_model(tag, model, loader, num_token, out_dir,
     measures extrapolation, and does so asymmetrically between the two arms.
     See make_analysis_loader for the measured numbers.
 
-    `use_t` selects the position the complexity is read at, and it must match
-    the direction (A3).  With a tril mask the last position has seen the whole
+    `use_t` selects the position where the complexity is read at.  With a tril mask the last position has seen the whole
     past; with a triu mask position t attends to [t, T-1], so the LAST position
     attends to itself alone and maximum context is at position 0.
     """
@@ -261,6 +260,7 @@ def analyse_model(tag, model, loader, num_token, out_dir,
     # `k` is the THEORETICAL causal-state count for this arm (2/3 for the coin,
     # n+1/m+1 for the flower).  It is what the fixed-k estimator assumes, and
     # what the discovered k̂ is compared against.
+    # It must be noted for the case of flower process, that the backward causal state maybe <= m+1
     k_theory = k
 
     # ── Move to CPU so Metal heap is freed before analysis ────────────────
@@ -275,7 +275,6 @@ def analyse_model(tag, model, loader, num_token, out_dir,
         except Exception as e:
             print(f"  attn failed: {e}")
 
-    # C1: discover k rather than assume it, by clustering the model's
     # PREDICTIVE DISTRIBUTION -- a causal state is an equivalence class of
     # histories with the same future distribution, which is not the same thing
     # as a region of latent space.
@@ -338,11 +337,9 @@ def compare_fw_bw(tag, cv_fw, cv_bw, ana_fw, ana_bw, loader_ana, num_token, out_
                   sample_seq, theory_fw, theory_bw, attn_vis_len=64, p=None, q=None,
                   cfg=None):
     """
-    `loader_ana` is the full-sequence analysis loader (B4).  The old signature
-    took both loader_fw and loader_bw; every call site passed loader_fw twice
-    and the loader_bw parameter was never read, so it has been removed.
+    `loader_ana` is the full-sequence analysis loader.
 
-    `cfg` is now a real parameter (B7).  The UMAP call used to read
+    `cfg` is now a real parameter.  The UMAP call used to read
     `cfg.get('umap_n_neighbors', 200) if 'cfg' in dir() else 200` — dir() with
     no argument lists the *local* scope, cfg was neither a parameter nor a
     local, and dir() would not see a global anyway, so the condition was always
@@ -374,11 +371,11 @@ def compare_fw_bw(tag, cv_fw, cv_bw, ana_fw, ana_bw, loader_ana, num_token, out_
     except Exception as e:
         print(f"  attn compare failed: {e}")
 
-    # (c) side-by-side UMAP of the two models' latents on the same data.
+    # side-by-side UMAP of the two models' latents on the same data.
     # Both arms see the same forward-generated sequences; they differ only in
     # the attention mask and the batch convention.
     #
-    # C6: each arm is sampled at ITS OWN max-context position — last for the
+    # each arm is sampled at ITS OWN max-context position — last for the
     # forward (tril) model, first for the backward (triu) one — one point per
     # sequence, across all sequences.  This used to take the first n_pts rows
     # of the flattened array, i.e. every position of the first few sequences,
@@ -695,7 +692,6 @@ def experiment_2(cfg, out_root, all_results, n, m, role):
     rng        = np.random.default_rng(cfg["flower_dice_seed"])
     dice_probs = rng.dirichlet(np.ones(m), size=n)
 
-    # A1: real closed forms instead of nan.  C+ = 1 + (1/2)log2(n);
     # C- = 1 + (1/2)H(pi_outcome) over *distinguishable* outcomes.
     C_plus, C_minus = flower_complexity(n, m, dice_probs)
     theory = flower_entropy_rate(n, m, dice_probs)       # H_inf, same both ways
@@ -715,8 +711,8 @@ def experiment_2(cfg, out_root, all_results, n, m, role):
     chunk     = cfg["train_chunk_len"]
     seq_len_f = len(data[0])
 
-    # FIX-5: parametric FlowerDataset from Flower_process_generation.
-    # B4: the ds_bw / loader_bw / loader_bw_ana chain that used to be built
+    # Parametric FlowerDataset from Flower_process_generation.
+    # the ds_bw / loader_bw / loader_bw_ana chain that used to be built
     # here was never used — cv_bw trained on loader_fw, and the comment
     # "reversed data -> forward model" described the exact opposite of what
     # the code did (forward data -> backward model).  Deleted.
@@ -855,12 +851,7 @@ def main(argv=None):
         cfg["seed"] = args.seed
     if args.out_root is not None:
         cfg["out_root"] = args.out_root
-
-    # A4: out_root comes from the config, so two configurations can no longer
-    # overwrite each other's weights in a shared results/models/ directory.
     out_root = cfg["out_root"]
-    # FIX-2: pre-compile numba kernels so a segfault, if any, happens now
-    # rather than hours into training.
     warm_up_umap(cfg.get("umap_n_neighbors", 15))
     set_seed(cfg["seed"])                    # A2: reproducible end to end
     mkdir(out_root)

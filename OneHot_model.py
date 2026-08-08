@@ -85,9 +85,6 @@ def cross_ent_onehot(logits, targets):
     """
     Mean cross-entropy in BITS, and the matching perplexity 2**CE.
 
-    Implementation note (IMPROVEMENT_PLAN.md B3).  The previous version built
-    the one-hot target explicitly and evaluated
-
         -(target_prob * logits.softmax(-1).log2()).sum(dim=1)
 
     which returns NaN once any *non-target* class probability underflows to
@@ -145,13 +142,13 @@ class OneHotDecoder(L.LightningModule):
         self.max_len = max_len
         self.lr = lr
 
-        # IMPROVEMENT_PLAN.md C5.  This was an nn.Parameter, which makes
+        # This was an nn.Parameter, which makes
         # `one_hot @ self.rand_prj` a LEARNED embedding table -- mathematically
         # identical to nn.Embedding -- despite the class name and the "fixed
         # random projection" comment.  It is now a buffer, so "onehot" mode
         # really is a fixed random projection.
         #
-        # This is what makes the Phase 4 d_model sweep interpretable: varying
+        # This is what makes d_model sweep interpretable: varying
         # d_model then varies representational capacity alone, rather than
         # capacity plus the size of a learned input code.  Note it invalidates
         # every checkpoint written before this commit -- rand_prj moves from
@@ -224,8 +221,7 @@ class OneHotDecoder(L.LightningModule):
         True = allowed.  Forward (tril): position t attends to [0, t].
         Backward (triu): position t attends to [t, T-1].  The two are exact
         mirror images -- summed over positions the context budget is identical,
-        which is why the mask is NOT the forward/backward confound (the
-        positional encoding is; see IMPROVEMENT_PLAN.md C2).
+        which is why the mask is NOT the forward/backward confound.
         """
         key = (T, str(device))
         cached = self._mask_cache.get(key)
