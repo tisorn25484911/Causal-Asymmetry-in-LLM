@@ -16,13 +16,14 @@ state of the repository.
 4. [The configuration system](#4-the-configuration-system)
 5. [Running the training suite](#5-running-the-training-suite)
 6. [Running the controls](#6-running-the-controls)
-7. [Generating the causal-state figures](#7-generating-the-causal-state-figures)
-8. [The post-hoc evaluators](#8-the-post-hoc-evaluators)
-9. [Verification and documentation](#9-verification-and-documentation)
-10. [Understanding the outputs](#10-understanding-the-outputs)
-11. [Interpreting the results](#11-interpreting-the-results)
-12. [Troubleshooting](#12-troubleshooting)
-13. [Command reference](#13-command-reference)
+7. [Running the seed-repeat harness](#7-running-the-seed-repeat-harness)
+8. [Generating the causal-state figures](#8-generating-the-causal-state-figures)
+9. [The post-hoc evaluators](#9-the-post-hoc-evaluators)
+10. [Verification and documentation](#10-verification-and-documentation)
+11. [Understanding the outputs](#11-understanding-the-outputs)
+12. [Interpreting the results](#12-interpreting-the-results)
+13. [Troubleshooting](#13-troubleshooting)
+14. [Command reference](#14-command-reference)
 
 ---
 
@@ -223,7 +224,7 @@ The p-q sweep trains a model and then evaluates it on the same loader. Its
 heatmaps are training-set quantities. This is pre-existing behaviour and is
 documented rather than corrected.
 
-The figures produced by `plot_state_clusters.py` (Section 7) address the second
+The figures produced by `plot_state_clusters.py` (Section 8) address the second
 row of this table directly, by separating the train-seen and held-out
 sequences into different panels.
 
@@ -265,7 +266,7 @@ the comparison into a controlled one. It writes into `results_quick/` alongside
 the QUICK results, and only runs the processes QUICK does not already cover.
 
 **`LARGE`** increases every dimension. Its cross-validation results are **not
-usable**; see Section 11.3.
+usable**; see Section 12.3.
 
 ### 4.3 Output directories and tags
 
@@ -277,6 +278,10 @@ literals: a coin experiment at p = 0.4, q = 0.8 is tagged
 `exp1_coin_p040_q080`. A tag therefore cannot disagree with the parameters that
 produced it. This was a genuine defect previously: two runners used the same tag
 literal at different parameters and overwrote one another's checkpoints.
+
+The same derivation supplies the `traj_` tags of the repeat harness (Section 7),
+which writes to `results_trajectories/` and so cannot collide with a training
+run's output either.
 
 ---
 
@@ -369,7 +374,7 @@ During the run the following are printed for each experiment:
 - the theoretical quantities: H∞, C⁺, C⁻, and the predicted sign of ΔCE;
 - per-fold validation and test losses;
 - a warning for any fold that **diverged** — that is, reached a good loss and
-  then blew up (Section 11.3);
+  then blew up (Section 12.3);
 - the recovered number of causal states k̂ with its stability profile;
 - the paired ΔCE, reported both over all folds and over converged folds only.
 
@@ -427,7 +432,217 @@ Each control is scored against its own prediction, using a three-way verdict:
 
 ---
 
-## 7. Generating the causal-state figures
+## 7. Running the seed-repeat harness
+
+```bash
+python run_statistical_trj.py
+```
+
+Seven processes, each trained one hundred times in both causal directions.
+Runtime is approximately two and a quarter hours; output is written to
+`results_trajectories/`.
+
+This is the answer to the second caveat in Section 12.2. Every standard error
+reported by `run_experiments.py` is computed over the five cross-validation folds
+of a single seed, and those folds share a training set: the quantity measured is
+fold-to-fold variability, not sampling variability over datasets. Each repeat
+here regenerates its process from a fresh seed, so the spread across repeats
+**is** sampling variability, and the paired statistic can therefore support a
+claim about the sign of ΔCE that the per-fold statistic cannot.
+
+### 7.1 Options
+
+```
+--config CFG          Configuration supplying the model, data and optimiser
+                      settings.  Default: QUICK.
+
+--repeats N           Independent repeats per process.  Default: 100.
+
+--seed N              Base seed.  Repeat i uses base + i for BOTH arms.
+                      Default: the configuration's seed.
+
+--out-root DIR        Where figures and pickles are written.
+                      Default: results_trajectories.
+
+--only TAG [TAG ...]  Run a subset.  Matches a full tag or any substring of
+                      one, so --only coin_p030 flower_n2 is accepted.
+
+--khat                Additionally recover k̂ and S_hat from each model's
+                      predictive distribution.  Slower; see 7.6.
+
+--plots-only          Redraw every figure from the saved pickle without
+                      training anything.
+
+--verbose             Do not suppress the per-run training output.
+```
+
+### 7.2 The seven processes
+
+All are run at one common set of settings — the configuration's `coin_*` values
+for the three coin processes and its `flower_*` values for the four flower ones —
+so that the processes are comparable with one another. In particular all three
+coin processes use `coin_num_samples`, `coin_seq_len` and `coin_max_epochs`; the
+shorter `coin_seq_len_12` of experiment 1.2 is not used here.
+
+| Tag | Process | C⁺ | C⁻ | Prediction |
+|---|---|---|---|---|
+| `traj_coin_p010_q090` | coin, p = 0.1, q = 0.9 | 0.4690 | 0.8911 | ΔCE > 0 |
+| `traj_coin_p030_q040` | coin, p = 0.3, q = 0.4 | 0.9852 | 1.4888 | ΔCE > 0 |
+| `traj_coin_p040_q080` | coin, p = 0.4, q = 0.8 | 0.9183 | 1.5656 | ΔCE > 0 |
+| `traj_flower_n2_m6` | flower, n = 2, m = 6 | 1.5000 | 2.1137 | ΔCE > 0 |
+| `traj_flower_n2_m8` | flower, n = 2, m = 8 | 1.5000 | 2.4765 | ΔCE > 0 |
+| `traj_flower_n4_m2` | flower, n = 4, m = 2 | 2.0000 | 1.4952 | ΔCE < 0 |
+| `traj_flower_n6_m4` | flower, n = 6, m = 4 | 2.2925 | 1.9899 | ΔCE < 0 |
+
+The last two are the reversed cases, and they are the reason for running seven
+processes rather than one: a result in which the *sign* of ΔCE follows the sign
+of C⁻ − C⁺ across processes is far stronger evidence than any single positive
+case.
+
+Approximate cost per repeat, measured: eight seconds for a coin process, fourteen
+for a flower one, sixteen with `--khat`. One hundred repeats of all seven is
+therefore about two and a quarter hours, or three with `--khat`.
+
+### 7.3 How a repeat differs from a cross-validated run
+
+| | `run_experiments.py` | `run_statistical_trj.py` |
+|---|---|---|
+| Unit of replication | Cross-validation fold | Independent repeat |
+| Data | One dataset, shared by all folds | Regenerated per repeat |
+| Trainings per unit | Five folds, best selected | One |
+| Reported loss | Held-out CE of the best fold | Held-out CE of the single model |
+| What the standard error measures | Fold-to-fold variability | **Sampling variability** |
+
+Two consequences of the middle row deserve stating. A cross-validated run
+reports the fold with the lowest validation loss, and a minimum over five draws
+is not a sample from the same distribution as a single draw; using it as the
+per-repeat value would bias the statistic. Running a full cross-validation
+within each repeat would also multiply the cost fivefold, to seven thousand
+trainings.
+
+Within a repeat the two arms remain **paired** exactly as elsewhere in the
+repository: the same seed yields identical sequences, identical chunk windows, an
+identical train/held-out split, identical batch order and identical weight
+initialisation, so that only the attention mask and the batch convention differ.
+
+The flower dice are drawn from `flower_dice_seed`, **not** from the repeat seed.
+The dice define the process — they determine C⁺ and C⁻ — so resampling them per
+repeat would average over different processes rather than over realisations of
+one. They are the same dice `run_experiments.py` trains on, which keeps the two
+sets of numbers comparable.
+
+### 7.4 What is produced
+
+```
+results_trajectories/
+├── run_config_QUICK.json                   parameters, repeat count, timestamp
+├── all_trajectories.pkl                    every process, merged by tag
+├── summary_delta_ce.png                    cross-process summary, two panels
+└── traj_coin_p040_q080/
+    ├── results.pkl                         every run of this process
+    ├── ..._complexity.png                  S_emp against C⁺ / C⁻, with error bars
+    ├── ..._final_loss.png                  three bars: FW, BW, BW − FW
+    └── ..._trajectories.png                all runs, both means, shaded interval
+```
+
+Three figures per process, as follows.
+
+**`_complexity.png`** places the mean empirical complexity of each arm beside its
+closed form. The caption beneath restates that `S_emp` is k-means at the
+pre-specified k printed on the axis, so that the figure cannot be read as
+independent confirmation of that k.
+
+**`_final_loss.png`** carries the three bars: forward, backward, and their
+difference. The difference is drawn against **its own axis on the right**,
+because ΔCE is two to three orders of magnitude smaller than the cross-entropies
+beside it and would otherwise be a flat line at zero. Its error is the *paired*
+standard deviation — the spread of the per-repeat differences — which is the
+purpose of pairing the arms and is substantially smaller than the propagation of
+two independent errors would suggest. Where any run diverged, a second hatched
+group of bars gives the same three statistics over converged runs only.
+
+**`_trajectories.png`** has two panels. The left shows every run at alpha 0.3
+with the two mean curves in bold and a shaded ±1 standard deviation band; its
+y-axis is clipped, and the number of points excluded is stated in the title,
+because a diverged run reaches fifteen to sixty bits and would otherwise
+compress everything of interest. The right panel is the mean of the per-step
+paired difference, scaled to the second half of training for the same reason.
+
+In every figure a **thick** error bar is ±1 standard error and a **thin** whisker
+is ±1 standard deviation, stated in the caption, so that no error bar is
+ambiguous as to which it is.
+
+**`summary_delta_ce.png`** shows ΔCE with its standard error for each process,
+and ΔCE against C⁻ − C⁺. A process whose ΔCE is not distinguishable from zero is
+drawn in grey rather than assigned a colour, on the same |ΔCE| < 2 × standard
+error rule the console table uses.
+
+### 7.5 Interruption, subsetting and redrawing
+
+State is written after **every** repeat, to both the per-process `results.pkl` and
+the combined `all_trajectories.pkl`, so an interruption costs one repeat rather
+than the run. The combined pickle is merged by tag, exactly as in Section 5.5,
+so a subsequent partial run does not discard earlier processes.
+
+```bash
+# one process only, into the same directory
+python run_statistical_trj.py --only flower_n6_m4
+
+# a short shakedown before committing to the full run
+python run_statistical_trj.py --repeats 3 --out-root /tmp/traj_check
+
+# regenerate all figures after editing a plotting function
+python run_statistical_trj.py --plots-only
+```
+
+### 7.6 The recovered state count
+
+`--khat` additionally runs `recover_causal_states` on each arm of each repeat,
+recording k̂, S_hat and the stability plateau. This is the better estimator —
+Section 12.2, caveat 3 — but it costs an agglomerative clustering pass per arm
+per repeat, and it is off by default so that the headline run is not delayed by
+it. When it has been used, the complexity figure carries the median k̂ and the
+mean S_hat beneath the axis for comparison with `S_emp`.
+
+### 7.7 The schema of `results.pkl`
+
+```python
+import pickle
+r = pickle.load(open("results_trajectories/traj_coin_p040_q080/results.pkl", "rb"))
+r["runs"][0]["fw"]["final_ce"]        # held-out CE of repeat 0, forward arm
+```
+
+| Key | Contents |
+|---|---|
+| `spec` | The process: tag, kind, parameters, dice, C⁺, C⁻, H∞, and the k assumed for each arm. |
+| `config`, `base_seed`, `repeats`, `khat` | How the run was invoked. |
+| `runs` | One entry per repeat; see below. |
+| `paired` | The paired ΔCE statistics, in the same schema as Section 11.2, with the repeat as the unit in place of the fold. |
+
+Each entry of `runs` holds `seed`, `delta_ce`, and an `fw` and a `bw` dictionary:
+
+| Key | Contents |
+|---|---|
+| `final_ce`, `final_ppl` | Held-out cross-entropy and perplexity. |
+| `traj`, `traj_at` | Training loss per gradient step, and the step indices. |
+| `val_traj`, `val_at` | Held-out loss on its own sparser cadence. |
+| `S_emp` | Complexity from k-means at the assumed k. |
+| `k_hat`, `S_hat`, `k_plateau` | Present only when `--khat` was passed. |
+| `diverged`, `divergence` | The divergence verdict and its diagnosis. |
+
+Because every repeat is retained in full, an alternative convergence filter or a
+different summary statistic may be applied without re-running anything.
+
+### 7.8 Status
+
+The harness has been verified end to end on short runs — one and two repeats
+across a coin and two flower processes, with and without `--khat`, and through
+`--plots-only`. **The full hundred-repeat run has not yet been performed**, so no
+results from it are quoted in Section 12.
+
+---
+
+## 8. Generating the causal-state figures
 
 ```bash
 python plot_state_clusters.py
@@ -436,7 +651,7 @@ python plot_state_clusters.py
 This script must be run **after** a training run. It loads saved weights and
 does not retrain, so it is inexpensive.
 
-### 7.1 Options
+### 8.1 Options
 
 ```
 --config CFG          Which configuration's experiments to plot.  Default: QUICK.
@@ -452,7 +667,7 @@ Example:
 python plot_state_clusters.py --out-root results_large --metrics js
 ```
 
-### 7.2 What is produced
+### 8.2 What is produced
 
 For every experiment and every metric, one 2 × 2 figure is written to
 `results_quick/<tag>/<tag>_states_<metric>.png`:
@@ -470,7 +685,7 @@ off the figure: on the coin's forward arm, tokens 0 and 2 appear in *different
 colours* but with the *same marker*, within a single group — two tokens, one
 causal state.
 
-### 7.3 Why the train/held-out split appears here
+### 8.3 Why the train/held-out split appears here
 
 As noted in Section 3.3, the complexity and latent quantities reported elsewhere
 are computed on the full dataset, roughly 80 % of which the model was trained
@@ -488,7 +703,7 @@ The exception is the flower configuration with n = 2, m = 8 backward, which has
 the largest number of states (9) and therefore the fewest held-out sequences per
 state.
 
-### 7.4 The three distance metrics
+### 8.4 The three distance metrics
 
 The predictive distributions are points on the probability simplex. Three
 distances are implemented:
@@ -512,7 +727,7 @@ disagree only where the model itself under-resolves the states.
 
 ---
 
-## 8. The post-hoc evaluators
+## 9. The post-hoc evaluators
 
 ```bash
 python Test_data_eval.py
@@ -521,7 +736,7 @@ python LLM_asymmetry_testing.py
 
 These load saved checkpoints and score them on freshly generated data.
 
-### 8.1 Configuration
+### 9.1 Configuration
 
 Neither script has a command-line interface. Each is configured by a `RUN`
 dictionary — near the bottom of `Test_data_eval.py`, and at approximately line
@@ -542,7 +757,7 @@ architecture and the process it was trained on, and the loaders verify against
 it; a mismatch produces an explicit warning rather than a confusing shape error
 or, worse, silently incorrect numbers.
 
-### 8.2 A note on metrics
+### 9.2 A note on metrics
 
 `Test_data_eval.py` reports two perplexities and they must not be conflated.
 The **teacher-forced** perplexity scores both models on the same ground-truth
@@ -553,9 +768,9 @@ informational only.
 
 ---
 
-## 9. Verification and documentation
+## 10. Verification and documentation
 
-### 9.1 The test suite
+### 10.1 The test suite
 
 ```bash
 pytest tests/ -q
@@ -571,7 +786,7 @@ closed forms reproduce their reference values; that vectorised code produces the
 same numbers as the loops it replaced; and that the causal-state estimator
 merges tokens with equal futures while separating those with different ones.
 
-### 9.2 The walkthrough notebook
+### 10.2 The walkthrough notebook
 
 ```bash
 python build_walkthrough.py
@@ -586,9 +801,9 @@ consolidated list of caveats.
 
 ---
 
-## 10. Understanding the outputs
+## 11. Understanding the outputs
 
-### 10.1 Directory layout
+### 11.1 Directory layout
 
 ```
 results_quick/
@@ -612,7 +827,7 @@ results_quick/
 Everything other than the source files is excluded from version control and
 should be regenerated rather than committed.
 
-### 10.2 The schema of `results.pkl`
+### 11.2 The schema of `results.pkl`
 
 ```python
 import pickle
@@ -667,9 +882,9 @@ applied to existing results without re-running anything.
 
 ---
 
-## 11. Interpreting the results
+## 12. Interpreting the results
 
-### 11.1 The current findings
+### 12.1 The current findings
 
 The QUICK configuration converges: the forward cross-entropy exceeds H∞ by
 between 0.0010 and 0.0082 bits across the seven experiments. The measured ΔCE
@@ -696,8 +911,8 @@ only because the fold-level standard error is itself very small (0.0004), and
 that standard error is computed over five folds that **share a training set**.
 It therefore measures fold-to-fold variability rather than sampling variability
 over datasets, and is a lower bound on the true uncertainty. Establishing an
-effect of this size would require the seed-repeat harness, which has not yet
-been built.
+effect of this size requires the seed-repeat harness of Section 7, which now
+exists but has not yet been run in full.
 
 The overall picture is a **null result**, which is precisely what Section 2.3
 predicts for a converged predictor with capacity to spare. It should not be
@@ -705,14 +920,15 @@ reported as "no causal asymmetry", because it remains ambiguous until the
 `d_model` sweep distinguishes that conclusion from "capacity absorbed the
 asymmetry".
 
-### 11.2 Caveats attaching to every reported number
+### 12.2 Caveats attaching to every reported number
 
 1. ΔCE is a difference of residuals; a converged, sufficient-capacity model
    yields approximately zero regardless of C⁻ − C⁺.
 2. The standard error is computed over five folds **that share a training
    set**. It measures fold-to-fold variability, not sampling variability over
    datasets, and is therefore a lower bound on the true uncertainty. It must not
-   be presented as a confidence interval.
+   be presented as a confidence interval. Section 7 is the harness that replaces
+   it with a standard error over independent repeats.
 3. `S_emp` uses a **pre-specified** k and satisfies S ≤ log₂k, so it will
    confirm whatever k it is given. The recovered `S_hat` is preferable: across
    the fourteen arms its mean absolute error against the closed forms is 0.0260
@@ -728,7 +944,7 @@ asymmetry".
 6. Results are not bit-reproducible across runs on MPS, though the pairing of
    the two arms is unaffected.
 
-### 11.3 The LARGE configuration
+### 12.3 The LARGE configuration
 
 **The cross-validation results from the LARGE configuration are not usable.**
 In the completed run, **all forty folds diverged** — five of five on each of its
@@ -761,13 +977,13 @@ measured divergence rate from four in six to one in six. Adopting it would
 change every number, so QUICK and the controls would require re-running under
 the same optimiser to remain comparable.
 
-### 11.4 Which run to report
+### 12.4 Which run to report
 
 **QUICK.** All five folds converge, in all seven experiments.
 
 ---
 
-## 12. Troubleshooting
+## 13. Troubleshooting
 
 **A test fails.** Do not proceed to experiments. The tests cover failures that
 are silent in ordinary use.
@@ -781,7 +997,7 @@ estimator measures what the *model* represents, and a model that has not
 resolved all the states of its process will legitimately return a smaller k̂.
 Consult the stability profile before concluding that the estimator is at fault.
 
-**A run reports many diverged folds.** See Section 11.3. This is expected for
+**A run reports many diverged folds.** See Section 12.3. This is expected for
 long runs and is reported rather than concealed.
 
 **The paired standard error is `nan`.** Fewer than two folds survived the
@@ -792,7 +1008,7 @@ Section 1.2.
 
 ---
 
-## 13. Command reference
+## 14. Command reference
 
 ```bash
 # Environment
@@ -812,6 +1028,13 @@ python run_experiments.py --config QUICK --seed 1 --out-root results_quick_seed1
 
 # Controls
 python sanity_check.py                              # ~7 min
+
+# Repeat statistics (Section 7)
+python run_statistical_trj.py                       # ~2.25 h, 7 x 100, not yet run
+python run_statistical_trj.py --repeats 3 --out-root /tmp/traj_check
+python run_statistical_trj.py --only flower_n6_m4   # one process, resumable
+python run_statistical_trj.py --khat                # ~3 h, adds k-hat per run
+python run_statistical_trj.py --plots-only          # redraw, no training
 
 # Analysis of saved weights
 python plot_state_clusters.py                       # all metrics, results_quick
