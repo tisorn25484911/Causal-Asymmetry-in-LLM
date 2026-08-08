@@ -27,7 +27,12 @@ each arm.  Per process, three figures go to results_trajectories/<tag>/:
     <tag>_trajectories.png   every run at alpha 0.3, the two mean curves in bold,
                              and a shaded interval
 
-plus one cross-process summary of delta_CE against C- - C+ at the root.
+and two cross-process figures at the root:
+
+    summary_delta_ce.png     delta_CE with its sem per process, and delta_CE
+                             against C- - C+
+    summary_grid.png         all three quantities for all processes in one
+                             3 x N grid -- the whole experiment on one sheet
 
 Why this exists
 ---------------
@@ -407,13 +412,19 @@ def _errbars(ax, xs, means, sds, sems):
                 elinewidth=3.0, capsize=0, zorder=6)
 
 
-def plot_complexity(rec: dict, out_dir: str):
+# Each panel is drawn by a _draw_* helper that takes an Axes, so the same code
+# serves both the one-figure-per-process outputs and the grid summary.  Anything
+# duplicated between the two would drift apart the first time one was fixed.
+# `compact` shrinks the annotation for a grid cell; `legend` lets the grid draw
+# the key in one column only.
+
+def _draw_complexity(ax, rec: dict, compact: bool = False, legend: bool = True):
     """
     S_emp for both arms with error bars over the repeats, against C+ / C-.
 
-    One figure per process, as the plan asks.  The theoretical bars are the
-    closed forms -- statistical_complexity for the coin, flower_complexity for
-    the flower -- so a systematic gap is visible rather than inferred.
+    The theoretical bars are the closed forms -- statistical_complexity for the
+    coin, flower_complexity for the flower -- so a systematic gap is visible
+    rather than inferred.
     """
     spec = rec["spec"]
     s_fw = _stats([r["fw"]["S_emp"] for r in rec["runs"]])
@@ -421,29 +432,37 @@ def plot_complexity(rec: dict, out_dir: str):
     emp  = [s_fw["mean"], s_bw["mean"]]
     th   = [spec["C_plus"], spec["C_minus"]]
     x    = np.arange(2)
+    fs, fsl = (6, 6) if compact else (9, 9)
 
-    fig, ax = plt.subplots(figsize=(9, 5.5))
     b1 = ax.bar(x - 0.2, emp, 0.35, color=[FW_COLOUR, BW_COLOUR],
                 alpha=0.85, edgecolor="k", label=f"Empirical S_emp (n={s_fw['n']} runs)")
     b2 = ax.bar(x + 0.2, th, 0.35, color=[FW_COLOUR, BW_COLOUR],
                 alpha=0.45, edgecolor="k", hatch="//", label="Theoretical (closed form)")
     _errbars(ax, x - 0.2, emp, [s_fw["sd"], s_bw["sd"]], [s_fw["sem"], s_bw["sem"]])
-    ax.bar_label(b1, fmt="%.4f", padding=14, fontsize=9)
-    ax.bar_label(b2, fmt="%.4f", padding=3, fontsize=9)
+    ax.bar_label(b1, fmt="%.4f", padding=(8 if compact else 14), fontsize=fs)
+    ax.bar_label(b2, fmt="%.4f", padding=3, fontsize=fs)
 
     ax.set_xticks(x)
-    ax.set_xticklabels([f"Forward  (C+, k={spec['k_fw']})",
-                        f"Backward  (C-, k={spec['k_bw']})"])
+    if compact:
+        ax.set_xticklabels([f"FW  k={spec['k_fw']}", f"BW  k={spec['k_bw']}"],
+                           fontsize=7)
+    else:
+        ax.set_xticklabels([f"Forward  (C+, k={spec['k_fw']})",
+                            f"Backward  (C-, k={spec['k_bw']})"])
     ax.set_ylabel("Statistical complexity (bits)")
     ax.set_ylim(0, max(emp + th) * 1.20)          # headroom for the bar labels
-    ax.set_title(
-        f"{spec['tag']} — empirical vs theoretical statistical complexity\n"
-        f"mean over {s_fw['n']} runs;  thick bar = ±1 sem, thin = ±1 sd  "
-        f"(sem: {s_fw['sem']:.4f} / {s_bw['sem']:.4f})",
-        fontsize=11, fontweight="bold")
-    ax.legend(fontsize=9)
+    if not compact:
+        ax.set_title(
+            f"{spec['tag']} — empirical vs theoretical statistical complexity\n"
+            f"mean over {s_fw['n']} runs;  thick bar = ±1 sem, thin = ±1 sd  "
+            f"(sem: {s_fw['sem']:.4f} / {s_bw['sem']:.4f})",
+            fontsize=11, fontweight="bold")
+    if legend:
+        ax.legend(fontsize=fsl, loc="upper left")
     ax.grid(True, alpha=0.3, axis="y")
 
+    if compact:
+        return
     note = ("S_emp is k-means at the k above, so S ≤ log2(k); it overestimates "
             "when the true state occupancy is unbalanced.")
     k_fw = [r["fw"].get("k_hat") for r in rec["runs"] if r["fw"].get("k_hat")]
@@ -457,11 +476,17 @@ def plot_complexity(rec: dict, out_dir: str):
     ax.text(0.5, -0.16, note, transform=ax.transAxes, ha="center", va="top",
             fontsize=8, color="0.25")
 
+
+def plot_complexity(rec: dict, out_dir: str):
+    """One complexity figure for one process."""
+    fig, ax = plt.subplots(figsize=(9, 5.5))
+    _draw_complexity(ax, rec)
     fig.tight_layout()
-    savefig(fig, os.path.join(out_dir, f"{spec['tag']}_complexity.png"))
+    savefig(fig, os.path.join(out_dir, f"{rec['spec']['tag']}_complexity.png"))
 
 
-def plot_final_loss(rec: dict, paired: dict, out_dir: str):
+def _draw_final_loss(ax, rec: dict, paired: dict, compact: bool = False,
+                     legend: bool = True, right_label: bool = True):
     """
     Three bars — forward, backward, backward - forward — with their error.
 
@@ -477,13 +502,13 @@ def plot_final_loss(rec: dict, paired: dict, out_dir: str):
     bw = np.asarray([r["bw"]["final_ce"] for r in rec["runs"]], dtype=float)
     d  = bw - fw
     conv = converged_mask(rec, paired)
+    fs, fsl = (6, 6) if compact else (9, 8)
 
     groups = [("all runs", np.ones(len(fw), dtype=bool), 0.85, None)]
     if conv.sum() and conv.sum() < len(fw):
         groups.append((f"converged only (|CE−H∞| ≤ {CONV_TOL} both arms)",
                        conv, 0.45, "//"))
 
-    fig, ax = plt.subplots(figsize=(10, 5.5))
     ax2 = ax.twinx()
     w = 0.34 if len(groups) > 1 else 0.5
 
@@ -493,15 +518,17 @@ def plot_final_loss(rec: dict, paired: dict, out_dir: str):
         b = ax.bar([0 + off, 1 + off], [s_fw["mean"], s_bw["mean"]], w,
                    color=[FW_COLOUR, BW_COLOUR], alpha=alpha, edgecolor="k",
                    hatch=hatch, label=f"{glabel}  (n={s_fw['n']})")
-        ax.bar_label(b, padding=12, fontsize=9,
-                     labels=[f"{s['mean']:.4f}\n±{s['sd']:.4f} sd"
-                             for s in (s_fw, s_bw)])
+        ax.bar_label(b, padding=(6 if compact else 12), fontsize=fs,
+                     labels=([f"{s['mean']:.4f}" for s in (s_fw, s_bw)] if compact
+                             else [f"{s['mean']:.4f}\n±{s['sd']:.4f} sd"
+                                   for s in (s_fw, s_bw)]))
         _errbars(ax, [0 + off, 1 + off], [s_fw["mean"], s_bw["mean"]],
                  [s_fw["sd"], s_bw["sd"]], [s_fw["sem"], s_bw["sem"]])
 
         bd = ax2.bar([2 + off], [s_d["mean"]], w, color=D_COLOUR, alpha=alpha,
                      edgecolor="k", hatch=hatch)
-        ax2.bar_label(bd, fmt="%+.4f", padding=14, fontsize=9, color=D_COLOUR)
+        ax2.bar_label(bd, fmt="%+.4f", padding=(6 if compact else 14),
+                      fontsize=fs, color=D_COLOUR)
         _errbars(ax2, [2 + off], [s_d["mean"]], [s_d["sd"]], [s_d["sem"]])
 
     ax.axhline(spec["theory"], color="crimson", ls="--", lw=1.5,
@@ -511,51 +538,84 @@ def plot_final_loss(rec: dict, paired: dict, out_dir: str):
     ax2.hlines(0.0, 1.55, 2.55, color="k", ls=":", lw=1.0)
 
     ax.set_xticks([0, 1, 2])
-    ax.set_xticklabels(["Forward", "Backward", "BW − FW  (right axis)"])
+    ax.set_xticklabels(["Forward", "Backward", "BW − FW\n(right axis)"]
+                       if compact else
+                       ["Forward", "Backward", "BW − FW  (right axis)"],
+                       fontsize=(7 if compact else None))
     ax.set_ylabel("Final held-out CE (bits/token)")
     ax.set_ylim(0, max(np.nanmax(fw), np.nanmax(bw)) * 1.30)   # label headroom
-    ax2.set_ylabel("delta_CE = CE_BW − CE_FW (bits)", color=D_COLOUR)
-    ax2.tick_params(axis="y", colors=D_COLOUR)
+    if right_label:
+        ax2.set_ylabel("delta_CE = CE_BW − CE_FW (bits)", color=D_COLOUR)
+    ax2.tick_params(axis="y", colors=D_COLOUR,
+                    labelsize=(6 if compact else None))
     # Keep zero visible and the difference bar centred on it.
     lim = max(abs(np.nanmin(d)), abs(np.nanmax(d)), 1e-6) * 1.6
     ax2.set_ylim(-lim, lim)
 
     all_s = _stats(d)
-    ax.set_title(
-        f"{spec['tag']} — final held-out loss and the paired difference\n"
-        f"delta_CE = {all_s['mean']:+.4f} ± {all_s['sem']:.4f} (sem over "
-        f"{all_s['n']} repeats);  C− − C+ = {spec['C_minus']-spec['C_plus']:+.4f}\n"
-        f"thick bar = ±1 sem, thin = ±1 sd;  note the two y-scales",
-        fontsize=11, fontweight="bold")
-    ax.legend(fontsize=8, loc="lower left")
+    if not compact:
+        ax.set_title(
+            f"{spec['tag']} — final held-out loss and the paired difference\n"
+            f"delta_CE = {all_s['mean']:+.4f} ± {all_s['sem']:.4f} (sem over "
+            f"{all_s['n']} repeats);  C− − C+ = {spec['C_minus']-spec['C_plus']:+.4f}\n"
+            f"thick bar = ±1 sem, thin = ±1 sd;  note the two y-scales",
+            fontsize=11, fontweight="bold")
+    if legend:
+        ax.legend(fontsize=fsl, loc="lower left")
     ax.grid(True, alpha=0.3, axis="y")
+
+
+def plot_final_loss(rec: dict, paired: dict, out_dir: str):
+    """One final-loss figure for one process."""
+    fig, ax = plt.subplots(figsize=(10, 5.5))
+    _draw_final_loss(ax, rec, paired)
     fig.tight_layout()
-    savefig(fig, os.path.join(out_dir, f"{spec['tag']}_final_loss.png"))
+    savefig(fig, os.path.join(out_dir, f"{rec['spec']['tag']}_final_loss.png"))
 
 
 def plot_trajectories(rec: dict, out_dir: str):
     """
     Every run's training-loss trajectory at alpha 0.3, both mean curves in bold,
-    with a shaded ±1 sd interval — and, beside it, the mean paired difference
-    per step.
+    with a shaded ±1 sd interval — and, beside it, the same treatment of the
+    paired difference.
 
     The second panel is the trajectory form of the headline number: at each step
-    it is the mean over repeats of (CE_BW − CE_FW) for the SAME repeat, so it
-    inherits the pairing instead of differencing two independent means.
+    it is (CE_BW − CE_FW) within the SAME repeat, so it inherits the pairing
+    instead of differencing two independent means.  Every run's difference is
+    drawn, with the mean and its bands over the top.
     """
     spec = rec["spec"]
+    if _traj_pair(rec) is None:
+        print(f"  no trajectories to plot for {spec['tag']}")
+        return
+    fig, axes = plt.subplots(1, 2, figsize=(17, 5.5))
+    _draw_loss_trajectories(axes[0], rec)
+    _draw_paired_diff(axes[1], rec)
+    fig.tight_layout()
+    savefig(fig, os.path.join(out_dir, f"{spec['tag']}_trajectories.png"))
+
+
+def _traj_pair(rec: dict):
+    """
+    (M_fw, M_bw, L, steps) with both arms truncated to a common length, or None
+    when there is nothing recorded.  Shared by the two trajectory panels so they
+    cannot end up drawn over different step ranges.
+    """
     M_fw = _traj_matrix([r["fw"]["traj"] for r in rec["runs"]])
     M_bw = _traj_matrix([r["bw"]["traj"] for r in rec["runs"]])
     if M_fw.size == 0 or M_bw.size == 0:
-        print(f"  no trajectories to plot for {spec['tag']}")
-        return
+        return None
     L = min(M_fw.shape[1], M_bw.shape[1])
-    M_fw, M_bw = M_fw[:, :L], M_bw[:, :L]
-    steps = np.arange(L)
+    return M_fw[:, :L], M_bw[:, :L], L, np.arange(L)
 
-    fig, axes = plt.subplots(1, 2, figsize=(17, 5.5))
 
-    ax = axes[0]
+def _draw_loss_trajectories(ax, rec: dict, compact: bool = False,
+                            legend: bool = True):
+    """Every run's training loss, both arms, with their means and ±1 sd bands."""
+    spec = rec["spec"]
+    M_fw, M_bw, L, steps = _traj_pair(rec)
+    fsl = 6 if compact else 8
+
     for M, colour, label in ((M_fw, FW_COLOUR, "Forward"),
                              (M_bw, BW_COLOUR, "Backward")):
         for row in M:
@@ -578,45 +638,80 @@ def plot_trajectories(rec: dict, out_dir: str):
     n_div = sum(r["fw"]["diverged"] or r["bw"]["diverged"] for r in rec["runs"])
     ax.set_xlabel("Gradient step")
     ax.set_ylabel("Training CE loss (bits)")
-    ax.set_title(
-        f"{spec['tag']} — {M_fw.shape[0]} runs per direction\n"
-        f"{n_div} run(s) diverged"
-        + (f";  y clipped at {top:.2f}, {n_above} point(s) above" if n_above else ""),
-        fontsize=11, fontweight="bold")
-    ax.legend(fontsize=8)
+    if not compact:
+        ax.set_title(
+            f"{spec['tag']} — {M_fw.shape[0]} runs per direction\n"
+            f"{n_div} run(s) diverged"
+            + (f";  y clipped at {top:.2f}, {n_above} point(s) above" if n_above else ""),
+            fontsize=11, fontweight="bold")
+    if legend:
+        ax.legend(fontsize=fsl)
     ax.grid(True, alpha=0.3)
 
-    ax = axes[1]
+
+def _draw_paired_diff(ax, rec: dict, compact: bool = False,
+                      legend: bool = True):
+    """The per-step paired difference: every run, plus the mean and its bands."""
+    spec = rec["spec"]
+    M_fw, M_bw, L, steps = _traj_pair(rec)
+    fsl = 6 if compact else 8
     D  = M_bw - M_fw                      # paired, step by step
     mu = D.mean(axis=0)
     sd = D.std(axis=0, ddof=1) if D.shape[0] > 1 else np.zeros(L)
     sem = sd / np.sqrt(D.shape[0]) if D.shape[0] > 1 else np.zeros(L)
+    # Every run's own difference, same convention as the loss panel.  Drawn under
+    # the aggregate, so the bands and the mean stay readable on top.  A grid cell
+    # is roughly a quarter of the standalone panel's area, where alpha 0.03 is
+    # invisible rather than faint, so the compact form is a little stronger.
+    for row in D:
+        ax.plot(steps, row, color=D_COLOUR, alpha=(0.01 if compact else 0.03),
+                lw=0.6, zorder=1)
     ax.fill_between(steps, mu - sd, mu + sd, color=D_COLOUR, alpha=0.18,
-                    linewidth=0, label="±1 sd over runs")
+                    linewidth=0, zorder=2, label="±1 sd over runs")
     ax.fill_between(steps, mu - sem, mu + sem, color=D_COLOUR, alpha=0.40,
-                    linewidth=0, label="±1 sem")
-    ax.plot(steps, mu, color=D_COLOUR, lw=2.2, label="mean (CE_BW − CE_FW)")
-    ax.axhline(0.0, color="k", ls="--", lw=0.9)
-    # Scale to the SETTLED half of training.  Both arms are still falling
-    # through the first few dozen steps and their difference swings by whole
-    # bits there, which would compress the converged region -- the only part
-    # where the difference means anything -- into a flat line at zero.
-    tail = slice(L // 2, L)
+                    linewidth=0, zorder=2, label="±1 sem")
+    ax.plot(steps, mu, color=D_COLOUR, lw=2.2, zorder=3,
+            label="mean (CE_BW − CE_FW)")
+    ax.axhline(0.0, color="k", ls="--", lw=0.9, zorder=4)
+    # Scale to the SETTLED portion of training, from the aggregate band.
+    #
+    # There are two regimes here and one axis cannot serve both.  Through the
+    # first few dozen steps both arms are still descending and their difference
+    # swings by whole bits -- measured, 30 to 90 times the settled spread, and up
+    # to 8.8 bits on the flower configs.  That swing is optimisation transient,
+    # not the quantity under study.  Later the difference IS the residual
+    # difference the hypothesis is about, and it lives at 0.005 to 0.03 bits.
+    # Scaling to the transient flattens the settled region onto zero and the
+    # panel then says nothing; scaling to the settled region costs only that the
+    # transient leaves the frame, and the loss panel beside it already shows the
+    # descent of both arms.
+    #
+    # The limit comes from the mean and its band rather than from the individual
+    # traces, because the mean and band are what this panel asserts and they
+    # must never be clipped.  Over the tail a max is safe -- there is no
+    # transient left to guard against -- and 1.5x keeps the band clear of the
+    # frame and the legend.
+    # `int(...)`: L // 4.3 is a FLOAT (130 // 4.3 == 30.0), and numpy raises
+    # "slice indices must be integers" on a float slice, so the divisor has to be
+    # made an index explicitly.  The title reads the same value, so the stated
+    # window cannot drift from the one actually used.
+    tail_from = int(L / 4.3)
+    tail = slice(tail_from, L)
     span = max(float(np.nanmax(np.abs(np.concatenate([(mu - sd)[tail],
                                                       (mu + sd)[tail]])))), 1e-6)
-    ax.set_ylim(-span * 1.25, span * 1.25)
+    ax.set_ylim(-span * 1.5, span * 1.5)
     ax.set_xlabel("Gradient step")
     ax.set_ylabel("CE_BW − CE_FW (bits)")
-    ax.set_title(f"Paired difference per step  (y scaled to steps {L//2}–{L})\n"
-                 f"prediction from theory: "
-                 f"{'delta_CE > 0' if spec['C_minus'] > spec['C_plus'] else 'delta_CE < 0'}"
-                 f"  (C− − C+ = {spec['C_minus']-spec['C_plus']:+.4f})",
-                 fontsize=11, fontweight="bold")
-    ax.legend(fontsize=8)
+    if not compact:
+        ax.set_title(f"Paired difference per step — every one of {D.shape[0]} runs\n"
+                     f"y scaled to steps {tail_from}–{L}; the earlier transient "
+                     f"runs off-scale;  prediction: "
+                     f"{'delta_CE > 0' if spec['C_minus'] > spec['C_plus'] else 'delta_CE < 0'}"
+                     f"  (C− − C+ = {spec['C_minus']-spec['C_plus']:+.4f})",
+                     fontsize=11, fontweight="bold")
+    if legend:
+        ax.legend(fontsize=fsl)
     ax.grid(True, alpha=0.3)
-
-    fig.tight_layout()
-    savefig(fig, os.path.join(out_dir, f"{spec['tag']}_trajectories.png"))
 
 
 def plot_summary(records: dict, out_root: str):
@@ -682,6 +777,114 @@ def plot_summary(records: dict, out_root: str):
     savefig(fig, os.path.join(out_root, "summary_delta_ce.png"))
 
 
+def _verdict(mean: float, sem: float, gap: float) -> str:
+    """
+    The three-way call used by both the table and the grid.
+
+    A sign is only claimed when it is distinguishable from zero: delta_CE is a
+    difference of residuals, so a converged predictor with spare capacity gives
+    zero whatever C- - C+ is, and reading a direction off noise is exactly the
+    over-interpretation this repo has been prone to.
+    """
+    if not np.isfinite(mean):
+        return "—"
+    if np.isfinite(sem) and abs(mean) < 2 * sem:
+        return "n.s."
+    return "match" if (mean > 0) == (gap > 0) else "MISMATCH"
+
+
+def _grid_order(records: dict) -> list:
+    """
+    Column order for the grid: coin processes then flower ones, each by
+    DESCENDING C- - C+.
+
+    Families stay together so a column is easy to find, and within a family the
+    theoretical asymmetry decreases left to right -- which is the order that makes
+    the question the grid exists to answer readable along a row: does anything in
+    these panels vary with C- - C+?
+    """
+    rank = {"coin": 0, "flower": 1}
+    return sorted(((t, r) for t, r in records.items() if r.get("runs")),
+                  key=lambda kv: (rank.get(kv[1]["spec"]["kind"], 9),
+                                  -(kv[1]["spec"]["C_minus"]
+                                    - kv[1]["spec"]["C_plus"])))
+
+
+def plot_grid_summary(records: dict, out_root: str,
+                      fname: str = "summary_grid.png"):
+    """
+    Every process's three figures in one 3 x N grid — the whole experiment on a
+    single sheet.
+
+    Rows are the three quantities, columns the processes, so each row is a
+    like-for-like comparison across processes:
+
+        row 1   statistical complexity, empirical against the closed form
+        row 2   final held-out loss, and the paired difference on the right axis
+        row 3   the per-step paired difference, every run plus mean and bands
+
+    Panels are drawn by the same _draw_* helpers as the per-process figures, in
+    `compact` mode, so the grid can never disagree with them.  Row 3 is the
+    difference panel rather than the loss panel: the loss curves are nearly
+    identical across the two arms by construction and differ between processes
+    only in where H∞ sits, whereas the difference is the quantity under study.
+    The absolute loss trajectories remain in <tag>_trajectories.png.
+
+    Y-scales are per column, NOT shared.  H∞ ranges from 0.47 to 2.10 bits across
+    these processes, so a shared axis would compress every panel in order to
+    accommodate the largest; each column is a statement about its own process
+    converging to its own H∞.  The consequence is that bar heights must not be
+    compared by eye between columns -- read the printed numbers.
+    """
+    items = _grid_order(records)
+    if not items:
+        print("  nothing to put in the grid summary")
+        return
+    n = len(items)
+    fig, axes = plt.subplots(3, n, figsize=(4.4 * n, 12.8), squeeze=False)
+
+    for col, (tag, rec) in enumerate(items):
+        spec   = rec["spec"]
+        paired = rec.get("paired") or {}
+        first, last = col == 0, col == n - 1
+
+        _draw_complexity(axes[0][col], rec, compact=True, legend=first)
+        _draw_final_loss(axes[1][col], rec, rec.get("paired"), compact=True,
+                         legend=first, right_label=last)
+        _draw_paired_diff(axes[2][col], rec, compact=True, legend=first)
+
+        gap  = spec["C_minus"] - spec["C_plus"]
+        mean = paired.get("mean", float("nan"))
+        sem  = paired.get("sem", float("nan"))
+        n_div = sum(r["fw"]["diverged"] or r["bw"]["diverged"]
+                    for r in rec["runs"])
+        axes[0][col].set_title(
+            f"{tag.replace('traj_', '')}   ({len(rec['runs'])} repeats"
+            + (f", {n_div} diverged" if n_div else "") + ")\n"
+            f"C+ = {spec['C_plus']:.3f}   C− = {spec['C_minus']:.3f}   "
+            f"C− − C+ = {gap:+.3f}\n"
+            f"ΔCE = {mean:+.4f} ± {sem:.4f}   [{_verdict(mean, sem, gap)}]",
+            fontsize=9, fontweight="bold")
+
+        # Row identity comes from the leftmost column's y-label; repeating it in
+        # every column is noise.
+        if not first:
+            for row in range(3):
+                axes[row][col].set_ylabel("")
+
+    fig.suptitle(
+        "Repeat-statistics summary — every process, every quantity\n"
+        "columns ordered coin then flower, each by descending C− − C+;  "
+        "rows: statistical complexity  |  final held-out loss + paired ΔCE  |  "
+        "per-step paired difference\n"
+        "y-scales are PER COLUMN (H∞ differs by process), so compare numbers "
+        "rather than bar heights across columns;  "
+        "thick error bar = ±1 sem, thin = ±1 sd",
+        fontsize=12, fontweight="bold")
+    fig.tight_layout(rect=[0, 0, 1, 0.955])
+    savefig(fig, os.path.join(out_root, fname))
+
+
 def print_summary(records: dict, out_root: str):
     """The runner's asymmetry table, over repeats instead of folds."""
     print(f"\n{'='*104}\n  ASYMMETRY SUMMARY over repeats  ({out_root})\n{'='*104}")
@@ -694,16 +897,7 @@ def print_summary(records: dict, out_root: str):
         spec = r["spec"]
         mean, sem = pd_["mean"], pd_.get("sem", float("nan"))
         cp, cm = spec["C_plus"], spec["C_minus"]
-        # Only call a sign when it is distinguishable from zero.  delta_CE is a
-        # difference of residuals: a converged predictor with spare capacity
-        # gives 0 whatever C- - C+ is, so a near-zero value is a null result and
-        # not evidence for or against the sign.
-        if np.isfinite(sem) and abs(mean) < 2 * sem:
-            verdict = "n.s."
-        elif (mean > 0) == (cm > cp):
-            verdict = "match"
-        else:
-            verdict = "MISMATCH"
+        verdict = _verdict(mean, sem, cm - cp)      # shared with the grid
         n_div = sum(x["fw"]["diverged"] or x["bw"]["diverged"] for x in r["runs"])
         print(f"  {tag:<26} {cp:>7.4f} {cm:>7.4f} {cm-cp:>+9.4f} "
               f"{mean:>+10.4f} {sem:>8.4f} {pd_['t']:>+7.2f} {pd_['n']:>4} "
@@ -878,6 +1072,7 @@ def main(argv=None):
 
     save_pkl(combined, combined_path)
     plot_summary(combined, out_root)
+    plot_grid_summary(combined, out_root)
     print_summary(combined, out_root)
 
     print(f"\n{'='*70}\n  ALL COMPLETE — {(time.time()-t_start)/60:.1f} min")
