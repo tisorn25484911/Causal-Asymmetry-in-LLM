@@ -1,311 +1,1267 @@
 # Thermodynamic Consequences of Causal Asymmetry in Transformer Language Models
 
-This repository empirically tests the **causal asymmetry** hypothesis from Thompson et al. (2017) using transformer decoder models trained on Hidden Markov Model (HMM) sequences.
+This repository tests, empirically and on processes whose answer is known
+analytically, whether a transformer trained to predict a stochastic process
+*backwards* pays a measurable price when the backward direction requires more
+memory than the forward one.
 
-The central question: if a stochastic process requires more memory to predict in one causal direction than the other (i.e. C+ ≠ C−), do transformer models trained in the harder direction incur a measurably higher cross-entropy loss at convergence?
+The mechanism under test comes from computational mechanics and from Thompson et
+al. (2018): a stationary process has a forward statistical complexity **C⁺** and
+a backward one **C⁻**, the minimum memory an optimal predictor needs in each
+direction. When C⁺ ≠ C⁻ the process is **causally asymmetric** — one direction is
+intrinsically cheaper to model. The question here is whether a finite-capacity
+neural predictor exhibits that asymmetry as excess cross-entropy.
 
----
+**The headline result, stated up front.** Two halves, with opposite outcomes.
 
-## Background
+- **The representational half is confirmed.** The models demonstrably build the
+  ε-machine of the direction they are trained in. Across fourteen trained arms
+  the recovered number of causal states and their occupancy entropy match the
+  closed forms to a mean absolute error of **0.026 bits**, and they do so
+  *asymmetrically in the right direction*: a coin's backward arm recovers three
+  states where its forward arm recovers two, and the flower arms swap when m > n
+  becomes n > m.
+- **The thermodynamic half is not confirmed.** ΔCE = CE_BW − CE_FW is of order
+  0.001–0.003 bits, with standard errors of comparable size; five of seven
+  experiments are statistically indistinguishable from zero. **The extra memory
+  is real, and at this capacity it is free.**
 
-For a stationary stochastic process, the **statistical complexity** C+ (forward) and C− (backward) measure the minimum memory required by an optimal predictor in each direction. When C+ < C− the process is **causally asymmetric** — the forward direction is intrinsically easier to model.
-
-The key theoretical prediction (Thompson et al. 2017):
-
-```
-CE_FW → H∞ + residual_FW
-CE_BW → H∞ + residual_BW
-delta_CE = CE_BW − CE_FW > 0   (backward is harder)
-```
-
-This repository tests that prediction empirically on two processes:
-
-- **Coin HMM** — a two-state HMM parameterised by flip probabilities p, q with 3 observable tokens
-- **Flower HMM** — an n-die, m-face process where forward causal states = n+1 and backward causal states = m+1
-
----
-
-## Repository Structure
-
-```
-.
-├── Data_generation.py           # Coin HMM and Flower process sequence generators
-├── Flower_process_generation.py # Extended Flower process DataLoader
-├── OneHot_model.py              # OneHotDecoder transformer (forward + backward)
-├── Training_model.py            # Training pipeline, CV, callbacks
-├── Model_analysis.py            # All analysis functions (perplexity, UMAP, complexity)
-├── pq_experiment.py             # p-q grid sweep for heatmap experiments
-│
-├── main.py                      # Quick experiment runner (~1.5 hr)
-├── main_large.py                # Overnight high-quality runner
-├── Main_call.py                 # Extended main with additional plots
-│
-├── LLM_asymmetry_testing.py     # Causal asymmetry test suite (all metrics)
-├── Test_data_eval.py            # Model evaluation on freshly generated data
-│
-├── run_experiments.ipynb        # Interactive experiment launcher
-├── sequence_prediction.ipynb    # Token-by-token prediction visualisation
-├── umap_analysis.ipynb          # UMAP latent space analysis
-└── testing.ipynb                # Scratch / development notebook
-```
+That second outcome is what the theory predicts for an over-provisioned,
+converged model — Section 1.2 explains why — so it is a null result rather than a
+refutation, and it is not yet interpretable as either. Section 11 sets out what
+it does and does not license, and what would settle it.
 
 ---
 
-## Model Architecture
+## Contents
 
-Both forward and backward models use the same `OneHotDecoder` class with a single flag changing the causal structure.
+1. [The question](#1-the-question)
+2. [The two processes](#2-the-two-processes)
+3. [Model architecture](#3-model-architecture)
+4. [Experimental design](#4-experimental-design)
+5. [The experiments](#5-the-experiments)
+6. [The analysis](#6-the-analysis)
+7. [Configurations](#7-configurations)
+8. [Repository structure](#8-repository-structure)
+9. [Running](#9-running)
+10. [Results](#10-results)
+11. [What the results mean](#11-what-the-results-mean)
+12. [Limitations and open work](#12-limitations-and-open-work)
+13. [References and related work](#13-references-and-related-work)
 
-```python
-# Forward model: causal (lower-triangular) mask
-model_fw = OneHotDecoder(token_size=3, d_model=64, mode="forward")
+For operating instructions — every flag, every output file, troubleshooting —
+see **`HOW_TO_RUN.md`**. This document is about *what* is being done and *why*.
 
-# Backward model: anti-causal (upper-triangular) mask
-model_bw = OneHotDecoder(token_size=3, d_model=64, mode="backward")
+---
+
+## 1. The question
+
+### 1.1 The hypothesis
+
+For a stationary process, the **forward causal states** are the equivalence
+classes of pasts that induce the same distribution over futures (Shalizi &
+Crutchfield 2001). C⁺ is the Shannon entropy of the stationary distribution over
+those states: the memory, in bits, that an optimal forward predictor must carry.
+C⁻ is the same quantity for the time-reversed process. Generically C⁺ ≠ C⁻ —
+prediction is not a symmetric activity.
+
+Applied to a neural predictor, the conjecture is:
+
+```
+CE_FW  →  H∞ + residual_FW
+CE_BW  →  H∞ + residual_BW
+ΔCE    =  CE_BW − CE_FW  should track  sign(C⁻ − C⁺)
 ```
 
-**Critical design principle**: both models are always trained on the **same forward-data DataLoader**. Only the attention mask and batch convention differ. This is the principled comparison — same data, different causal structure.
+### 1.2 What the design can and cannot show
 
-The backward model's `training_step` swaps the batch so it predicts `x[:-1]` given `x[1:]`, learning to predict each token from its future context.
+**This is the single most important section in this document.** The entropy rate
+H∞ is **time-reversal invariant**: a process and its reverse have the same H∞.
+The code relies on this — one `theory` value is passed to both arms. Therefore
 
-| | Forward model | Backward model |
+```
+ΔCE = CE_BW − CE_FW = residual_BW − residual_FW
+```
+
+ΔCE is a difference of **residuals**, not of entropy rates. An
+unbounded-capacity, fully-converged predictor achieves residual ≈ 0 in *both*
+directions and hence ΔCE ≈ 0 **regardless of C⁻ − C⁺**. ΔCE > 0 is a prediction
+about *memory-bounded* predictors only: the backward direction needs more causal
+states, so at fixed `d_model` and a fixed step budget it leaves a larger
+residual.
+
+Three consequences constrain every claim this repository can make:
+
+1. **Only the sign of ΔCE is predicted**, and only when C⁻ ≠ C⁺. The magnitude
+   has no theoretical anchor, so there is nothing to compare an effect size
+   against.
+2. **A null result is ambiguous.** "No asymmetry" and "capacity was large enough
+   to absorb it" produce the same number. Distinguishing them requires varying
+   capacity — the `d_model` sweep, not yet run.
+3. **The measurement must be paired.** The predicted effect is a few hundredths
+   of a bit at most. Any nuisance difference between the two arms — a different
+   data split, different windows, different initialisation — is of that order or
+   larger, so an unpaired comparison cannot resolve the effect it is looking for.
+
+### 1.3 What is actually measured
+
+Four quantities, in decreasing directness:
+
+| Quantity | How | What it establishes |
 |---|---|---|
-| Attention mask | Lower-triangular (tril) | Upper-triangular (triu) |
-| Position t attends to | x[0..t] (past) | x[t..T] (future) |
-| Max-context position | logits[:, -1, :] | logits[:, 0, :] |
-| Context grows | Rightward | Leftward |
-| Causal states (coin) | C+ = 2 | C− = 3 |
+| **ΔCE** | Held-out cross-entropy of both arms on the same sequences, paired per fold | The thermodynamic claim |
+| **C⁺, C⁻ recovered** | Clustering the model's predictive distribution | Whether the ε-machine was learned at all |
+| **Convergence** | CE against the analytic H∞ | Whether the residuals are small enough for ΔCE to be about asymmetry rather than about optimisation |
+| **p-q map** | Coarse sweep over coin parameters | Where in parameter space the asymmetry is largest |
 
 ---
 
-## Experiments
+## 2. The two processes
 
-### Experiment 1 — Coin HMM (p=0.3, q=0.4)
+Both are hidden Markov models with an analytically known H∞, C⁺ and C⁻. That is
+the point of using them: the answer is known before the model is trained.
 
-Baseline comparison. Both models trained on the same coin sequences, evaluated across 5-fold cross-validation.
+### 2.1 The coin process
 
-Expected: `delta_CE > 0` (BW harder), empirical C− > C+ matching theory.
+Two hidden states, 0 and 1, with `p = P(0→1)` and `q = P(1→0)`. Three
+observable tokens (`Data_generation.coin_generation`):
 
-### Experiment 1.2 — Coin HMM p-q heatmap
+| Token | Emitted when |
+|---|---|
+| `0` | in state 0, and was in state 0 |
+| `1` | in state 1 |
+| `2` | in state 0, having just arrived from state 1 |
 
-Sweeps a grid of (p, q) values to show where causal asymmetry is strongest in parameter space. Produces complexity and perplexity difference heatmaps comparing empirical values to theoretical predictions.
+The true conditionals (`Model_analysis.coin_true_conditional`) are what make this
+a useful test case:
 
-### Experiment 2 — Flower HMM (n=6, m=4)
+```
+forward  P(next | token)          backward  P(previous | token)
+  0 →  [1−p,  p,   0 ]              0 →  [1−p,     0,    p  ]
+  1 →  [ 0,  1−q,  q ]              1 →  [q(1−p), 1−q,  pq  ]
+  2 →  [1−p,  p,   0 ]              2 →  [ 0,      1,    0  ]
+```
 
-Tests a more complex process where forward causal states = n+1 = 7 and backward causal states = m+1 = 5. For this process C− < C+ (backward direction is actually easier), providing an important control case where the asymmetry reverses.
+Tokens 0 and 2 have **identical forward futures** — they are two tokens forming
+**one** forward causal state. Backwards, all three rows differ, so there are
+three. Hence
+
+```
+C⁺ = H( q/(p+q),  p/(p+q) )                        2 states
+C⁻ = H( q(1−p)/(p+q),  p/(p+q),  pq/(p+q) )        3 states
+H∞ = π₀·H₂(p) + π₁·H₂(q)
+```
+
+The backward states **refine** the forward ones — token 1 is state 1; tokens 0
+and 2 split forward-state 0 according to the previous state — so **C⁻ ≥ C⁺ for
+every (p, q)**. The coin is a positive case everywhere in its parameter space,
+which a test asserts.
+
+### 2.2 The flower process
+
+*n* dice with *m* faces each (`Flower_process_generation.flower_process_generation`).
+Each cycle: choose a die *i* uniformly and emit token *i*; roll it and emit token
+*n + j*. Vocabulary n + m, and the sequence strictly alternates
+selection, outcome, selection, outcome.
+
+**`seq_len` is measured in cycles, not tokens** — a sequence is `2 × seq_len`
+tokens long. The first `pre_depth = 10` cycles are discarded.
+
+Forward causal states: one "a roll just happened, the next token is a uniform
+selection" state, plus one state per die (the next token is that die's
+distribution). Their probabilities are ½ and 1/(2n) each, so
+
+```
+C⁺ = 1 + ½·log₂ n
+```
+
+Backward causal states: one "the current token is a selection" state, plus one
+state per **distinguishable** outcome. Two outcomes *j* and *j′* are the *same*
+backward state exactly when they induce the same posterior P(die | outcome) —
+that is, when columns *j* and *j′* of `dice_probs` are proportional. Merging
+those,
+
+```
+C⁻ = 1 + ½·H(π_merged),     π_j = (1/n)·Σᵢ dice_probs[i, j]
+```
+
+That word *distinguishable* is a correction to an earlier version of this
+repository, which counted m + 1 backward states unconditionally. Two consequences
+follow from the corrected form:
+
+- **n = 1 degenerates.** With a single die, P(die | outcome) = 1 for every
+  outcome, so *all* m outcomes collapse into one state and C⁻ = C⁺ = 1. The
+  process `0, X, 0, X, …` with X uniform is exactly time-reversible — a **null**
+  control, not a positive one.
+- **C⁻ ≤ 1 + ½·log₂ m, so C⁻ > C⁺ requires m > n.** Every flower configuration
+  originally in this repository had n > m, which is to say all of them tested the
+  *negation* of the hypothesis. Both signs are now run deliberately, because a
+  result in which the sign of ΔCE follows the sign of C⁻ − C⁺ *across*
+  configurations is far stronger than a single positive case.
+
+Entropy rate: `H∞ = ½·log₂ n + ½·meanᵢ H(dice_probs[i])`.
+
+### 2.3 Reference values
+
+Verified by `tests/test_theory.py` against the closed forms and, for the
+conditionals, against a Monte-Carlo estimate over the generator itself.
+
+| Process | C⁺ | C⁻ | C⁻ − C⁺ | H∞ |
+|---|---|---|---|---|
+| coin p=0.5, q=0.5 | 1.0000 | 1.5000 | +0.5000 | 1.0000 |
+| coin p=0.1, q=0.9 | 0.4690 | 0.8911 | +0.4221 | 0.4690 |
+| coin p=0.3, q=0.4 | 0.9852 | 1.4888 | +0.5036 | 0.9197 |
+| coin p=0.4, q=0.8 | 0.9183 | 1.5656 | +0.6473 | 0.8879 |
+| flower n=1, m=2 (fair) | 1.0000 | 1.0000 | 0.0000 | 0.5000 |
+| flower n=2, m=6 | 1.5000 | 2.1137 | +0.6137 | 1.5343 |
+| flower n=2, m=8 | 1.5000 | 2.4765 | +0.9765 | 1.7800 |
+| flower n=4, m=2 | 2.0000 | 1.4952 | −0.5048 | 1.3364 |
+| flower n=6, m=4 | 2.2925 | 1.9899 | −0.3026 | 2.0985 |
+
+Flower values are for dice drawn from `default_rng(flower_dice_seed = 42)`,
+which is what every run uses, so these are the actual processes trained on.
 
 ---
 
-## Metrics
+## 3. Model architecture
 
-Four metrics are computed per experiment, in increasing strength of signal:
+One class, `OneHot_model.OneHotDecoder`, with a single flag selecting the causal
+direction.
 
-| Metric | Function | What it measures |
+```python
+model_fw = OneHotDecoder(token_size=3, d_model=32, max_len=1999, mode="forward")
+model_bw = OneHotDecoder(token_size=3, d_model=32, max_len=1999, mode="backward")
+```
+
+### 3.1 The two arms
+
+| | Forward | Backward |
 |---|---|---|
-| Perplexity on ground-truth | `perplexity_calculation` | CE loss on same sequences for both models — primary asymmetry signal |
-| CE vs true conditional | `perplexity_ind_CE` | CE against the analytical HMM conditional at every step on ground-truth sequences |
-| Stepwise KL | `stepwise_kl_coin` | D_KL(P_true(·\|cur_tok) || P_model) averaged over all positions |
-| Stationary KL | `kl_from_true_coin` | D_KL(pi_true || pi_model) — weaker sanity check on token frequencies |
+| Attention mask | lower-triangular (`tril`) | upper-triangular (`triu`) |
+| Position *t* attends to | x[0…t] — the past | x[t…T−1] — the future |
+| `training_step` unpacks | `inputs, targets = batch` | `targets, inputs = batch` |
+| Predicts | x[t+1] from x[≤t] | x[t−1] from x[≥t] |
+| Maximum-context position | `T − 1` (last) | `0` (first) |
+| Context accumulates | rightward | leftward |
 
-`perplexity_calculation` is the primary metric. It evaluates both models on the same ground-truth sequences using the correct batch-swap convention for the backward model.
+The masks are **exact mirror images**: summed over positions the total context
+budget is identical, and a test asserts `tril(T) == flip(triu(T))`. The mask is
+therefore *not* a confound between the arms.
 
-### Note on `perplexity_ind_CE`
+The maximum-context row of that table is load-bearing and was once wrong. With a
+`triu` mask, position T−1 attends to *itself alone*; the backward model's
+richest representation is at position **0**. Reading the backward arm's
+complexity at the last position — as an earlier version did — clustered latents
+that encode a single token.
 
-An earlier autoregressive version of this function had a critical bug: for the backward model, context was grown leftward using backward HMM transitions. This gave the model out-of-distribution right-context (backward dynamics) while training always used forward-sequence context. The biased context made the backward model appear artificially accurate, reversing the asymmetry signal. The corrected version uses the ground-truth loader so both models see forward-sequence context exactly as during training.
+The masks are cached per `(T, device)` in a plain dict, deliberately not a
+buffer, so they never enter a checkpoint.
 
-### Statistical complexity
+### 3.2 One block
 
-Empirical complexity is estimated by k-means clustering of the model's latent representations at the max-context position:
-
-```python
-# Forward model: last position has maximum past context
-S_emp_fw = statistical_complexity_empirical(model_fw, loader, use_t="last", k=2)
-
-# Backward model: first position has maximum future context
-S_emp_bw = statistical_complexity_empirical(model_bw, loader, use_t="first", k=3)
-```
-
----
-
-## Outputs
-
-Running `main.py` produces, per experiment:
-
-```
-results/
-├── models/
-│   ├── exp1_coin_p03_q04_fw.pt            # best forward model weights
-│   └── exp1_coin_p03_q04_bw.pt            # best backward model weights
-├── exp1_coin_p03_q04/
-│   ├── *_fw_cv.png                        # forward model CV training curves
-│   ├── *_bw_cv.png                        # backward model CV training curves
-│   ├── *_umap_fw.png                      # forward latent UMAP coloured by token
-│   ├── *_umap_bw.png                      # backward latent UMAP coloured by token
-│   ├── *_complexity_heatmap.png           # empirical vs theoretical complexity
-│   └── *_diff_ppl.png                     # delta perplexity heatmap
-└── all_results.pkl
-```
-
-Running `LLM_asymmetry_testing.py` additionally produces:
-
-```
-results/asymmetry_test/exp1_coin_p03_q04/
-├── *_dual_ppl.png                         # 4-panel: both perplexity metrics FW vs BW
-├── *_kl_distribution.png                  # true vs model stationary token distribution
-├── *_stepwise_kl.png                      # per-token stepwise KL breakdown
-└── *_complexity.png                       # empirical + theoretical C+ / C−
-```
-
----
-
-## Quick Start
-
-```bash
-# Install dependencies
-pip install torch lightning numpy matplotlib scikit-learn umap-learn
-
-# Quick run (~1.5 hours, 500 samples, 15 epochs)
-python main.py
-
-# Overnight high-quality run (2000 samples, 80 epochs, 16-pt p-q grid)
-python main_large.py
-
-# Causal asymmetry test suite (requires trained models in results/models/)
-python LLM_asymmetry_testing.py
-
-# Evaluate models on freshly generated data with UMAP and cumulative PPL
-python Test_data_eval.py
-```
-
-Or run interactively:
-
-```bash
-jupyter notebook run_experiments.ipynb
-```
-
----
-
-## Configuration
-
-All experiment parameters are in the `CFG` dict at the top of each runner file:
+`n_layers` blocks are applied in sequence. Each is pre-norm with two residual
+connections:
 
 ```python
-CFG = dict(
-    d_model         = 64,     # transformer hidden dimension
-    n_layers        = 2,      # attention + FFN layers
-    lr              = 5e-3,
-    train_chunk_len = 512,    # sequence chunk length (OOM prevention)
-    n_folds         = 5,      # cross-validation folds
-
-    # Coin HMM
-    coin_p1         = 0.3,  coin_q1 = 0.4,
-    coin_num_samples = 1500,
-    coin_seq_len    = 2000,
-    coin_max_epochs = 60,
-
-    # Flower HMM
-    flower_n = 6, flower_m = 4,
-
-    # p-q heatmap
-    pq_grid = [0.05, 0.15, ..., 0.95],  # 12 points → 144 models
-    pq_epochs = 20,
-)
+normed = ln1(x);  x = x + attn(normed, normed, normed, mask=mask)
+normed = ln2(x);  x = x + ffn(normed)
 ```
 
-The overnight config in `main_large.py` uses 2000 samples, 80 epochs, and a 16-point p-q grid (256 models per direction).
+where `attn` is single-head scaled dot-product attention (`wq`, `wk`, `wv`, each
+`d_model × d_model`) and `ffn` is `Linear(d, 4d) → ReLU → Linear(4d, d)`. The
+input is a **fixed random projection** of the one-hot token, and the output is a
+`Linear(d_model, token_size)` read directly off the residual stream.
 
----
+### 3.3 Deviations from a standard decoder, and why they matter
 
-## Causal State Counts
+Four, all deliberate, and all worth knowing before comparing anything here to a
+conventional transformer:
 
-| Process | Forward C+ | Backward C− | Asymmetry direction |
+- **The input projection is frozen.** `rand_prj` is a registered *buffer*, not a
+  parameter. It was an `nn.Parameter`, which made `one_hot @ rand_prj`
+  mathematically a learned embedding table despite the class name and the "fixed
+  random projection" comment. Freezing it is what makes a `d_model` sweep
+  interpretable: varying `d_model` then varies representational capacity alone,
+  rather than capacity plus the size of a learned input code.
+- **Single head, and no output projection.** Attention returns `prob @ V`
+  directly; there is no `W_O`.
+- **No dropout, no weight decay, no gradient clipping, no learning-rate
+  schedule.** Plain Adam. This matters: it is the direct cause of the training
+  divergence documented in Section 4.6.
+- **No final LayerNorm.** `output_prj` reads the unnormalised residual stream.
+
+`reverse_pos_for_backward` exists and is **never set anywhere**. Both arms
+receive `PE[t]` increasing left to right, so for the forward model the positional
+index increases with context length and for the backward model it decreases.
+This is the one remaining architectural asymmetry between the arms and the
+most plausible source of a spurious ΔCE. Testing it is open work
+(Section 12).
+
+### 3.4 The loss
+
+`cross_ent_onehot` returns cross-entropy in **bits** and perplexity as `2**CE`:
+
+```python
+loss = F.cross_entropy(logits.reshape(-1, V), targets.reshape(-1)) / math.log(2)
+```
+
+Everything downstream is in bits, comparable directly against H∞, C⁺ and C⁻.
+The implementation matters. The natural-looking form
+
+```python
+-(target_prob * logits.softmax(-1).log2()).sum(dim=1)
+```
+
+returns **NaN** as soon as any non-target class probability underflows to exactly
+zero: that term is `0 · −inf`, and the NaN propagates through the sum and poisons
+the whole batch even though the target class was fine. This is reachable rather
+than hypothetical — both processes contain deterministic transitions, and
+cross-entropy on a deterministic transition drives the logit gap toward infinity.
+Measured: at logit scale 200 the old expression returns NaN where the true value
+is 0.0. `F.cross_entropy` uses log-sum-exp internally and is exact at any logit
+scale.
+
+### 3.5 Capacity
+
+Trainable parameters are `n_layers · (11·d² + 12·d) + d·V + V`:
+
+| `d_model` | `n_layers` | Vocabulary | Parameters |
 |---|---|---|---|
-| Coin HMM (any p, q) | 2 states | 3 states | C− > C+ (forward easier) |
-| Flower n=6, m=4 | 7 states (n+1) | 5 states (m+1) | C+ > C− (backward easier) |
+| 32 | 2 | 3 | 23,395 |
+| 32 | 2 | 10 | 23,626 |
+| 64 | 2 | 3 | 91,843 |
 
-The Flower experiment serves as a control: theory predicts `delta_CE < 0` (FW harder), the opposite of the coin result.
+Hold this beside the quantity being measured: an optimal predictor of the coin
+needs **0.5 to 1.6 bits** of memory, and the model carries a 32-dimensional float
+residual stream. The mismatch of scales is, as Section 11 argues, the whole story
+of the null result.
 
----
-
-## Key Design Decisions
-
-**Same DataLoader for both models.** Any difference in training data would confound the comparison. The backward model receives the same sequences as the forward model — only the mask and batch swap differ.
-
-**Chunked training, full-length analysis.** Full T=2000 sequences allocate O(T²) memory per attention layer. `ChunkedDataset` samples random 512-token windows per batch. However, `max_len` is always set to the full sequence length so the positional encoding table covers the entire range — analysis on full sequences remains in-distribution.
-
-**`use_t="last"` for forward, `"first"` for backward in complexity estimation.** The causal mask means maximum context is accumulated at the last position for forward models and the first position for backward models. Clustering at any other position mixes different context lengths and produces noisy estimates.
-
-**`perplexity_calculation` as the primary metric.** It uses the existing batch-swap convention, evaluates both models on the same ground-truth data, and directly produces CE values comparable to H∞. It is the most direct and unambiguous measure of causal asymmetry in this setting.
+`n_layers` is 2 in every configuration and is deliberately never varied, because
+depth is part of the same capacity budget as `d_model`; varying both would make a
+change in ΔCE attributable to neither.
 
 ---
 
-## Reference
+## 4. Experimental design
 
-Thompson, J., Garner, A. R., Mahoney, J. R., Vanner, M. R., Gu, M., & Modi, K. (2017). Causal asymmetry in a quantum world. *Physical Review X*, 8(3), 031013.
+### 4.1 Both arms train on the same forward data
+
+The backward model is **not** trained on reversed sequences. It sees the same
+forward-generated sequences as the forward model and differs only in its mask and
+its batch convention. Reversing the data would confound the comparison with a
+change of dataset; the point is to hold the process fixed and change only the
+causal direction of prediction.
+
+An earlier version of the repository contained a third notion of "backward" — a
+`mode="backward"` branch in the data loader that reversed the sequences
+themselves — which no experiment used. It has been removed rather than left as a
+trap.
+
+### 4.2 Pairing the two arms
+
+Per Section 1.2, the effect is smaller than plausible nuisance differences, so
+the two arms are made **paired** at every level. Given the same seed, fold *k* of
+the forward run and fold *k* of the backward run share:
+
+- the same generated sequences;
+- the same chunk windows (`ChunckDataset` draws one offset per sequence once at
+  construction, so `__getitem__` is a pure function of the index);
+- the same hold-out test set and the same fold membership (`random_split` and
+  `randperm` are given explicit seeded generators);
+- the same batch order (each fold loader gets `Generator().manual_seed(seed + fold)`);
+- the same weight initialisation (`torch.manual_seed(seed·1000 + fold)` before
+  each fit).
+
+Each of these was once absent, and each mattered. The window bug is the
+instructive one: both arms were handed the *same loader object*, and offsets were
+drawn from a stateful RNG at access time, so the forward run advanced the
+generator and the backward run trained on **different windows of the same
+sequences**. Validation also redrew fresh windows at every recorded step, so the
+validation curve carried window noise on top of learning signal and "best fold"
+was chosen partly on which fold happened to draw easy windows.
+
+The cost of the fix: a sequence now contributes one window for the whole run
+rather than a fresh one each epoch. That is a deliberate trade — exact pairing is
+what the study rests on, and window diversity is recoverable by generating more
+sequences.
+
+Pairing does **not** give bit-reproducibility across invocations on Apple MPS.
+Measured: initialisation is identical and the first loss matches to eight
+decimals, then trajectories diverge from the first backward pass. The same test
+on CPU is exactly repeatable. CPU is ~6× slower, so MPS is the default and
+`accelerator="cpu"` is available when exact reproducibility is worth the wall
+clock. Pairing is unaffected either way.
+
+### 4.3 Chunked training
+
+Attention is O(T²) in memory, and sequences are 2,000–4,000 tokens.
+`ChunckDataset` therefore takes one fixed-length window per sequence
+(`train_chunk_len` = 256 or 512).
+
+`max_len` — the positional-encoding table size — is nevertheless set to the
+**full** input length, so the table covers the whole range regardless of what is
+fed in.
+
+### 4.4 Splits, and what is held out
+
+```
+500 sequences
+├── 100  (20 %)  held-out test set, never trained on, shared by both arms
+└── 400  (80 %)  train+val pool
+    └── 5 folds: each fold trains on 320 and validates on 80
+```
+
+Every fold model is then evaluated on the held-out 100. The **paired ΔCE is
+computed from those held-out per-fold cross-entropies**, so the headline number
+is out-of-sample.
+
+Two quantities are *not* out-of-sample, and this is stated wherever they are
+reported: the empirical complexity and the latent figures are computed over the
+whole dataset, roughly 80 % of which the model trained on.
+`plot_state_clusters.py` exists to quantify what that costs, by drawing the same
+figure for train-seen and held-out sequences side by side.
+
+### 4.5 Analysis must run at the training chunk length
+
+This was the most consequential finding of the rewrite, and the null control is
+what caught it.
+
+An earlier version ran analysis on **full-length** sequences, on the stated
+grounds that "analysis on full sequences remains in-distribution". **That claim
+is false whenever `chunk_len` < full sequence length.** A chunk is fed to the
+model as a standalone sequence, so the positional-encoding index is the position
+*within the chunk*: the model only ever sees PE indices [0, chunk). Evaluating at
+full length asks it to extrapolate to positions it has never been trained on.
+
+Measured on the control coin checkpoint (chunk 512, evaluated at T = 999,
+H∞ = 1.0):
+
+| positions | CE |
+|---|---|
+| 0–511 (trained) | **1.0249** — converged |
+| 512–998 (never seen) | 1.5563 |
+| whole sequence | **1.2840** ← what was being reported |
+
+So the coin arm had converged all along; the 0.28-bit "failure to converge" was
+extrapolation error.
+
+Why this is fatal rather than merely inaccurate: it biases the two arms
+**asymmetrically**. The forward arm's complexity is read at the last position and
+the backward arm's at position 0 — correctly, those are the maximum-context
+positions. At full length the forward read is at an untrained position and the
+backward read at a trained one, so the two arms are measured under different
+amounts of extrapolation, and ΔCE is a difference between them.
+
+The first re-run of the controls after this was noticed reported **ΔCE = −0.4210
+on a process that is exactly time-reversible** — precisely the failure a null
+control exists to detect. `make_analysis_loader` now emits deterministic windows
+at the training chunk length, from a seed offset from the training one. On the
+same checkpoint:
+
+| | before | after | theory |
+|---|---|---|---|
+| CE | 1.2859 | **1.0235** | 1.0000 |
+| C⁺ empirical | 0.9863 | **0.9982** | 1.0000 |
+| C⁻ empirical | 1.5458 | **1.5061** | 1.5000 |
+
+### 4.6 Training divergence
+
+Training on these processes is only marginally stable, and the failure mode is
+not a bad local optimum. Folds **reach H∞ and then blow up** — to CE of 15 to 58
+bits on a 3-token process, far worse than the 1.585 a uniform predictor achieves
+— then partially recover. Because they recover, the failure cannot be diagnosed
+from the final loss; `Training_model.diagnose_divergence` detects the
+reach-then-rise shape instead.
+
+**The cause is the same deterministic transitions that caused the NaN of Section
+3.4.** Cross-entropy on a deterministic transition has no finite minimiser, so
+gradient descent keeps enlarging the logit gap even after the loss has stopped
+improving, until one step overshoots. Over 80 epochs the training loss sits flat
+at H∞ from step 100 to step 800 while the maximum logit magnitude grows from 2.9
+to 8.7 and peaks at 12.8. Nothing in the loss curve gives warning.
+
+Single-factor ablation, holding the process fixed and changing one thing at a
+time from a QUICK baseline (3 seeds each, recorded in `factorial.log`):
+
+| Configuration | Steps | Diverged | First blow-up |
+|---|---|---|---|
+| A QUICK baseline | 160 | 0/3 | — |
+| B + epochs 80 | 1280 | **3/3** | step 255 |
+| C + d_model 64 | 160 | 1/3 | step 88 |
+| D + lr 5e-3 | 160 | 0/3 | — |
+| E + chunk 512 | 160 | 0/3 | — |
+| F + batch 64 | 80 | 0/3 | — |
+| G + n_seq 2000 | 630 | 2/3 | step 192 |
+| H LARGE-like (all) | 2560 | **3/3** | step 145 |
+
+Only the factors that increase the **number of gradient steps** produce
+divergence. Learning rate, chunk length and batch size have no effect in
+isolation. The onset window is roughly step 90 to 255.
+
+Optimiser variants on the control flower process (6 seeds each, `divtest.log`):
+
+| Configuration | Diverged |
+|---|---|
+| MPS, Adam, lr 5e-3 (current) | 4/6 |
+| MPS, AdamW, weight decay 0.01 | 1/6 |
+| MPS, Adam, lr 1e-3 | 0/6 |
+| CPU, Adam, lr 5e-3 | 0/6 |
+
+So it is an *interaction*: the landscape is sharp enough that MPS's numerical
+noise tips it over where CPU's does not. Weight decay is the principled fix,
+since it restores a finite optimum.
+
+**It is left unfixed deliberately**, because changing the optimiser would change
+every number in the study and require re-running everything. The consequence is
+recorded rather than concealed: QUICK's 100 steps per fold stop *before* the
+onset window and all its folds converge, which is why QUICK is the run that gets
+reported, and why LARGE's cross-validation does not (Section 10.5).
 
 ---
 
-## Related Work
+## 5. The experiments
 
-### Causal Asymmetry and the Primary Reference
+### 5.1 Experiment 1 — coin, cross-validated
 
-**Thompson et al. (2018)** — *Causal asymmetry in a quantum world.* Physical Review X, 8(3), 031013.
-The direct theoretical foundation for this repository. Establishes that for causally asymmetric processes C+ ≠ C−, and that quantum models can exploit this gap. This work tests the same asymmetry signal in classical transformer models.
+Forward and backward arms on the same coin sequences at `(coin_p1, coin_q1)`,
+five-fold CV, then: attention heatmaps, latent UMAPs, recovered causal states,
+empirical complexity against the closed form, and the paired ΔCE.
 
-**Papadopoulos, Wenger & Hongler (2024)** — *Arrows of Time for Large Language Models.* arXiv:2401.17505.
-The closest prior empirical study to this work. Tests whether large language models (GPT-2, LLaMA) assign higher perplexity to reversed text than forward text, finding a consistent forward-time preference. This repository provides a controlled, theoretically grounded version of that test on HMM processes where the ground-truth asymmetry is analytically known.
+### 5.2 Experiment 1.2 — a second coin, plus the p-q sweep
 
-**Ren, Ichter & Majumdar (2024)** — *Thinking Forward and Backward: Effective Backward Planning with Large Language Models.* arXiv:2411.01790.
-Explores asymmetry in LLM reasoning by comparing forward and backward chain-of-thought. Empirically shows that backward planning is harder for LLMs on certain tasks, consistent with the causal asymmetry hypothesis operating at the reasoning level.
+The same, at `(coin_p2, coin_q2)`, and additionally a sweep over a grid of
+(p, q) values training a fresh pair of models per grid point. Four heatmaps are
+produced: empirical complexity forward and backward, theoretical complexity
+forward and backward, their differences, and ΔPPL.
+
+**The sweep is exploratory, not a measurement**, for three reasons that should be
+read before any heatmap is quoted: it uses **no** held-out split, so its
+perplexities are in-sample; it trains on **full-length** 199-token sequences with
+no chunking, a different regime from the main experiments; and it runs a single
+short fit per grid point with no cross-validation. It maps *where* in parameter
+space the asymmetry is largest; it does not measure how large.
+
+The sweep is also the dominant cost of the LARGE configuration — 512 models,
+about 2.5 of its 3.5 hours — and it is the one part that gains nothing from the
+validation-cadence optimisation, because it trains without a validation loader.
+
+### 5.3 Experiment 2 — flower, both signs
+
+One experiment per entry in `flower_configs`, currently one with m > n (predicting
+ΔCE > 0) and one with n > m (predicting ΔCE < 0). The runner prints the
+prediction *before* training and scores the outcome against that configuration's
+own prediction rather than against a blanket expectation.
+
+`k` for the fixed-k complexity estimator is n+1 forward and m+1 backward — the
+actual causal-state counts, not `n+m` for both as an earlier version used. Since
+S = H(cluster occupancy) ≤ log₂ k, an inflated k inflates both numbers and
+destroys the comparison. Note that m+1 is an *upper bound* backward: indistinguishable
+outcomes merge (Section 2.2), which is exactly what the recovered k̂ detects.
+
+### 5.4 The controls — `sanity_check.py`
+
+Two processes with opposite predictions, and a result is only interpretable if
+both come out right.
+
+- **Positive control**: coin p = q = 0.5. H∞ = 1.0 exactly, C⁺ = 1.0, C⁻ = 1.5.
+  Predicts ΔCE > 0.
+- **Null control**: flower n = 1, m = 2, fair die. C⁻ = C⁺ = 1.0 and the process
+  is exactly time-reversible. Predicts ΔCE ≈ 0.
+
+The null control is the more important of the two: a pipeline that reports
+ΔCE > 0 on a time-reversible process is measuring an artefact of the
+architecture, not causal asymmetry. It has already earned its place twice — it
+caught the analysis-length defect of Section 4.5, and it is what forced the
+correction of the flower closed form in Section 2.2, since this arm was
+originally labelled a *positive* case and its correct answer (ΔCE ≈ 0) was being
+printed as `FAIL`.
+
+Verdicts are three-way — `PASS`, `INCONCLUSIVE`, `FAIL` — because a near-zero
+ΔCE on the *positive* control is not a refutation, for the reason in Section 1.2.
+An earlier version scored it with a bare sign test and reported −0.0006 bits, six
+ten-thousandths of a bit, as a failure.
+
+### 5.5 The repeat harness — `run_statistical_trj.py`
+
+Seven processes × 100 repeats × both directions. Each repeat regenerates its
+process from a fresh seed and trains one model per arm.
+
+This exists to fix a specific weakness. Every standard error reported by
+`run_experiments.py` is computed over the five CV folds of a single seed, and
+those folds **share a training set**: the quantity measured is fold-to-fold
+variability, not sampling variability over datasets, so it is a lower bound on
+the true uncertainty and cannot support a claim about the sign of ΔCE. Repeats do
+not share a training set, so their spread is sampling variability.
+
+Design points: one fit per repeat rather than a CV, because reporting the best of
+five folds is a minimum over five draws and not a sample from the same
+distribution as a single draw; flower dice pinned to `flower_dice_seed`, since the
+dice *are* the process and resampling them would average over different
+processes; and uniform settings across all seven processes so they are comparable
+to each other. Within a repeat the two arms are paired exactly as in Section 4.2.
+
+Per process it produces the complexity with error bars over repeats, the final
+loss as three bars (forward, backward, and their paired difference), and all
+trajectories with both mean curves and a shaded interval.
+
+**Verified end to end on short runs; the full 100-repeat run has not yet been
+performed**, so no results from it appear in Section 10.
+
+### 5.6 The causal-state figures — `plot_state_clusters.py`
+
+For every experiment and every distance metric, a 2 × 2 figure: forward and
+backward arms, train-seen and held-out sequences. Each panel is a UMAP of the
+model's predictive distribution at the maximum-context position, with **colour
+encoding the token** and **marker shape the recovered causal state**.
+
+The two encodings are independent, which lets the central claim be read straight
+off the figure: on the coin's forward arm, tokens 0 and 2 appear in *different
+colours* with the *same marker*, inside one group — two tokens, one causal state.
+
+The split is reproduced exactly rather than approximated: `random_split` draws
+`randperm(N, generator)` and slices it, so the partition depends only on N and the
+seed, and the reproduction is verified against the training pipeline's own
+indices by a test.
 
 ---
 
-### Computational Mechanics and Statistical Complexity
+## 6. The analysis
 
-**Shalizi & Crutchfield (2001)** — *Computational mechanics: Pattern and prediction, structure and simplicity.* Journal of Statistical Physics, 104(3), 817–879.
-The formal foundation for ε-machines, causal states, and statistical complexity C+. Defines the forward causal state representation used throughout this project and establishes the connection between minimal predictive memory and thermodynamic cost.
+### 6.1 Loss and perplexity
 
-**Crutchfield & Feldman (1997)** — *Statistical complexity of simple one-dimensional spin systems.* Physical Review E, 55(2), R1239.
-Early demonstration of computational mechanics on spin chains — closely related to the HMM processes studied here. Shows how C+ varies across parameter space, motivating the p-q heatmap experiments in Experiment 1.2.
+`perplexity_calculation` is the comparison metric. Both models are scored on the
+**same ground-truth sequences**, using each arm's batch convention, and CE is
+accumulated **token-weighted** so that `PPL = 2**CE` holds by construction.
 
-**Tan et al. (2014)** — *Towards quantifying complexity with quantum mechanics.* European Physical Journal Plus, 129(9), 191.
-Extends the complexity framework to quantum models and quantifies the advantage quantum memory provides over classical causal states. Provides the theoretical context for why C+ and C− differ and what the gap means thermodynamically.
+Both properties were once wrong in ways worth recording, because both were
+silent. Perplexity was computed as `mean(2**CE_batch)` rather than `2**mean(CE)`;
+by Jensen's inequality that is biased high, and on a realistic spread of
+per-batch CE the bias is **+0.041 bits** — the same order as the ΔCE being
+measured. The accumulators were also divided by the number of batches, so a
+ragged final batch counted as much as a full one.
+
+### 6.2 Statistical complexity: two estimators, and why the second is better
+
+**`statistical_complexity_empirical`** — k-means on the latent vectors at the
+maximum-context position, at a k the caller supplies; S = H(cluster occupancy).
+This is what the earlier literature in this repository reported, and it has a
+structural weakness: **S ≤ log₂ k, so it confirms whatever k it is handed.** It
+also cannot discover that two tokens are one state.
+
+**`recover_causal_states`** — the better estimator, and the reasoning behind it is
+the interesting part. A causal state is an equivalence class of histories that
+induce the same distribution over the **future**. It is *not* a region of latent
+space. So the thing to cluster is the model's **predictive distribution**,
+`softmax(output_prj(latent))`, not the latent: two histories in the same causal
+state must predict alike, but nothing forces the network to give them the same
+latent, and in practice it does not.
+
+Measured on the coin's forward arm, where tokens 0 and 2 are one causal state:
+
+```
+latent distance    d(tok0, tok2) = 1.59   against a true state gap of 19.10
+predictive dist.   d(tok0, tok2) = 0.041  against a true state gap of  1.065
+within-token spread              = 0.004
+```
+
+Both carry the state structure, but the latent also carries token identity, which
+the state does not depend on. Clustering is agglomerative with a **distance
+threshold** and `n_clusters=None`, so k falls out of the data; complete linkage,
+so a cluster is a set whose members are *all* mutually within tolerance — the
+literal reading of "the same predictive distribution to within tolerance".
+
+**The threshold is a genuine free parameter and no single value is correct.** The
+smallest true separation between backward states ranges from 0.135 at
+p = 0.1, q = 0.9 to 0.612 at p = q = 0.5, so a threshold that resolves one
+configuration merges another. `recover_causal_states` therefore always returns and
+prints k̂ across a grid of thresholds plus the **plateau** — the k that survives
+the widest span — because "k̂ = 2, stable for tolerances 0.10 to 0.60" is
+defensible where a single number is not.
+
+### 6.3 Distances on the probability simplex
+
+Predictive distributions are points on a simplex, where Euclidean geometry is not
+the natural one. Three metrics are implemented, with per-metric thresholds
+because their ranges differ:
+
+| Metric | Definition | Range | Threshold | Arms correct |
+|---|---|---|---|---|
+| `euclidean` | √Σ(pᵢ−qᵢ)² | [0, √2] | 0.100 | 13/14 |
+| `tv` | ½·Σ\|pᵢ−qᵢ\| | [0, 1] | 0.075 | 13/14 |
+| `js` | √(Jensen–Shannon divergence) | [0, 1] bit | 0.075 | 12/14 |
+
+Jensen–Shannon has the strongest theoretical claim. Raw KL is unusable as a
+clustering metric — asymmetric, unbounded, and infinite wherever q = 0 < p, which
+is fatal here because a trained model drives probabilities to ~1e-6. JS repairs
+all three by comparing both distributions to their mixture: it is symmetric by
+construction, bounded by 1 bit, always finite, and its square root satisfies the
+triangle inequality (Endres & Schindelin 2003) — which is what a
+distance-threshold clusterer actually requires.
+
+**On this data it is nevertheless marginally worse than plain L2.** That is
+worth stating plainly, since an earlier note in this repository claimed JS
+"doubles the safe window" — measured on two arms of a single experiment, and not
+surviving the full fourteen. All three agree on 12 or 13 of 14 and disagree only
+on the high-k flower backward arms, where the model itself under-resolves the
+states.
+
+### 6.4 Latent visualisation, and how it misleads
+
+UMAP figures are kept, but annotated, because they were actively misleading in
+two distinct ways.
+
+**They used to show one trajectory, not a distribution.** The code embedded
+`latents.reshape(-1, d)[:n_pts]`. The reshape is row-major, so those first rows
+are every position of the first ⌈n_pts/T⌉ sequences — four sequences at chunk
+256, and at T = 999 with `n_pts = 500`, a **single** sequence. Every latent figure
+in the repository was one realisation.
+
+Two panels are now drawn, because each is misleading alone:
+
+- **`per_sequence`** — one position per sequence, at the maximum-context position
+  for that direction. This is the exact slice the complexity estimator clusters,
+  so the picture and the number cannot tell different stories, and since all
+  points share a context length any spread is structure.
+- **`random`** — uniform over (sequence, position) across all sequences, minus a
+  **direction-aware** burn-in: the first positions for a forward model, the
+  *last* for a backward one. Richer, but mixes context lengths.
+
+**UMAP is scale-free, so a blob count is not a state count.** It builds a k-NN
+graph, so what matters is separation relative to *local* spread, not absolute
+distance. On the coin's forward arm the model has not perfectly merged tokens 0
+and 2 — they sit 0.041 apart against a true state gap of 1.065, 26× larger — but
+the within-token spread is 0.004, giving a separation-to-spread ratio of 10.8,
+which reads to a k-NN graph as a clean boundary. So the figure drew **three**
+blobs for a two-state process. Meanwhile k-means at k=2 in the full 32-dimensional
+space recovers exactly {0,2} versus {1} with silhouette 0.967, *higher* than
+k=3's 0.941.
+
+Correcting the sampling did not cause this; it **exposed** it, by removing the
+context-length smear that had been blurring the sub-split away. The figures now
+carry k̂ and an explicit reminder, plus a third panel showing the predictive
+distribution jittered at a quarter of the state tolerance, which draws causal
+states rather than tokens.
+
+### 6.5 Attention
+
+`FW_BW_attention_comparison` draws both arms on the same short prefix with a
+shared colour scale. Attention maps are retained **only** inside a
+`capture_attention()` context manager: a (B, T, T) map at B = 32, T = 1999 is
+511 MB retained per forward pass, which only the plotting helpers ever need. The
+plotted map is the **final layer only**, so at `n_layers = 2` the figure
+under-reports what the model does; every layer's map is available on
+`last_attention_layers`.
+
+### 6.6 Metrics kept for reference, not comparison
+
+Two functions in this repository must not be used to compare the arms, and are
+named and documented accordingly:
+
+- **`self_generated_entropy_rate`** (formerly `perplexity_ind_model`) samples a
+  sequence *from the model* and scores the model's log-loss on that same
+  sequence. It is an estimate of the model's own entropy rate, and a degenerate,
+  over-confident model **minimises** it. Each model is evaluated on its own
+  sequence from its own state distribution, so it cannot say which of two models
+  is better. It was once the headline chart of one evaluator.
+- **`perplexity_ind_CE`** scores the model against the analytic conditional
+  (a soft label) on ground-truth sequences. This is legitimate, but note the
+  history: an earlier autoregressive version grew the backward model's context
+  leftward using *backward* HMM transitions, giving it out-of-distribution
+  context and making the backward arm look artificially accurate — reversing the
+  asymmetry signal. It now uses the ground-truth loader so both arms see forward
+  sequences, exactly as in training.
 
 ---
 
-### Quantum Models of Complexity
+## 7. Configurations
 
-**Gu et al. (2012)** — *Quantum mechanics can reduce the complexity of classical models.* Nature Communications, 3(1), 762.
-Demonstrates that quantum models can simulate stochastic processes using strictly less memory than any classical model. Directly motivates the question of whether neural network models (which are classical) can nevertheless exploit causal asymmetry through learned representations.
+All configurations live in `configs.py`, each with its own `out_root` so two
+cannot overwrite each other's weights. Tags are **derived from parameter values**
+(`utils.coin_tag`, `utils.flower_tag`), so a tag can never disagree with the run
+that produced it — a real defect once, when two runners used the same tag literal
+at different parameters and overwrote each other's checkpoints.
 
-**Suen et al. (2017)** — *The classical-quantum divergence of complexity in modelling spin chains.* Quantum, 1, 25.
-Analyses the gap between classical and quantum statistical complexity across a family of spin-chain processes. The Flower HMM in this repository is structurally similar to the processes studied here.
+| | SMOKE | QUICK | LARGE | QUICK_LARGE_HMM |
+|---|---|---|---|---|
+| `out_root` | `results_smoke` | `results_quick` | `results_large` | `results_quick` |
+| `d_model` | 16 | 32 | 64 | 32 |
+| `lr` | 1e-2 | 1e-2 | 5e-3 | 1e-2 |
+| `train_chunk_len` | 64 | 256 | 512 | 256 |
+| Sequences | 40 | 500 | 2000 | 500 |
+| Coin length | 200 | 2000 | 2000 | 2000 |
+| Epochs | 3 | 10 | 80 | 10 |
+| Batch | 8 | 32 | 64 | 32 |
+| Folds | 2 | 5 | 5 | 5 |
+| p-q grid | 2 pts | 10 pts | 16 pts | 10 pts |
+| Flower configs | (2,3), (3,2) | (2,6), (4,2) | (2,8), (6,4) | (2,8), (6,4) |
+| Runtime | ~2 min | ~9 min | ~3.5 h | ~9 min |
 
-**Elliott et al. (2022)** — *Quantum adaptive agents with efficient long-term memories.* Physical Review X, 12(1), 011007.
-Shows that quantum agents can maintain efficient long-term memory by exploiting causal structure. Provides the broader context for why causal asymmetry matters for memory-bounded agents — a category that includes transformers with finite model dimension.
+`n_layers = 2`, `seed = 0`, `val_every_n_steps = 25` and `state_tol = 0.10` are
+shared by all.
+
+**QUICK_LARGE_HMM** exists because QUICK and LARGE differ along four axes at
+once — data volume, capacity, optimisation, *and the processes themselves*, which
+have different entropy rates and different theoretical asymmetries. That last
+one makes them non-comparable. Running LARGE's processes at QUICK's settings
+holds the process fixed, so QUICK versus LARGE becomes a controlled comparison of
+scale, capacity and learning rate. It writes into QUICK's `out_root`, and because
+tags are derived, the process the two configurations share is not duplicated.
 
 ---
 
-### Thermodynamics of Computation
+## 8. Repository structure
 
-**Landauer (1961)** — *Irreversibility and heat generation in the computing process.* IBM Journal of Research and Development, 5(3), 183–191.
-The foundational result connecting logical irreversibility to thermodynamic cost. The causal asymmetry hypothesis can be viewed as a consequence of Landauer's principle applied to the memory operations of a predictor: models of causally asymmetric processes must perform more irreversible operations in one direction, incurring higher representational cost.
+```
+Foundation
+├── Data_generation.py            coin generator, CoinDataset, make_loader
+├── Flower_process_generation.py  flower generator, FlowerDataset (single definition)
+├── OneHot_model.py               OneHotDecoder, attention, PE, loss in bits
+├── Training_model.py             chunking, loaders, CV pipeline, recorder, divergence
+├── utils.py                      tags, filesystem, entropy rate, checkpoint sidecars
+└── configs.py                    every configuration, one place
+
+Analysis
+├── Model_analysis.py             CE/PPL, complexity (both estimators), distances,
+│                                 UMAP, attention, paired ΔCE, result slimming
+└── pq_experiment.py              the p-q grid sweep and its heatmaps
+
+Runners
+├── run_experiments.py            THE training runner — exp1, exp1.2, exp2
+├── sanity_check.py               positive and null controls
+├── run_statistical_trj.py        seed-repeat harness, 7 processes x 100 repeats
+├── plot_state_clusters.py        causal states, train vs held-out, per metric
+├── Test_data_eval.py             post-hoc evaluation of saved weights
+└── LLM_asymmetry_testing.py      post-hoc metric suite (LaTeX figures)
+
+Verification and documentation
+├── tests/test_theory.py          61 regression tests
+├── build_walkthrough.py          regenerates walkthrough.ipynb
+├── HOW_TO_RUN.md                 the operating manual
+└── implementation_logbook/       the audit and the phase handoffs
+```
+
+Notebooks (`walkthrough.ipynb`, `metric_panel_plot.ipynb`,
+`sequence_prediction.ipynb`, `umap_analysis.ipynb`) read the saved pickles and
+weights; `walkthrough.ipynb` is generated from `build_walkthrough.py` rather than
+edited by hand so it can be regenerated after a re-run.
+
+Every `.pt` is written with a **JSON sidecar** recording `d_model`, `n_layers`,
+`token_size`, `max_len`, `seed` and the process parameters, and both post-hoc
+evaluators call `check_weight_meta` to verify rather than guess. Without it a
+loader has to guess the architecture, and guessing wrong surfaces as a confusing
+shape error — or, once `d_model` happens to line up, as silently scoring a
+checkpoint against the wrong process.
 
 ---
 
-### Transformer Architecture
+## 9. Running
 
-**Vaswani et al. (2017)** — *Attention Is All You Need.* NeurIPS, 30.
-Introduces the transformer architecture used in this repository. The causal (lower-triangular) mask used for the forward model and the anti-causal (upper-triangular) mask for the backward model are direct applications of the masked self-attention mechanism described here.
+```bash
+conda activate qdrug
 
-**Devlin et al. (2019)** — *BERT: Pre-training of Deep Bidirectional Transformers for Language Understanding.* arXiv:1810.04805.
-Establishes bidirectional transformers as powerful models of future context. The backward model in this repository is conceptually related to BERT's masked language modelling objective — both attend to future tokens — but is trained autoregressively on reversed causal structure rather than with masked prediction.
+pytest tests/ -q                              # 61 tests, ~20 s
+python run_experiments.py --config SMOKE      # ~2 min, exercises every path
+
+python run_experiments.py --config QUICK      # ~9 min  ← the reportable run
+python sanity_check.py                        # ~7 min, the controls
+python plot_state_clusters.py                 # causal-state figures
+python run_statistical_trj.py                 # ~2.25 h, repeat statistics
+```
+
+`HOW_TO_RUN.md` documents every flag, every output file, the schema of each
+pickle, and troubleshooting. Dependencies are in `requirements.txt`, with exact
+pins in `requirements-lock.txt`.
 
 ---
 
-### Area Laws and Mutual Information
+## 10. Results
 
-**Wolf et al. (2008)** — *Area laws in quantum systems: Mutual information and correlations.* Physical Review Letters, 100(7), 070502.
-Establishes area laws bounding how mutual information scales with subsystem size in quantum systems. Provides the information-theoretic context for why long-range correlations in a process (high C+ or C−) impose fundamental constraints on the memory required to model it — constraints that manifest as higher cross-entropy for finite-capacity models.
+All numbers below are from `results_quick/all_results.pkl` — the QUICK
+configuration plus QUICK_LARGE_HMM's three additional processes, seven
+experiments in total, seed 0, `d_model = 32`, `n_layers = 2`, five folds each.
 
-**Asplund & Panciu (2024)** — *Predictive complexity of quantum subsystems.* Entropy, 26(12), 1065.
-Recent work extending predictive complexity to quantum subsystems. Connects the statistical complexity framework to quantum information measures, providing a bridge between the classical HMM experiments here and potential quantum extensions.
+### 10.1 Convergence
+
+Every arm converged. Forward cross-entropy exceeds the analytic H∞ by between
+**0.0010 and 0.0082 bits** across the seven experiments, and all five folds
+converge in every one. This matters because ΔCE is only about asymmetry once both
+residuals are small; had the arms been 0.3 bits off H∞, the difference between
+them would have been about optimisation.
+
+### 10.2 The asymmetry signal
+
+| Experiment | H∞ | CE_FW | CE_BW | ΔCE | sem | C⁻−C⁺ | Verdict |
+|---|---|---|---|---|---|---|---|
+| `exp1_2_coin_p010_q090` | 0.4690 | 0.4700 | 0.4726 | **+0.0026** | 0.0004 | +0.4221 | `match` |
+| `exp1_coin_p030_q040` | 0.9197 | 0.9248 | 0.9247 | −0.0001 | 0.0012 | +0.5036 | `n.s.` |
+| `exp1_coin_p040_q080` | 0.8879 | 0.8944 | 0.8941 | −0.0004 | 0.0013 | +0.6473 | `n.s.` |
+| `exp2_flower_n2_m6` | 1.5343 | 1.5425 | 1.5419 | −0.0006 | 0.0025 | +0.6137 | `n.s.` |
+| `exp2_flower_n2_m8` | 1.7800 | 1.7830 | 1.7846 | **+0.0016** | 0.0004 | +0.9765 | `match` |
+| `exp2_flower_n4_m2` | 1.3364 | 1.3401 | 1.3387 | −0.0015 | 0.0017 | −0.5048 | `n.s.` |
+| `exp2_flower_n6_m4` | 2.0985 | 2.1026 | 2.1041 | +0.0015 | 0.0023 | −0.3026 | `n.s.` |
+
+`n.s.` denotes |ΔCE| < 2 × sem — not distinguishable from zero. Five of seven are
+`n.s.`; the two marked `match` have the sign predicted by C⁻ − C⁺ and exceed
+twice their standard error.
+
+### 10.3 Causal states recovered — the positive result
+
+For each arm, the assumed k, the discovered k̂, and both complexity estimates
+against the closed form:
+
+| Arm | k assumed | k̂ | plateau | S_emp | S_hat | Closed form |
+|---|---|---|---|---|---|---|
+| `coin_p010_q090` fw | 2 | 2 | 2 | 0.5574 | 0.5574 | 0.4690 |
+| `coin_p010_q090` bw | 3 | 3 | 2 | 0.8783 | 0.8783 | 0.8911 |
+| `coin_p030_q040` fw | 2 | 2 | 2 | 0.9833 | 0.9833 | 0.9852 |
+| `coin_p030_q040` bw | 3 | 3 | 3 | 1.5173 | 1.5173 | 1.4888 |
+| `coin_p040_q080` fw | 2 | 2 | 2 | 0.9248 | 0.9248 | 0.9183 |
+| `coin_p040_q080` bw | 3 | 3 | 3 | 1.5582 | 1.5582 | 1.5656 |
+| `flower_n2_m6` fw | 3 | 3 | 3 | 1.5020 | 1.5020 | 1.5000 |
+| `flower_n2_m6` bw | 7 | 6 | 6 | **2.5967** | **2.0997** | 2.1137 |
+| `flower_n2_m8` fw | 3 | 3 | 3 | 1.5007 | 1.5007 | 1.5000 |
+| `flower_n2_m8` bw | 9 | 8 | 5 | **2.8539** | **2.2847** | 2.4765 |
+| `flower_n4_m2` fw | 5 | 5 | 5 | **2.2378** | **2.0021** | 2.0000 |
+| `flower_n4_m2` bw | 3 | 3 | 3 | 1.4941 | 1.4941 | 1.4952 |
+| `flower_n6_m4` fw | 7 | 7 | 7 | **2.5849** | **2.2932** | 2.2925 |
+| `flower_n6_m4` bw | 5 | 5 | 5 | 1.9957 | 1.9957 | 1.9899 |
+
+**Mean absolute error against the closed forms: 0.1104 bits for `S_emp`, 0.0260
+bits for the recovered `S_hat` — a 4.2× improvement.** The worst fixed-k cases
+collapse: flower n=2,m=6 backward from +0.4831 to −0.0140; n=6,m=4 forward from
++0.2924 to +0.0007; n=4,m=2 forward from +0.2378 to +0.0021.
+
+Two structural observations. First, **the two estimators return identical numbers
+on 10 of 14 arms** and diverge only where the latent partition differs from the
+predictive-distribution partition — which is to say the fixed-k estimator is fine
+when the model has cleanly resolved its states and unreliable exactly when it has
+not. Second, `S_emp` systematically **over**estimates when the true state
+occupancy is unbalanced: `coin_p010_q090` forward has π = (0.9, 0.1), giving
+C⁺ = 0.469, and k-means — which tends toward balanced clusters — returns 0.557.
+
+Where k̂ ≠ theory it is the **model**, not the estimator. The flower n=2,m=8
+backward arm merges several outcome tokens into one predictive distribution, so it
+genuinely represents fewer states than the process has; it correctly merges the
+two die *selections*, which theory also says are one backward state.
+
+`plot_state_clusters.py` additionally reports that **k̂ agrees between train-seen
+and held-out sequences on 12 of 14 arms**, the exceptions being the arms with the
+most states and therefore the fewest held-out sequences per state — evidence that
+the recovered structure is not memorisation.
+
+### 10.4 The controls
+
+| Control | H∞ | CE_FW | CE_BW | ΔCE | Verdict | Folds diverged |
+|---|---|---|---|---|---|---|
+| coin p=q=0.5 (positive) | 1.0000 | 1.0059 | 1.0053 | −0.0006 | `INCONCLUSIVE` | 8/10 |
+| flower n=1, m=2 (null) | 0.5000 | 0.5007 | 0.5006 | −0.0001 | `PASS` | 6/10 |
+
+Empirical complexity on the same run: the coin gives C⁺ = 0.9991 against a theory
+value of 1.0 and C⁻ = 1.4866 against 1.5; the null control gives 1.0000 in both
+directions, as it must for a time-reversible process. (This run predates the k̂
+estimator, so only `S_emp` is available for the controls.)
+
+**The null control holds** — on a process that is exactly time-reversible, the
+pipeline reports no asymmetry. That is the single most informative number here,
+and before the analysis-length fix this same control reported −0.4210.
+
+The positive control returns ≈ 0 as well, and is scored `INCONCLUSIVE` rather
+than `FAIL`: both arms converged to within 0.006 bits of H∞, and once that
+happens the residuals vanish and ΔCE → 0 whatever C⁻ − C⁺ is. Both controls carry
+heavy divergence at 60 epochs, so their paired statistics rest on one or two folds
+and the standard error is `nan`.
+
+### 10.5 LARGE
+
+**LARGE's cross-validation results are not usable.** All forty folds diverged —
+five of five on each of its eight arms — leaving paired standard errors of 0.11
+to 0.15 and one reported as `nan`. Section 4.6 explains the mechanism; at 80
+epochs the run is far past the onset window. Its exp1, for example, reports a
+converged-only mean of −0.0827 from a single surviving fold, which is one fold's
+optimisation luck rather than a measurement.
+
+What LARGE still provides is usable: the trained weights and sidecars, the
+figures, and the p-q heatmaps — the last unaffected because the sweep does not
+use cross-validation.
+
+---
+
+## 11. What the results mean
+
+### 11.1 The null on ΔCE is what the theory predicts, not a refutation of it
+
+Section 1.2 is not a hedge written after the fact; it is a derivation. H∞ is
+time-reversal invariant, so ΔCE is a difference of *residuals*, and residuals go
+to zero as capacity and training suffice. At `d_model = 32` — 23,395 parameters, a
+32-dimensional float residual stream — on a 3-token process whose optimal
+predictor needs under 1.6 bits of memory, the model is over-provisioned by orders
+of magnitude. **The correct prediction for this regime is ΔCE ≈ 0, and that is what
+was measured.**
+
+The mismatch of scales is the whole story. C⁻ − C⁺ = 0.65 bits for the coin at
+p=0.4, q=0.8. Holding 1.57 bits of state instead of 0.92 costs a 32-dimensional
+continuous representation nothing whatsoever. There is no reason it should show
+up in the loss, and it does not.
+
+So this result may **not** be reported as "no causal asymmetry in transformers".
+It is consistent with that, and equally consistent with "the asymmetry was
+entirely absorbed by spare capacity", and nothing in these seven experiments
+distinguishes the two.
+
+### 11.2 The representational half of the hypothesis *is* confirmed
+
+This is the finding that the ΔCE null tends to overshadow, and it is the stronger
+of the two.
+
+The models are not merely fitting a conditional table. They are constructing the
+ε-machine of the direction they are trained in, and doing so accurately:
+
+- **The state counts come out right, asymmetrically.** A coin's forward arm
+  recovers 2 states; its backward arm recovers 3. The flower arms invert with the
+  theory — n=2,m=6 recovers 3 forward and 6 backward; n=4,m=2 recovers 5 forward
+  and 3 backward. Nothing tells the model how many states to build; k̂ is
+  discovered by thresholding, and the threshold is the same 0.10 everywhere.
+- **The occupancy entropies come out right**, to a mean absolute error of 0.026
+  bits across fourteen arms spanning C from 0.47 to 2.48.
+- **The structure generalises.** k̂ is stable across a wide band of thresholds,
+  and agrees between train-seen and held-out sequences on 12 of 14 arms.
+- **The one clean qualitative prediction is visible directly.** Tokens 0 and 2 of
+  the coin have identical forward futures. The forward model merges them into one
+  predictive distribution while keeping them distinguishable in its latent — and
+  the state figures show them in different colours with the same marker, in one
+  group.
+
+In other words: **C⁺ and C⁻ are real, they differ, and the network finds both.**
+The information-theoretic content of causal asymmetry is reproduced by a trained
+transformer to two decimal places.
+
+### 11.3 What separates the two halves
+
+The gap between 11.1 and 11.2 is precisely the gap between *representing* extra
+memory and *paying* for it. Thompson et al.'s thermodynamic argument concerns a
+memory-bounded machine, where each additional causal state must be physically
+instantiated and erased. A transformer with a 32-dimensional residual stream is
+not that machine: within a very wide range, extra states are free.
+
+That is not a failure of the experiment; it locates the effect. The interesting
+question is no longer "does ΔCE track C⁻ − C⁺" but **"at what capacity does the
+extra memory stop being free?"** That question has a shape — a curve of ΔCE
+against `d_model` — and a curve is a far stronger result than any single point.
+Everything in this repository is arranged so that curve can be measured: the
+input projection is frozen so `d_model` varies capacity alone, `n_layers` is held
+at 2 so depth does not confound it, the arms are paired so a few thousandths of a
+bit is resolvable, and the harness for repeated seeds now exists.
+
+Two further design notes follow from this reading. Depth and width both work
+*against* seeing the effect, so the informative direction is downward —
+`d_model` of 2 to 8 — not upward. And a transformer may be the wrong instrument
+for the thermodynamic claim in the first place: the natural test is a model whose
+memory is explicitly bounded and countable, where the number of states is a
+parameter rather than an emergent property.
+
+### 11.4 The two `match` verdicts should not be over-read
+
+They are +0.0026 and +0.0016 bits — a few thousandths of a bit. They clear the
+threshold only because the fold-level standard error is itself very small
+(0.0004), and that standard error is computed over five folds that **share a
+training set**. It therefore measures fold-to-fold variability, not sampling
+variability over datasets, and is a lower bound on the true uncertainty. It must
+not be presented as a confidence interval.
+
+More telling is that **no dose-response relationship with C⁻ − C⁺ is visible.**
+Ordering the seven experiments by their theoretical asymmetry gives no
+corresponding order in ΔCE: the largest gap (+0.9765) yields +0.0016, but the
+second largest (+0.6473) yields −0.0004, and the smallest positive gap (+0.4221)
+yields the largest ΔCE of all. Ignoring significance entirely and simply counting
+signs, ΔCE agrees with the sign of C⁻ − C⁺ in **3 of 7** experiments — which is
+what coin-flipping looks like, and is the signature of a null.
+
+If the two significant values were measuring asymmetry, one would expect them to
+be the experiments where the asymmetry is largest, and one would expect the
+others to line up behind them. Neither holds. They are more consistent with a
+small residual optimisation difference, or with the small-sample structure of five
+folds that share a training set.
+
+The honest summary of Section 10.2 is: **seven experiments, no detectable effect,
+two values that clear a threshold computed on a standard error that is known to
+be too small.**
+
+### 11.5 The negative results were worth having
+
+Three of the most useful outcomes here are not measurements of the hypothesis at
+all, and they are recorded because a reader deciding whether to trust the numbers
+needs them:
+
+- **A null control caught a −0.42-bit artefact.** Evaluating chunk-trained models
+  at full sequence length biased the two arms asymmetrically, manufacturing a
+  large false asymmetry on a process that has none. Without a time-reversible
+  control in the suite, that number would have looked like a strong positive
+  result.
+- **Training diverges on these processes for a structural reason**, not through
+  bad luck: cross-entropy on a deterministic transition has no finite minimiser.
+  Any study of this kind on processes with deterministic transitions will hit it,
+  it scales with the number of gradient steps rather than with the learning rate,
+  and it is invisible in the final loss because the model partially recovers.
+- **The estimator you use to count causal states determines your answer.** A
+  fixed-k estimator confirms the k it is given and overestimates on unbalanced
+  occupancies; the same fourteen arms give a 4.2× smaller error when clustering
+  the predictive distribution instead, which is also the object the theory
+  actually defines states by.
+
+### 11.6 What would turn this into a finding
+
+In descending order of value:
+
+1. **The `d_model` sweep.** ΔCE against capacity, at fixed depth and fixed
+   process. This is the experiment that makes the null interpretable, and the
+   only one that can.
+2. **The seed-repeat harness, run in full.** Replaces a standard error over five
+   shared folds with one over 100 independent datasets. Built, verified, not yet
+   run.
+3. **The reversed positional encoding.** `reverse_pos_for_backward` is the last
+   architectural asymmetry between the arms. Running the backward arm both ways
+   is what separates causal asymmetry from a positional-encoding artefact.
+4. **A second null control** — an i.i.d. process, for which C⁺ = C⁻ = 0 — to
+   confirm that the pipeline reports zero for a reason rather than by luck.
+5. **Stable long runs**, via `AdamW(weight_decay=0.01)`, if the large
+   configuration is ever to contribute. Every number would need re-running under
+   the same optimiser.
+
+---
+
+## 12. Limitations and open work
+
+**Statistical.** Every reported standard error is over five folds of one seed
+sharing a training set: fold-to-fold variability, not sampling variability. One
+seed per configuration. No correction for testing seven experiments.
+
+**The estimator's free parameter.** k̂ depends on a distance threshold whose
+correct value varies by an order of magnitude across these processes. The
+stability plateau is always reported for this reason, and a single k̂ at a single
+threshold should not be quoted alone.
+
+**Not held out.** Complexity and latent figures are computed over the whole
+dataset, ~80 % of which was trained on. `plot_state_clusters.py` quantifies the
+cost; the paired ΔCE itself is fully out-of-sample.
+
+**The p-q sweep is exploratory** — in-sample, unchunked, single-fit — as
+Section 5.2 sets out.
+
+**The two post-hoc evaluators are unreliable as written.**
+`LLM_asymmetry_testing.py` and `Test_data_eval.py` both build their loader with
+`Training_model._loader` at **full sequence length**, which is exactly the
+extrapolation bias of Section 4.5, and hits the two arms asymmetrically. Their
+flower arms are worse still: both draw `dice_probs` from `default_rng(99)` while
+the runner trains with `flower_dice_seed = 42`, so they score flower checkpoints
+against a **different process**, not merely fresh samples of the same one. The
+figures they produce are useful as illustrations; their numbers should not be
+quoted. `run_experiments.py`, `sanity_check.py` and `plot_state_clusters.py` all
+use the chunk-length analysis loader correctly.
+
+**Reproducibility.** MPS is not bit-reproducible across runs; pairing of the two
+arms is unaffected. `accelerator="cpu"` is exact at ~6× the wall clock.
+
+**Scope.** Two process families, one architecture, one depth, one seed, sequences
+of a few thousand tokens, vocabularies of 3 to 14 tokens. Nothing here licenses a
+claim about language models at scale.
+
+---
+
+## 13. References and related work
+
+### The primary reference
+
+**Thompson, Garner, Mahoney, Vanner, Gu & Modi (2018)** — *Causal asymmetry in a
+quantum world.* Physical Review X 8(3), 031013. The theoretical foundation:
+establishes that C⁺ ≠ C⁻ for causally asymmetric processes and that quantum
+models can exploit the gap. This repository tests the same asymmetry signal in
+classical transformer models.
+
+### Closest empirical work
+
+**Papadopoulos, Wenger & Hongler (2024)** — *Arrows of Time for Large Language
+Models.* arXiv:2401.17505. Tests whether large models assign higher perplexity to
+reversed text, finding a consistent forward-time preference. This repository is a
+controlled version of that test, on processes where the ground-truth asymmetry is
+analytically known — which is what allows a null to be interpreted rather than
+merely reported.
+
+**Ren, Ichter & Majumdar (2024)** — *Thinking Forward and Backward: Effective
+Backward Planning with Large Language Models.* arXiv:2411.01790. Shows backward
+planning is harder for LLMs on certain tasks, consistent with causal asymmetry
+operating at the level of reasoning.
+
+### Computational mechanics
+
+**Shalizi & Crutchfield (2001)** — *Computational mechanics: Pattern and
+prediction, structure and simplicity.* Journal of Statistical Physics 104(3),
+817–879. The formal foundation for ε-machines, causal states and C⁺; defines the
+state representation used throughout, and the connection between minimal
+predictive memory and thermodynamic cost.
+
+**Crutchfield & Feldman (1997)** — *Statistical complexity of simple
+one-dimensional spin systems.* Physical Review E 55(2), R1239. Early
+demonstration on spin chains, and the motivation for mapping C over parameter
+space as the p-q sweep does.
+
+**Tan et al. (2014)** — *Towards quantifying complexity with quantum mechanics.*
+European Physical Journal Plus 129(9), 191. Extends the framework to quantum
+models and quantifies the advantage quantum memory provides.
+
+### Quantum models of complexity
+
+**Gu, Wiesner, Rieper & Vedral (2012)** — *Quantum mechanics can reduce the
+complexity of classical models.* Nature Communications 3(1), 762. Quantum models
+can simulate a process with strictly less memory than any classical model — which
+motivates asking whether a classical network can nonetheless exploit causal
+structure through learned representations.
+
+**Suen et al. (2017)** — *The classical-quantum divergence of complexity in
+modelling spin chains.* Quantum 1, 25. Analyses the classical-quantum gap across
+a family of processes structurally similar to the flower process.
+
+**Elliott et al. (2022)** — *Quantum adaptive agents with efficient long-term
+memories.* Physical Review X 12(1), 011007. Context for why causal asymmetry
+matters to memory-bounded agents — a category that includes transformers with
+finite `d_model`.
+
+### Thermodynamics of computation
+
+**Landauer (1961)** — *Irreversibility and heat generation in the computing
+process.* IBM Journal of Research and Development 5(3), 183–191. The foundational
+link between logical irreversibility and thermodynamic cost. The causal-asymmetry
+hypothesis can be read as Landauer's principle applied to a predictor's memory
+operations — and Section 11.3 is the observation that a transformer is not
+operating anywhere near that bound.
+
+### Architecture
+
+**Vaswani et al. (2017)** — *Attention Is All You Need.* NeurIPS 30. The
+architecture used here; the `tril` and `triu` masks are direct applications of
+its masked self-attention.
+
+**Devlin et al. (2019)** — *BERT: Pre-training of Deep Bidirectional Transformers
+for Language Understanding.* arXiv:1810.04805. Establishes bidirectional
+transformers as models of future context. The backward model here is related but
+distinct: it is trained autoregressively on reversed causal structure rather than
+by masked prediction.
+
+### Area laws and mutual information
+
+**Wolf, Verstraete, Hastings & Cirac (2008)** — *Area laws in quantum systems:
+Mutual information and correlations.* Physical Review Letters 100(7), 070502.
+Information-theoretic context for why long-range correlations impose fundamental
+constraints on the memory a model requires.
+
+**Asplund & Panciu (2024)** — *Predictive complexity of quantum subsystems.*
+Entropy 26(12), 1065. Extends predictive complexity to quantum subsystems,
+bridging the classical experiments here to quantum extensions.
+
+---
+
+*Every quantitative claim in Sections 10 and 11 is drawn from
+`results_quick/all_results.pkl` and `sanity_check_flower_process/*/results.pkl`,
+and can be recomputed from those files. The divergence tables in Section 4.6 come
+from `factorial.log` and `divtest.log`. The reasoning behind each correction
+described here is recorded in `implementation_logbook/`, and demonstrated
+side-by-side with the code it replaced in `walkthrough.ipynb`.*
