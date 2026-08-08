@@ -1,0 +1,893 @@
+"""
+run_statistical_trj.py — repeat statistics for the causal-asymmetry test.
+
+    python run_statistical_trj.py                       # 100 repeats, all 7 processes
+    python run_statistical_trj.py --repeats 3           # shakedown
+    python run_statistical_trj.py --only traj_coin_p030_q040 traj_flower_n2_m6
+    python run_statistical_trj.py --khat                # also recover k-hat per run
+    python run_statistical_trj.py --plots-only          # redraw from the saved pickle
+
+Experimental plan
+-----------------
+Seven processes, all at the QUICK configuration's scale, capacity and learning
+rate:
+
+    coin    p=0.1 q=0.9  |  p=0.3 q=0.4  |  p=0.4 q=0.8
+    flower  n=2 m=6  |  n=2 m=8  |  n=4 m=2  |  n=6 m=4
+
+For each process a forward (tril) and a backward (triu) model are trained on the
+SAME forward data, `--repeats` times.  Every run records its loss trajectory,
+its final held-out cross-entropy and the empirical statistical complexity of
+each arm.  Per process, three figures go to results_trajectories/<tag>/:
+
+    <tag>_complexity.png     S_emp for both arms with error bars over the runs,
+                             against the closed-form C+ / C-
+    <tag>_final_loss.png     three bars -- forward, backward, backward - forward
+                             -- with their statistical error
+    <tag>_trajectories.png   every run at alpha 0.3, the two mean curves in bold,
+                             and a shaded interval
+
+plus one cross-process summary of delta_CE against C- - C+ at the root.
+
+Why this exists
+---------------
+Every delta_CE this repo has reported carries a `sem` computed over the five CV
+folds of ONE seed, and those folds share a training set: it measures
+fold-to-fold variability, not sampling variability over datasets, so it is a
+lower bound on the real uncertainty and cannot support a claim about the sign of
+delta_CE.  Here each repeat regenerates the process from a fresh seed, so the
+spread across repeats IS sampling variability and the paired statistic is
+interpretable.
+
+What is held fixed, and why
+---------------------------
+  * The two arms of one repeat are PAIRED.  Repeat i uses seed = base + i for
+    both arms, so they get identical sequences, identical chunk windows, an
+    identical train/held-out split, identical batch order and identical weight
+    initialisation.  Only the attention mask and the batch convention differ.
+    An unpaired difference would be contaminated by split noise of the same
+    order as the effect being measured.
+  * `dice_probs` is drawn from cfg["flower_dice_seed"], NOT from the repeat
+    seed.  The dice define the process -- they set C+ and C- -- so resampling
+    them per repeat would average over different processes.  They are the same
+    dice run_experiments.py trains on, which keeps these numbers comparable to
+    that run's.
+  * All three coin processes use the exp1 settings (num_samples, seq_len,
+    epochs, batch), not exp1's for one and exp1_2's for another.  Uniform
+    settings are what make the seven processes comparable to each other.
+
+Two deliberate departures from the scaffolding this file started as
+-------------------------------------------------------------------
+  * ONE training run per repeat, not a 5-fold cross-validation.  The repeats
+    replace the folds as the source of statistics.  Running a full CV per repeat
+    would be 5x the compute (7000 trainings at 100 repeats) *and* would bias the
+    per-repeat number, because train_test_val_pipeline reports the best fold by
+    validation loss -- a minimum over five draws is not a sample of the same
+    distribution as a single draw.
+  * No weights are saved.  2 x repeats x 7 checkpoints is a lot of disk for
+    models nothing downstream reads; the trajectories and scalars are the
+    product here.
+
+Caveats carried over from the main runs
+---------------------------------------
+  * Divergence.  Both processes contain deterministic transitions, so CE has no
+    finite minimiser and training eventually blows up after reaching H_inf.
+    Every run is screened with diagnose_divergence(), and the paired statistic
+    is reported twice -- over all repeats and over converged repeats only.  At
+    these settings a run is ~130 gradient steps, which is the low end of the
+    observed onset window, so expect a nonzero rate.
+  * S_emp is k-means at a hand-specified k, bounded by log2(k), and
+    overestimates when the true state occupancy is unbalanced.  It is what the
+    plan asks for and what the rest of the repo reports, so it is the headline
+    here.  `--khat` additionally recovers k-hat and S_hat from the model's
+    predictive distribution, which is the better estimator but costs an
+    agglomerative clustering pass per arm per repeat.
+  * The complexity is read over the whole dataset, ~80% of which that repeat
+    trained on -- the same convention as run_experiments.py, kept so the numbers
+    are comparable.  plot_state_clusters.py is the train/held-out split of that
+    question.
+  * The held-out set is passed as train_model's val_loader so a held-out
+    trajectory is recorded alongside the training one.  Nothing selects on it --
+    there is no model selection anywhere in this file -- so it stays a clean
+    held-out estimate.
+"""
+# ── stdlib ─────────────────────────────────────────────────────────────────
+import argparse
+import contextlib
+import io
+import json
+import os
+import pickle
+import time
+
+# ── third-party ────────────────────────────────────────────────────────────
+import matplotlib
+matplotlib.use("Agg")
+import matplotlib.pyplot as plt
+import numpy as np
+import torch
+
+# ── project ────────────────────────────────────────────────────────────────
+from configs import CONFIGS
+from Data_generation import CoinDataset, coin_generation
+from Flower_process_generation import FlowerDataset, flower_process_generation
+from Model_analysis import (
+    flower_complexity,
+    flower_entropy_rate,
+    paired_delta_ce,
+    recover_causal_states,
+    savefig,
+    statistical_complexity,
+    statistical_complexity_empirical,
+)
+from utils import (
+    cleanup, coin_tag, entropy_rate_coin, flower_tag, mkdir, save_pkl,
+    to_cpu_for_analysis,
+)
+from Training_model import (
+    _eval_loss_on_loader, diagnose_divergence, make_analysis_loader,
+    make_chunked_loader, set_seed, test_train_validation, train_model,
+)
+from run_experiments import full_seq_len
+
+
+# ══════════════════════════════════════════════════════════════════════════
+# The seven processes named in the plan
+# ══════════════════════════════════════════════════════════════════════════
+COIN_PQ   = [(0.1, 0.9), (0.3, 0.4), (0.4, 0.8)]
+FLOWER_NM = [(2, 6), (2, 8), (4, 2), (6, 4)]
+
+OUT_ROOT_DEFAULT = "results_trajectories"
+
+FW_COLOUR, BW_COLOUR, D_COLOUR = "#4c72b0", "#dd8452", "crimson"
+
+# Convergence band used to split "measurement" from "optimisation failure",
+# matching paired_delta_ce's default: a run counts as converged when BOTH arms
+# land within this many bits of the process entropy rate.
+CONV_TOL = 0.10
+
+
+def coin_spec(cfg: dict, p: float, q: float) -> dict:
+    """Everything about one coin process that does not depend on the repeat."""
+    return dict(
+        tag         = coin_tag("traj", p, q),
+        kind        = "coin",
+        p           = p,
+        q           = q,
+        num_token   = cfg["coin_num_token"],
+        num_samples = cfg["coin_num_samples"],
+        seq_len     = cfg["coin_seq_len"],
+        max_epochs  = cfg["coin_max_epochs"],
+        batch       = cfg["coin_batch"],
+        k_fw        = 2,                 # 2 forward causal states, any (p, q)
+        k_bw        = 3,                 # 3 backward causal states
+        C_plus      = statistical_complexity(p, q, "forward"),
+        C_minus     = statistical_complexity(p, q, "backward"),
+        theory      = entropy_rate_coin(p, q),      # H_inf, both directions
+    )
+
+
+def flower_spec(cfg: dict, n: int, m: int) -> dict:
+    """
+    Everything about one flower process that does not depend on the repeat.
+
+    The dice come from cfg["flower_dice_seed"], exactly as in
+    run_experiments.experiment_2, so this is the same process that run trained
+    on rather than a new one with the same (n, m).
+    """
+    dice_probs = np.random.default_rng(cfg["flower_dice_seed"]).dirichlet(
+        np.ones(m), size=n)
+    C_plus, C_minus = flower_complexity(n, m, dice_probs)
+    return dict(
+        tag         = flower_tag("traj", n, m),
+        kind        = "flower",
+        n           = n,
+        m           = m,
+        dice_probs  = dice_probs,
+        num_token   = n + m,
+        num_samples = cfg["flower_num_samples"],
+        seq_len     = cfg["flower_seq_len"],     # CYCLES; tokens = 2 x this
+        max_epochs  = cfg["flower_max_epochs"],
+        batch       = cfg["flower_batch"],
+        k_fw        = n + 1,
+        k_bw        = m + 1,                     # an upper bound: outcomes that
+                                                 # induce the same posterior over
+                                                 # dice are ONE backward state
+        C_plus      = C_plus,
+        C_minus     = C_minus,
+        theory      = flower_entropy_rate(n, m, dice_probs),
+    )
+
+
+def process_specs(cfg: dict) -> list:
+    return ([coin_spec(cfg, p, q) for p, q in COIN_PQ]
+            + [flower_spec(cfg, n, m) for n, m in FLOWER_NM])
+
+
+# ══════════════════════════════════════════════════════════════════════════
+# ONE REPEAT
+# ══════════════════════════════════════════════════════════════════════════
+def build_dataset(spec: dict, seed: int):
+    """
+    Regenerate the process from `seed`.
+
+    set_seed covers numpy, which is what coin_generation and
+    flower_process_generation draw from, so the sequences are a pure function of
+    the repeat seed -- and identical for the two arms of that repeat.
+    """
+    set_seed(seed)
+    if spec["kind"] == "coin":
+        data, _ = coin_generation(num_samples=spec["num_samples"],
+                                  seq_len=spec["seq_len"],
+                                  p=spec["p"], q=spec["q"])
+        return CoinDataset(data, seq_len=spec["seq_len"])
+    data, _ = flower_process_generation(num_samples=spec["num_samples"],
+                                        seq_len=spec["seq_len"],
+                                        n=spec["n"], m=spec["m"],
+                                        dice_probs=spec["dice_probs"])
+    return FlowerDataset(data, seq_len=len(data[0]))
+
+
+def one_repeat(spec: dict, cfg: dict, seed: int, khat: bool = False) -> dict:
+    """
+    Train both arms once on one realisation of the process and measure them.
+
+    Returns {"seed", "fw": {...}, "bw": {...}, "delta_ce"}, where each arm dict
+    carries final_ce / final_ppl / S_emp / traj / val_traj / val_at / diverged
+    (+ k_hat / S_hat when `khat`).
+    """
+    ds      = build_dataset(spec, seed)
+    max_len = full_seq_len(ds)                       # PE table covers the input
+    chunk   = min(cfg["train_chunk_len"], max_len)
+    loader  = make_chunked_loader(ds, chunk, spec["batch"], seed=seed)
+    # Windows at the TRAINING chunk length, from a different seed -- evaluating
+    # at full length would ask the model to extrapolate to positional-encoding
+    # indices it never saw, and would do so asymmetrically between the arms.
+    loader_ana = make_analysis_loader(ds, chunk, cfg["ana_batch"], seed=seed + 1000)
+
+    out = {"seed": seed}
+    for arm, mode, use_t, k in (("fw", "forward",  "last",  spec["k_fw"]),
+                                ("bw", "backward", "first", spec["k_bw"])):
+        # Rebuilt per arm rather than shared: the split is a pure function of
+        # (N, seed) so both arms get the same one, while the training loader's
+        # shuffle generator is freshly seeded instead of carrying the state the
+        # first arm left it in.
+        train_loader, test_loader = test_train_validation(
+            loader, test_ratio=0.20, train_ratio=0.80, seed=seed)
+
+        # Identical initialisation for the two arms of this repeat.
+        torch.manual_seed(seed * 1000)
+        rec = train_model(
+            train_loader,
+            num_token=spec["num_token"], d_model=cfg["d_model"],
+            max_len=max_len, max_epochs=spec["max_epochs"], lr=cfg["lr"],
+            mode=mode, embed_type=cfg["embed_type"],
+            val_loader=test_loader, n_layers=cfg["n_layers"],
+            accelerator=cfg["accelerator"],
+            val_every_n_steps=cfg["val_every_n_steps"],
+        )
+        to_cpu_for_analysis(rec.model)
+
+        ce, ppl = _eval_loss_on_loader(rec.model, test_loader)
+        dv      = diagnose_divergence(rec.step_loss)
+        arm_res = dict(
+            final_ce=ce, final_ppl=ppl,
+            traj=[float(v) for v in rec.step_loss],
+            traj_at=[int(v) for v in rec.step_at],
+            val_traj=[float(v) for v in rec.step_val_loss],
+            val_at=[int(v) for v in rec.step_val_at],
+            diverged=bool(dv["diverged"]), divergence=dv,
+        )
+
+        try:
+            arm_res["S_emp"] = statistical_complexity_empirical(
+                rec.model, loader_ana, max_batches=cfg["max_batches"],
+                use_t=use_t, k=k)
+        except Exception as e:
+            print(f"  complexity failed ({arm}, seed {seed}): {e}")
+            arm_res["S_emp"] = float("nan")
+
+        if khat:
+            # The better estimator: cluster the model's PREDICTIVE distribution
+            # with a distance threshold, so k falls out of the data instead of
+            # being assumed.  Off by default because it is a clustering pass per
+            # arm per repeat.
+            try:
+                rcs = recover_causal_states(
+                    rec.model, loader_ana, use_t=use_t,
+                    max_batches=cfg["max_batches"],
+                    state_tol=cfg["state_tol"], n_pts=cfg["umap_n_pts"],
+                    seed=seed)
+                arm_res.update(k_hat=rcs["k_hat"], S_hat=rcs["S_hat"],
+                               k_plateau=rcs["plateau"])
+            except Exception as e:
+                print(f"  k-hat failed ({arm}, seed {seed}): {e}")
+                arm_res.update(k_hat=None, S_hat=float("nan"), k_plateau=None)
+
+        out[arm] = arm_res
+        del rec
+        cleanup()
+
+    out["delta_ce"] = out["bw"]["final_ce"] - out["fw"]["final_ce"]
+    return out
+
+
+@contextlib.contextmanager
+def quiet(enabled: bool = True):
+    """
+    Swallow the per-run training chatter, and re-emit it if the block raises.
+
+    train_test_val_pipeline is not used here, but test_train_validation and
+    Lightning still print several lines per run; at 100 repeats x 7 processes
+    x 2 arms that is the whole log.  Nothing is lost on failure.
+    """
+    if not enabled:
+        yield None
+        return
+    buf = io.StringIO()
+    try:
+        with contextlib.redirect_stdout(buf):
+            yield buf
+    except Exception:
+        print(buf.getvalue())
+        raise
+
+
+# ══════════════════════════════════════════════════════════════════════════
+# STATISTICS
+# ══════════════════════════════════════════════════════════════════════════
+def _stats(vals) -> dict:
+    """mean / sd / sem / n over the finite entries of `vals`."""
+    a = np.asarray(vals, dtype=float)
+    a = a[np.isfinite(a)]
+    n = int(a.size)
+    if n == 0:
+        return dict(mean=float("nan"), sd=float("nan"), sem=float("nan"), n=0)
+    sd = float(a.std(ddof=1)) if n > 1 else 0.0
+    return dict(mean=float(a.mean()), sd=sd,
+                sem=(sd / np.sqrt(n) if n > 1 else float("nan")), n=n)
+
+
+def _traj_matrix(trajs) -> np.ndarray:
+    """
+    (n_runs, L) matrix of trajectories truncated to the shortest one.
+
+    Every run here has the same number of gradient steps, but a truncation
+    guard costs nothing and keeps the mean well defined if one run is short.
+    """
+    kept = [t for t in trajs if t]
+    if not kept:
+        return np.zeros((0, 0))
+    L = min(len(t) for t in kept)
+    return np.asarray([t[:L] for t in kept], dtype=float)
+
+
+def paired_stats(rec: dict) -> dict:
+    """
+    Paired delta-CE over repeats, reusing the runner's estimator.
+
+    paired_delta_ce takes the two arms' per-unit held-out CE and returns the
+    mean paired difference, its sem, a paired t and the same statistic over
+    converged units only.  Its unit is a CV fold in run_experiments.py and a
+    REPEAT here; the arithmetic is identical, and the repeat version is the
+    stronger one because repeats do not share a training set.
+    """
+    fw = [r["fw"]["final_ce"] for r in rec["runs"]]
+    bw = [r["bw"]["final_ce"] for r in rec["runs"]]
+    seed = rec["runs"][0]["seed"] if rec["runs"] else None
+    return paired_delta_ce(
+        {"fold_test_loss": fw, "seed": seed},
+        {"fold_test_loss": bw, "seed": seed},
+        label=f"{rec['spec']['tag']}  (one line per REPEAT, not per fold)",
+        theory=rec["spec"]["theory"], conv_tol=CONV_TOL,
+    )
+
+
+def converged_mask(rec: dict, paired: dict) -> np.ndarray:
+    """Boolean mask over repeats: both arms within CONV_TOL of H_inf."""
+    n = len(rec["runs"])
+    if paired and paired.get("converged") is not None:
+        return np.asarray(paired["converged"], dtype=bool)
+    return np.ones(n, dtype=bool)
+
+
+# ══════════════════════════════════════════════════════════════════════════
+# PLOTS
+# ══════════════════════════════════════════════════════════════════════════
+def _errbars(ax, xs, means, sds, sems):
+    """
+    Thin whisker = +/- 1 sd (spread over repeats), thick bar = +/- 1 sem
+    (precision of the mean).  Drawing both removes the usual ambiguity about
+    which one an error bar is.
+    """
+    nz = lambda v: np.nan_to_num(np.asarray(v, dtype=float), nan=0.0)
+    ax.errorbar(xs, means, yerr=nz(sds), fmt="none", ecolor="0.30",
+                elinewidth=1.0, capsize=6, zorder=5)
+    ax.errorbar(xs, means, yerr=nz(sems), fmt="none", ecolor="k",
+                elinewidth=3.0, capsize=0, zorder=6)
+
+
+def plot_complexity(rec: dict, out_dir: str):
+    """
+    S_emp for both arms with error bars over the repeats, against C+ / C-.
+
+    One figure per process, as the plan asks.  The theoretical bars are the
+    closed forms -- statistical_complexity for the coin, flower_complexity for
+    the flower -- so a systematic gap is visible rather than inferred.
+    """
+    spec = rec["spec"]
+    s_fw = _stats([r["fw"]["S_emp"] for r in rec["runs"]])
+    s_bw = _stats([r["bw"]["S_emp"] for r in rec["runs"]])
+    emp  = [s_fw["mean"], s_bw["mean"]]
+    th   = [spec["C_plus"], spec["C_minus"]]
+    x    = np.arange(2)
+
+    fig, ax = plt.subplots(figsize=(9, 5.5))
+    b1 = ax.bar(x - 0.2, emp, 0.35, color=[FW_COLOUR, BW_COLOUR],
+                alpha=0.85, edgecolor="k", label=f"Empirical S_emp (n={s_fw['n']} runs)")
+    b2 = ax.bar(x + 0.2, th, 0.35, color=[FW_COLOUR, BW_COLOUR],
+                alpha=0.45, edgecolor="k", hatch="//", label="Theoretical (closed form)")
+    _errbars(ax, x - 0.2, emp, [s_fw["sd"], s_bw["sd"]], [s_fw["sem"], s_bw["sem"]])
+    ax.bar_label(b1, fmt="%.4f", padding=14, fontsize=9)
+    ax.bar_label(b2, fmt="%.4f", padding=3, fontsize=9)
+
+    ax.set_xticks(x)
+    ax.set_xticklabels([f"Forward  (C+, k={spec['k_fw']})",
+                        f"Backward  (C-, k={spec['k_bw']})"])
+    ax.set_ylabel("Statistical complexity (bits)")
+    ax.set_ylim(0, max(emp + th) * 1.20)          # headroom for the bar labels
+    ax.set_title(
+        f"{spec['tag']} — empirical vs theoretical statistical complexity\n"
+        f"mean over {s_fw['n']} runs;  thick bar = ±1 sem, thin = ±1 sd  "
+        f"(sem: {s_fw['sem']:.4f} / {s_bw['sem']:.4f})",
+        fontsize=11, fontweight="bold")
+    ax.legend(fontsize=9)
+    ax.grid(True, alpha=0.3, axis="y")
+
+    note = ("S_emp is k-means at the k above, so S ≤ log2(k); it overestimates "
+            "when the true state occupancy is unbalanced.")
+    k_fw = [r["fw"].get("k_hat") for r in rec["runs"] if r["fw"].get("k_hat")]
+    k_bw = [r["bw"].get("k_hat") for r in rec["runs"] if r["bw"].get("k_hat")]
+    if k_fw and k_bw:
+        h_fw = _stats([r["fw"]["S_hat"] for r in rec["runs"]])
+        h_bw = _stats([r["bw"]["S_hat"] for r in rec["runs"]])
+        note += (f"\nRecovered from the predictive distribution: "
+                 f"k̂ median {int(np.median(k_fw))} / {int(np.median(k_bw))}, "
+                 f"S_hat {h_fw['mean']:.4f} / {h_bw['mean']:.4f}")
+    ax.text(0.5, -0.16, note, transform=ax.transAxes, ha="center", va="top",
+            fontsize=8, color="0.25")
+
+    fig.tight_layout()
+    savefig(fig, os.path.join(out_dir, f"{spec['tag']}_complexity.png"))
+
+
+def plot_final_loss(rec: dict, paired: dict, out_dir: str):
+    """
+    Three bars — forward, backward, backward - forward — with their error.
+
+    The third bar is on its own axis on the right.  delta_CE is two to three
+    orders of magnitude smaller than the CE values beside it, so on a shared
+    axis it is a flat line at zero and the figure says nothing.  Its error is
+    the PAIRED sd/sem, i.e. the spread of the per-repeat differences, which is
+    the whole point of pairing the arms and is much smaller than what
+    propagating the two independent errors would give.
+    """
+    spec = rec["spec"]
+    fw = np.asarray([r["fw"]["final_ce"] for r in rec["runs"]], dtype=float)
+    bw = np.asarray([r["bw"]["final_ce"] for r in rec["runs"]], dtype=float)
+    d  = bw - fw
+    conv = converged_mask(rec, paired)
+
+    groups = [("all runs", np.ones(len(fw), dtype=bool), 0.85, None)]
+    if conv.sum() and conv.sum() < len(fw):
+        groups.append((f"converged only (|CE−H∞| ≤ {CONV_TOL} both arms)",
+                       conv, 0.45, "//"))
+
+    fig, ax = plt.subplots(figsize=(10, 5.5))
+    ax2 = ax.twinx()
+    w = 0.34 if len(groups) > 1 else 0.5
+
+    for gi, (glabel, mask, alpha, hatch) in enumerate(groups):
+        off = (gi - (len(groups) - 1) / 2) * w
+        s_fw, s_bw, s_d = _stats(fw[mask]), _stats(bw[mask]), _stats(d[mask])
+        b = ax.bar([0 + off, 1 + off], [s_fw["mean"], s_bw["mean"]], w,
+                   color=[FW_COLOUR, BW_COLOUR], alpha=alpha, edgecolor="k",
+                   hatch=hatch, label=f"{glabel}  (n={s_fw['n']})")
+        ax.bar_label(b, padding=12, fontsize=9,
+                     labels=[f"{s['mean']:.4f}\n±{s['sd']:.4f} sd"
+                             for s in (s_fw, s_bw)])
+        _errbars(ax, [0 + off, 1 + off], [s_fw["mean"], s_bw["mean"]],
+                 [s_fw["sd"], s_bw["sd"]], [s_fw["sem"], s_bw["sem"]])
+
+        bd = ax2.bar([2 + off], [s_d["mean"]], w, color=D_COLOUR, alpha=alpha,
+                     edgecolor="k", hatch=hatch)
+        ax2.bar_label(bd, fmt="%+.4f", padding=14, fontsize=9, color=D_COLOUR)
+        _errbars(ax2, [2 + off], [s_d["mean"]], [s_d["sd"]], [s_d["sem"]])
+
+    ax.axhline(spec["theory"], color="crimson", ls="--", lw=1.5,
+               label=f"H∞ = {spec['theory']:.4f}")
+    # Zero line only under the difference bar: drawn across the whole axes it
+    # cuts through the two CE bars at a height that means nothing for them.
+    ax2.hlines(0.0, 1.55, 2.55, color="k", ls=":", lw=1.0)
+
+    ax.set_xticks([0, 1, 2])
+    ax.set_xticklabels(["Forward", "Backward", "BW − FW  (right axis)"])
+    ax.set_ylabel("Final held-out CE (bits/token)")
+    ax.set_ylim(0, max(np.nanmax(fw), np.nanmax(bw)) * 1.30)   # label headroom
+    ax2.set_ylabel("delta_CE = CE_BW − CE_FW (bits)", color=D_COLOUR)
+    ax2.tick_params(axis="y", colors=D_COLOUR)
+    # Keep zero visible and the difference bar centred on it.
+    lim = max(abs(np.nanmin(d)), abs(np.nanmax(d)), 1e-6) * 1.6
+    ax2.set_ylim(-lim, lim)
+
+    all_s = _stats(d)
+    ax.set_title(
+        f"{spec['tag']} — final held-out loss and the paired difference\n"
+        f"delta_CE = {all_s['mean']:+.4f} ± {all_s['sem']:.4f} (sem over "
+        f"{all_s['n']} repeats);  C− − C+ = {spec['C_minus']-spec['C_plus']:+.4f}\n"
+        f"thick bar = ±1 sem, thin = ±1 sd;  note the two y-scales",
+        fontsize=11, fontweight="bold")
+    ax.legend(fontsize=8, loc="lower left")
+    ax.grid(True, alpha=0.3, axis="y")
+    fig.tight_layout()
+    savefig(fig, os.path.join(out_dir, f"{spec['tag']}_final_loss.png"))
+
+
+def plot_trajectories(rec: dict, out_dir: str):
+    """
+    Every run's training-loss trajectory at alpha 0.3, both mean curves in bold,
+    with a shaded ±1 sd interval — and, beside it, the mean paired difference
+    per step.
+
+    The second panel is the trajectory form of the headline number: at each step
+    it is the mean over repeats of (CE_BW − CE_FW) for the SAME repeat, so it
+    inherits the pairing instead of differencing two independent means.
+    """
+    spec = rec["spec"]
+    M_fw = _traj_matrix([r["fw"]["traj"] for r in rec["runs"]])
+    M_bw = _traj_matrix([r["bw"]["traj"] for r in rec["runs"]])
+    if M_fw.size == 0 or M_bw.size == 0:
+        print(f"  no trajectories to plot for {spec['tag']}")
+        return
+    L = min(M_fw.shape[1], M_bw.shape[1])
+    M_fw, M_bw = M_fw[:, :L], M_bw[:, :L]
+    steps = np.arange(L)
+
+    fig, axes = plt.subplots(1, 2, figsize=(17, 5.5))
+
+    ax = axes[0]
+    for M, colour, label in ((M_fw, FW_COLOUR, "Forward"),
+                             (M_bw, BW_COLOUR, "Backward")):
+        for row in M:
+            ax.plot(steps, row, color=colour, alpha=0.3, lw=0.6, zorder=1)
+        mu = M.mean(axis=0)
+        sd = M.std(axis=0, ddof=1) if M.shape[0] > 1 else np.zeros(L)
+        ax.fill_between(steps, mu - sd, mu + sd, color=colour, alpha=0.28,
+                        zorder=2, linewidth=0)
+        ax.plot(steps, mu, color=colour, lw=2.6, zorder=3,
+                label=f"{label} mean of {M.shape[0]}  (band ±1 sd)")
+    ax.axhline(spec["theory"], color="crimson", ls="--", lw=1.6,
+               label=f"H∞ = {spec['theory']:.4f}")
+
+    # A diverged run reaches CE 15-58 bits, which would squash the region the
+    # figure is about.  Clip the view rather than the data, and say so.
+    allv = np.concatenate([M_fw.ravel(), M_bw.ravel()])
+    top  = max(float(np.nanpercentile(allv, 99.5)), spec["theory"] * 1.6)
+    n_above = int((allv > top).sum())
+    ax.set_ylim(0.0, top * 1.05)
+    n_div = sum(r["fw"]["diverged"] or r["bw"]["diverged"] for r in rec["runs"])
+    ax.set_xlabel("Gradient step")
+    ax.set_ylabel("Training CE loss (bits)")
+    ax.set_title(
+        f"{spec['tag']} — {M_fw.shape[0]} runs per direction\n"
+        f"{n_div} run(s) diverged"
+        + (f";  y clipped at {top:.2f}, {n_above} point(s) above" if n_above else ""),
+        fontsize=11, fontweight="bold")
+    ax.legend(fontsize=8)
+    ax.grid(True, alpha=0.3)
+
+    ax = axes[1]
+    D  = M_bw - M_fw                      # paired, step by step
+    mu = D.mean(axis=0)
+    sd = D.std(axis=0, ddof=1) if D.shape[0] > 1 else np.zeros(L)
+    sem = sd / np.sqrt(D.shape[0]) if D.shape[0] > 1 else np.zeros(L)
+    ax.fill_between(steps, mu - sd, mu + sd, color=D_COLOUR, alpha=0.18,
+                    linewidth=0, label="±1 sd over runs")
+    ax.fill_between(steps, mu - sem, mu + sem, color=D_COLOUR, alpha=0.40,
+                    linewidth=0, label="±1 sem")
+    ax.plot(steps, mu, color=D_COLOUR, lw=2.2, label="mean (CE_BW − CE_FW)")
+    ax.axhline(0.0, color="k", ls="--", lw=0.9)
+    # Scale to the SETTLED half of training.  Both arms are still falling
+    # through the first few dozen steps and their difference swings by whole
+    # bits there, which would compress the converged region -- the only part
+    # where the difference means anything -- into a flat line at zero.
+    tail = slice(L // 2, L)
+    span = max(float(np.nanmax(np.abs(np.concatenate([(mu - sd)[tail],
+                                                      (mu + sd)[tail]])))), 1e-6)
+    ax.set_ylim(-span * 1.25, span * 1.25)
+    ax.set_xlabel("Gradient step")
+    ax.set_ylabel("CE_BW − CE_FW (bits)")
+    ax.set_title(f"Paired difference per step  (y scaled to steps {L//2}–{L})\n"
+                 f"prediction from theory: "
+                 f"{'delta_CE > 0' if spec['C_minus'] > spec['C_plus'] else 'delta_CE < 0'}"
+                 f"  (C− − C+ = {spec['C_minus']-spec['C_plus']:+.4f})",
+                 fontsize=11, fontweight="bold")
+    ax.legend(fontsize=8)
+    ax.grid(True, alpha=0.3)
+
+    fig.tight_layout()
+    savefig(fig, os.path.join(out_dir, f"{spec['tag']}_trajectories.png"))
+
+
+def plot_summary(records: dict, out_root: str):
+    """
+    Cross-process summary: delta_CE with its sem per process, and delta_CE
+    against C- - C+.
+
+    The sign of delta_CE tracking the sign of (C- - C+) ACROSS processes is the
+    strongest thing this design can show; a single process cannot show it.
+    """
+    items = [(tag, r) for tag, r in sorted(records.items())
+             if r.get("runs") and r.get("paired")]
+    if not items:
+        return
+    tags   = [t for t, _ in items]
+    means  = np.array([r["paired"]["mean"] for _, r in items], dtype=float)
+    sems   = np.array([r["paired"].get("sem", np.nan) for _, r in items], dtype=float)
+    gaps   = np.array([r["spec"]["C_minus"] - r["spec"]["C_plus"] for _, r in items])
+    ns     = [r["paired"]["n"] for _, r in items]
+
+    fig, axes = plt.subplots(1, 2, figsize=(17, 6))
+
+    ax = axes[0]
+    y = np.arange(len(tags))
+    # Same three-way rule as the printed table: grey out anything that is not
+    # distinguishable from zero, so the figure cannot suggest a verdict the
+    # numbers do not support.
+    def _colour(m, s, g):
+        if np.isfinite(s) and abs(m) < 2 * s:
+            return "0.65"
+        return FW_COLOUR if (m > 0) == (g > 0) else D_COLOUR
+    colours = [_colour(m, s, g) for m, s, g in zip(means, sems, gaps)]
+    ax.barh(y, means, xerr=np.nan_to_num(2 * sems), color=colours, alpha=0.85,
+            edgecolor="k", error_kw=dict(ecolor="k", elinewidth=1.4, capsize=4))
+    ax.axvline(0.0, color="k", ls="--", lw=1.0)
+    ax.set_yticks(y)
+    ax.set_yticklabels([f"{t}\n(n={n}, C−−C+={g:+.3f})"
+                        for t, n, g in zip(tags, ns, gaps)], fontsize=8)
+    ax.set_xlabel("delta_CE = CE_BW − CE_FW (bits),  error bars = ±2 sem")
+    ax.set_title("Paired delta_CE per process\n"
+                 "grey = not distinguishable from zero (|delta_CE| < 2 sem);  "
+                 "blue = sign agrees with C− − C+, red = disagrees",
+                 fontsize=11, fontweight="bold")
+    ax.grid(True, alpha=0.3, axis="x")
+
+    ax = axes[1]
+    ax.errorbar(gaps, means, yerr=np.nan_to_num(sems), fmt="o", ms=7,
+                color="#4c72b0", ecolor="0.3", capsize=4)
+    for g, m, t in zip(gaps, means, tags):
+        ax.annotate(t.replace("traj_", ""), (g, m), textcoords="offset points",
+                    xytext=(6, 5), fontsize=7)
+    ax.axhline(0.0, color="k", ls="--", lw=0.9)
+    ax.axvline(0.0, color="k", ls="--", lw=0.9)
+    ax.set_xlabel("C− − C+ (bits, closed form)")
+    ax.set_ylabel("delta_CE (bits, mean over repeats)")
+    ax.set_title("Does delta_CE track the theoretical asymmetry?\n"
+                 "the hypothesis predicts points in the lower-left and "
+                 "upper-right quadrants only",
+                 fontsize=11, fontweight="bold")
+    ax.grid(True, alpha=0.3)
+
+    fig.tight_layout()
+    savefig(fig, os.path.join(out_root, "summary_delta_ce.png"))
+
+
+def print_summary(records: dict, out_root: str):
+    """The runner's asymmetry table, over repeats instead of folds."""
+    print(f"\n{'='*104}\n  ASYMMETRY SUMMARY over repeats  ({out_root})\n{'='*104}")
+    print(f"  {'process':<26} {'C+':>7} {'C-':>7} {'C- - C+':>9} "
+          f"{'delta_CE':>10} {'sem':>8} {'t':>7} {'n':>4} {'div':>5} {'verdict':>9}")
+    for tag, r in sorted(records.items()):
+        pd_ = r.get("paired")
+        if not pd_ or not r.get("runs"):
+            continue
+        spec = r["spec"]
+        mean, sem = pd_["mean"], pd_.get("sem", float("nan"))
+        cp, cm = spec["C_plus"], spec["C_minus"]
+        # Only call a sign when it is distinguishable from zero.  delta_CE is a
+        # difference of residuals: a converged predictor with spare capacity
+        # gives 0 whatever C- - C+ is, so a near-zero value is a null result and
+        # not evidence for or against the sign.
+        if np.isfinite(sem) and abs(mean) < 2 * sem:
+            verdict = "n.s."
+        elif (mean > 0) == (cm > cp):
+            verdict = "match"
+        else:
+            verdict = "MISMATCH"
+        n_div = sum(x["fw"]["diverged"] or x["bw"]["diverged"] for x in r["runs"])
+        print(f"  {tag:<26} {cp:>7.4f} {cm:>7.4f} {cm-cp:>+9.4f} "
+              f"{mean:>+10.4f} {sem:>8.4f} {pd_['t']:>+7.2f} {pd_['n']:>4} "
+              f"{n_div:>5} {verdict:>9}")
+    print(f"{'='*104}")
+    print("  n.s. = |delta_CE| < 2 sem.  The sem is now over REPEATS, each with")
+    print("  its own dataset, so unlike the per-fold sem it is sampling")
+    print("  variability.  delta_CE is still a difference of residuals, so a")
+    print("  null remains ambiguous until the d_model sweep is run.")
+    print("  div = repeats where either arm diverged (reached H∞, then blew up).")
+    print(f"{'='*104}")
+
+
+# ══════════════════════════════════════════════════════════════════════════
+# MAIN
+# ══════════════════════════════════════════════════════════════════════════
+def parse_args(argv=None):
+    ap = argparse.ArgumentParser(
+        description="Repeat-statistics harness for the causal-asymmetry test.")
+    ap.add_argument("--config", default="QUICK", choices=sorted(CONFIGS),
+                    help="configuration from configs.py supplying the model, "
+                         "data and optimiser settings (default QUICK)")
+    ap.add_argument("--repeats", type=int, default=100,
+                    help="independent repeats per process (default 100)")
+    ap.add_argument("--seed", type=int, default=None,
+                    help="base seed; repeat i uses base + i for BOTH arms "
+                         "(default cfg['seed'])")
+    ap.add_argument("--out-root", default=OUT_ROOT_DEFAULT)
+    ap.add_argument("--only", nargs="+", default=None, metavar="TAG",
+                    help="run a subset; matches a full tag or any substring of "
+                         "one, e.g. --only coin_p030 flower_n2_m6")
+    ap.add_argument("--khat", action="store_true",
+                    help="also recover k-hat / S_hat from the predictive "
+                         "distribution (slower, better estimator)")
+    ap.add_argument("--plots-only", action="store_true",
+                    help="redraw every figure from the saved pickle, no training")
+    ap.add_argument("--verbose", action="store_true",
+                    help="do not suppress the per-run training output")
+    return ap.parse_args(argv)
+
+
+def select_specs(specs: list, only) -> list:
+    if not only:
+        return specs
+    keep = []
+    for s in specs:
+        if any(o == s["tag"] or o in s["tag"] for o in only):
+            keep.append(s)
+    if not keep:
+        raise SystemExit(f"--only {only} matched none of: "
+                         + ", ".join(s['tag'] for s in specs))
+    return keep
+
+
+def load_combined(path: str) -> dict:
+    if not os.path.exists(path):
+        return {}
+    try:
+        with open(path, "rb") as f:
+            return pickle.load(f)
+    except Exception as e:
+        print(f"  ! could not read {path} ({e}) — starting fresh")
+        return {}
+
+
+def main(argv=None):
+    args = parse_args(argv)
+    cfg  = dict(CONFIGS[args.config])
+    if args.seed is not None:
+        cfg["seed"] = args.seed
+    out_root = args.out_root
+    mkdir(out_root)
+
+    specs = select_specs(process_specs(cfg), args.only)
+    combined_path = os.path.join(out_root, "all_trajectories.pkl")
+    combined = load_combined(combined_path)
+
+    # Provenance next to the outputs, named per config so two configs sharing an
+    # out_root cannot overwrite each other's record.
+    if not args.plots_only:
+        with open(os.path.join(out_root,
+                               f"run_config_{args.config}.json"), "w") as f:
+            json.dump({"config": args.config, "repeats": args.repeats,
+                       "base_seed": cfg["seed"], "khat": args.khat,
+                       "processes": [s["tag"] for s in specs],
+                       "utc": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
+                       **{k: v for k, v in cfg.items()}},
+                      f, indent=2, default=str)
+
+    print(f"\n{'='*70}")
+    print(f"  config={args.config}  repeats={args.repeats}  "
+          f"base_seed={cfg['seed']}  out_root={out_root}")
+    print(f"  d_model={cfg['d_model']}  n_layers={cfg['n_layers']}  "
+          f"lr={cfg['lr']}  chunk={cfg['train_chunk_len']}")
+    print(f"  processes: {', '.join(s['tag'] for s in specs)}")
+    if args.plots_only:
+        print("  --plots-only: no training, redrawing from the saved pickle")
+    print(f"{'='*70}")
+
+    t_start = time.time()
+    for spec in specs:
+        tag  = spec["tag"]
+        odir = os.path.join(out_root, tag)      # created once there is output
+        print(f"\n{'='*70}\n  {tag}   [{spec['kind']}]\n{'='*70}")
+        if spec["kind"] == "flower":
+            print(f"  dice_probs (seed {cfg['flower_dice_seed']}):\n{spec['dice_probs']}")
+            print(f"  seq_len={spec['seq_len']} cycles = "
+                  f"{2*spec['seq_len']} tokens/sequence")
+        print(f"  H∞ = {spec['theory']:.4f} bits   "
+              f"C+ = {spec['C_plus']:.4f}   C- = {spec['C_minus']:.4f}   "
+              f"C- - C+ = {spec['C_minus']-spec['C_plus']:+.4f}")
+        print(f"  prediction: "
+              f"{'delta_CE > 0' if spec['C_minus'] > spec['C_plus'] else 'delta_CE < 0'}")
+
+        if args.plots_only:
+            rec = combined.get(tag)
+            if not rec or not rec.get("runs"):
+                print("  nothing saved for this process — skipping")
+                continue
+            mkdir(odir)
+        else:
+            mkdir(odir)
+            rec = dict(spec=spec, config=args.config, base_seed=cfg["seed"],
+                       repeats=args.repeats, khat=args.khat, runs=[])
+            t_proc = time.time()
+            for i in range(args.repeats):
+                seed = cfg["seed"] + i
+                t0 = time.time()
+                with quiet(not args.verbose):
+                    run = one_repeat(spec, cfg, seed, khat=args.khat)
+                rec["runs"].append(run)
+
+                flag = ""
+                if run["fw"]["diverged"] or run["bw"]["diverged"]:
+                    flag = ("   ! DIVERGED "
+                            f"({'fw' if run['fw']['diverged'] else ''}"
+                            f"{'bw' if run['bw']['diverged'] else ''})")
+                done = i + 1
+                eta = (time.time() - t_proc) / done * (args.repeats - done) / 60
+                extra = ""
+                if args.khat:
+                    extra = (f"  k̂ {run['fw'].get('k_hat')}/"
+                             f"{run['bw'].get('k_hat')}")
+                print(f"  [{tag} {done:>3}/{args.repeats}] seed={seed}  "
+                      f"CE_FW={run['fw']['final_ce']:.4f}  "
+                      f"CE_BW={run['bw']['final_ce']:.4f}  "
+                      f"delta={run['delta_ce']:+.4f}  "
+                      f"S_emp {run['fw']['S_emp']:.3f}/{run['bw']['S_emp']:.3f}"
+                      f"{extra}  ({time.time()-t0:.1f}s, ETA {eta:.1f} min)"
+                      f"{flag}")
+
+                # Written every repeat: this loop is hours long and a crash
+                # should cost one repeat, not the whole process.  Quiet, because
+                # paired_delta_ce prints one line per repeat and save_pkl prints
+                # a size -- both are wanted once at the end, not n times.
+                with contextlib.redirect_stdout(io.StringIO()):
+                    rec["paired"] = (paired_stats(rec)
+                                     if len(rec["runs"]) > 1 else None)
+                    save_pkl(rec, os.path.join(odir, "results.pkl"))
+                    combined[tag] = rec
+                    save_pkl(combined, combined_path)
+            print(f"\n  {tag} done in {(time.time()-t_proc)/60:.1f} min")
+
+        rec["paired"] = paired_stats(rec) if len(rec["runs"]) > 1 else None
+        combined[tag] = rec
+        save_pkl(rec, os.path.join(odir, "results.pkl"))
+
+        plot_complexity(rec, odir)
+        plot_final_loss(rec, rec["paired"], odir)
+        plot_trajectories(rec, odir)
+        cleanup()
+
+    save_pkl(combined, combined_path)
+    plot_summary(combined, out_root)
+    print_summary(combined, out_root)
+
+    print(f"\n{'='*70}\n  ALL COMPLETE — {(time.time()-t_start)/60:.1f} min")
+    for root, _dirs, files in os.walk(out_root):
+        lvl = root.replace(out_root, "").count(os.sep)
+        print(f"{'  '*lvl}{os.path.basename(root)}/")
+        for f in sorted(files):
+            print(f"{'  '*(lvl+1)}{f}")
+    print(f"{'='*70}")
+
+
+if __name__ == "__main__":
+    main()
