@@ -886,7 +886,7 @@ def main(argv=None):
     # silently destroy the record of every experiment not run this time --
     # the .pkl and .pt files on disk would survive but all_results.pkl, which
     # is what the analysis notebooks read, would list only the latest subset.
-    # Keyed by tag, and tags are derived from config values (A4), so a re-run
+    # Keyed by tag, and tags are derived from config values, so a re-run
     # of the same experiment replaces its own entry and nothing else.
     combined_path = os.path.join(out_root, "all_results.pkl")
     combined = {}
