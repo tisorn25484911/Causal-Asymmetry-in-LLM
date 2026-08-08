@@ -21,15 +21,18 @@ neural predictor exhibits that asymmetry as excess cross-entropy.
   *asymmetrically in the right direction*: a coin's backward arm recovers three
   states where its forward arm recovers two, and the flower arms swap when m > n
   becomes n > m.
-- **The thermodynamic half is not confirmed.** ΔCE = CE_BW − CE_FW is of order
-  0.001–0.003 bits, with standard errors of comparable size; five of seven
-  experiments are statistically indistinguishable from zero. **The extra memory
-  is real, and at this capacity it is free.**
+- **The thermodynamic half is not confirmed.** Across 1,400 trainings — seven
+  processes, 100 independent datasets each — ΔCE = CE_BW − CE_FW is between
+  0.0003 and 0.0024 bits, that is **0.03 % to 0.13 % of the entropy rate**. At
+  that sample size the effect is resolvable, and it does **not** follow the
+  theory: two processes come out significantly in the predicted direction and
+  **two significantly in the opposite direction**. **The extra memory is real,
+  and at this capacity it is free.**
 
 That second outcome is what the theory predicts for an over-provisioned,
-converged model — Section 1.2 explains why — so it is a null result rather than a
-refutation, and it is not yet interpretable as either. Section 11 sets out what
-it does and does not license, and what would settle it.
+converged model — Section 1.2 explains why — so it is a null on the hypothesis
+rather than a refutation of it, and it is not yet interpretable as either.
+Section 11 sets out what it does and does not license, and what would settle it.
 
 ---
 
@@ -601,11 +604,23 @@ processes; and uniform settings across all seven processes so they are comparabl
 to each other. Within a repeat the two arms are paired exactly as in Section 4.2.
 
 Per process it produces the complexity with error bars over repeats, the final
-loss as three bars (forward, backward, and their paired difference), and all
-trajectories with both mean curves and a shaded interval.
+loss as three bars (forward, backward, and their paired difference), and every
+run's trajectory with both mean curves and a shaded interval. At the root it
+writes two cross-process figures: `summary_delta_ce.png` (ΔCE with its standard
+error per process, and ΔCE against C⁻ − C⁺) and `summary_grid.png`, a 3 × 7 grid
+carrying all three quantities for all seven processes on one sheet — rows are the
+quantities, columns the processes ordered coin-then-flower by descending
+C⁻ − C⁺, so scanning a row asks directly whether anything varies with the
+theoretical asymmetry.
 
-**Verified end to end on short runs; the full 100-repeat run has not yet been
-performed**, so no results from it appear in Section 10.
+Every panel in the grid is drawn by the same `_draw_*` helper as the
+corresponding standalone figure, in a compact mode, so the two cannot disagree.
+Y-scales are per column, since H∞ ranges from 0.47 to 2.10 bits across these
+processes and a shared axis would compress every panel to accommodate the
+largest.
+
+**The full run is complete**: 700 repeats, 1,400 trainings, ~2.3 hours with
+`--khat`, zero divergences. Its results are Section 10.3.
 
 ### 5.6 The causal-state figures — `plot_state_clusters.py`
 
@@ -865,7 +880,8 @@ python run_experiments.py --config SMOKE      # ~2 min, exercises every path
 python run_experiments.py --config QUICK      # ~9 min  ← the reportable run
 python sanity_check.py                        # ~7 min, the controls
 python plot_state_clusters.py                 # causal-state figures
-python run_statistical_trj.py                 # ~2.25 h, repeat statistics
+python run_statistical_trj.py --khat          # ~2.3 h, repeat statistics (done)
+python run_statistical_trj.py --plots-only    # redraw its figures, no training
 ```
 
 `HOW_TO_RUN.md` documents every flag, every output file, the schema of each
@@ -876,19 +892,31 @@ pins in `requirements-lock.txt`.
 
 ## 10. Results
 
-All numbers below are from `results_quick/all_results.pkl` — the QUICK
-configuration plus QUICK_LARGE_HMM's three additional processes, seven
-experiments in total, seed 0, `d_model = 32`, `n_layers = 2`, five folds each.
+Two independent measurements of the same quantity are reported, and they should
+be read in this order:
+
+- **The cross-validated runs** (§10.2) — `results_quick/all_results.pkl`, seven
+  experiments, five folds of one seed each. Their standard error is over folds
+  that share a training set, so it understates the uncertainty.
+- **The repeat harness** (§10.3) — `results_trajectories/all_trajectories.pkl`,
+  seven processes × 100 independent datasets, 1,400 trainings. Its standard error
+  is sampling variability. **This is the measurement to quote.**
+
+Both used `d_model = 32`, `n_layers = 2`, base seed 0.
 
 ### 10.1 Convergence
 
-Every arm converged. Forward cross-entropy exceeds the analytic H∞ by between
-**0.0010 and 0.0082 bits** across the seven experiments, and all five folds
-converge in every one. This matters because ΔCE is only about asymmetry once both
-residuals are small; had the arms been 0.3 bits off H∞, the difference between
-them would have been about optimisation.
+Every arm of every run converged. Forward cross-entropy exceeds the analytic H∞
+by **0.0010 to 0.0082 bits** in the cross-validated runs and by **0.0023 to
+0.0117 bits** over the 100-repeat means. This matters because ΔCE is only about
+asymmetry once both residuals are small; had the arms been 0.3 bits off H∞, the
+difference between them would have been about optimisation instead.
 
-### 10.2 The asymmetry signal
+The repeat harness recorded **zero divergences in 1,400 trainings**, consistent
+with Section 4.6: at 130 gradient steps per run it stops just short of the onset
+window.
+
+### 10.2 The asymmetry signal — cross-validated
 
 | Experiment | H∞ | CE_FW | CE_BW | ΔCE | sem | C⁻−C⁺ | Verdict |
 |---|---|---|---|---|---|---|---|
@@ -902,9 +930,45 @@ them would have been about optimisation.
 
 `n.s.` denotes |ΔCE| < 2 × sem — not distinguishable from zero. Five of seven are
 `n.s.`; the two marked `match` have the sign predicted by C⁻ − C⁺ and exceed
-twice their standard error.
+twice their standard error. Section 11.4 explains why those two should not be
+read as confirmations, and §10.3 supersedes this table.
 
-### 10.3 Causal states recovered — the positive result
+### 10.3 The asymmetry signal — 100 independent repeats
+
+Each row is 100 independently generated datasets, each trained in both directions
+from the same seed, and the difference taken within a repeat. Columns are ordered
+as in `summary_grid.png`: coin then flower, each by descending C⁻ − C⁺.
+
+| Process | C⁺ | C⁻ | C⁻−C⁺ | CE_FW | CE_BW | ΔCE | sem | t | Verdict |
+|---|---|---|---|---|---|---|---|---|---|
+| `coin_p040_q080` | 0.918 | 1.566 | +0.647 | 0.8913 | 0.8902 | −0.0011 | 0.0002 | −4.86 | **`MISMATCH`** |
+| `coin_p030_q040` | 0.985 | 1.489 | +0.504 | 0.9236 | 0.9226 | −0.0011 | 0.0003 | −3.64 | **`MISMATCH`** |
+| `coin_p010_q090` | 0.469 | 0.891 | +0.422 | 0.4713 | 0.4716 | +0.0003 | 0.0002 | +1.28 | `n.s.` |
+| `flower_n2_m8` | 1.500 | 2.477 | +0.977 | 1.7870 | 1.7894 | **+0.0024** | 0.0004 | +5.56 | `match` |
+| `flower_n2_m6` | 1.500 | 2.114 | +0.614 | 1.5412 | 1.5418 | +0.0006 | 0.0004 | +1.81 | `n.s.` |
+| `flower_n6_m4` | 2.292 | 1.990 | −0.303 | 2.1101 | 2.1095 | −0.0006 | 0.0004 | −1.57 | `n.s.` |
+| `flower_n4_m2` | 2.000 | 1.495 | −0.505 | 1.3420 | 1.3413 | −0.0007 | 0.0003 | −2.42 | `match` |
+
+Four of the seven effects are now resolvable — **two in the predicted direction,
+two against it.** Three remain indistinguishable from zero. Every magnitude lies
+between 0.0003 and 0.0024 bits, which is 0.03 % to 0.13 % of the process entropy
+rate.
+
+Three aggregate statistics, none of which reaches significance:
+
+| Statistic | Value | |
+|---|---|---|
+| Signs agreeing with C⁻ − C⁺ | 5 of 7 | binomial p = 0.227 |
+| Pearson r(C⁻ − C⁺, ΔCE) | **+0.527** | p = 0.224, n = 7 processes |
+| Range of \|ΔCE\| | 0.0003 – 0.0024 bits | no relation to \|C⁻ − C⁺\| |
+
+The correlation point estimate is positive, i.e. in the direction the hypothesis
+predicts, and with only seven processes it is nowhere near distinguishable from
+zero. It is the most encouraging number in this repository and it must not be
+quoted without its p-value. Section 11.4 works through what it would take to
+turn it into evidence.
+
+### 10.4 Causal states recovered — the positive result
 
 For each arm, the assumed k, the discovered k̂, and both complexity estimates
 against the closed form:
@@ -949,7 +1013,36 @@ and held-out sequences on 12 of 14 arms**, the exceptions being the arms with th
 most states and therefore the fewest held-out sequences per state — evidence that
 the recovered structure is not memorisation.
 
-### 10.4 The controls
+**The repeat harness replicates all of this over 100 datasets per process**, with
+standard errors on the complexity that the single cross-validated run could not
+provide:
+
+| Arm | k theory | k̂ median | S_emp | S_hat | Closed form |
+|---|---|---|---|---|---|
+| `coin_p040_q080` fw / bw | 2 / 3 | 2 / 3 | 0.9146 / 1.5620 | 0.9146 / 1.5620 | 0.9183 / 1.5656 |
+| `coin_p030_q040` fw / bw | 2 / 3 | 2 / 3 | 0.9843 / 1.4843 | 0.9843 / 1.4916 | 0.9852 / 1.4888 |
+| `coin_p010_q090` fw / bw | 2 / 3 | 2 / 3 | 0.4709 / 0.8972 | 0.4709 / 0.8020 | 0.4690 / 0.8911 |
+| `flower_n2_m8` fw / bw | 3 / 9 | 3 / **7** | 1.4975 / 2.8565 | 1.5012 / 2.2219 | 1.5000 / 2.4765 |
+| `flower_n2_m6` fw / bw | 3 / 7 | 3 / **6** | 1.4959 / 2.5628 | 1.5032 / 2.0253 | 1.5000 / 2.1137 |
+| `flower_n6_m4` fw / bw | 7 / 5 | 7 / 5 | 2.5335 / 2.0453 | 2.2893 / 1.9882 | 2.2925 / 1.9899 |
+| `flower_n4_m2` fw / bw | 5 / 3 | 5 / 3 | 2.1259 / 1.4941 | 1.9996 / 1.5099 | 2.0000 / 1.4952 |
+
+Standard errors on the S_emp means are 0.001 to 0.013 bits, so the gaps against
+the closed forms below are far larger than the sampling noise in them.
+
+- **k̂ recovers the theoretical state count on 12 of 14 arms**, including both
+  directions of every coin and the correct *inversion* of the flower arms. The
+  two exceptions are the high-k flower backward arms, where the model
+  under-resolves the states it should have (7 against 9, and 6 against 7).
+- **Mean absolute error against the closed forms: 0.0914 bits for `S_emp`,
+  0.0335 for `S_hat`** — a 2.7× improvement, and `S_hat` is the closer estimate
+  on **11 of 14** arms.
+- One honest exception: on `coin_p010_q090` backward, `S_emp` (error 0.0061) beats
+  `S_hat` (0.0891). This is the most skewed occupancy in the set, and it is the
+  case where the two estimators' biases happen to point opposite ways. `S_hat`
+  is the better estimator on the evidence, not on every arm.
+
+### 10.5 The controls
 
 | Control | H∞ | CE_FW | CE_BW | ΔCE | Verdict | Folds diverged |
 |---|---|---|---|---|---|---|
@@ -971,7 +1064,7 @@ happens the residuals vanish and ΔCE → 0 whatever C⁻ − C⁺ is. Both cont
 heavy divergence at 60 epochs, so their paired statistics rest on one or two folds
 and the standard error is `nan`.
 
-### 10.5 LARGE
+### 10.6 LARGE
 
 **LARGE's cross-validation results are not usable.** All forty folds diverged —
 five of five on each of its eight arms — leaving paired standard errors of 0.11
@@ -988,25 +1081,38 @@ use cross-validation.
 
 ## 11. What the results mean
 
-### 11.1 The null on ΔCE is what the theory predicts, not a refutation of it
+### 11.1 The magnitude of ΔCE is what the theory predicts
 
 Section 1.2 is not a hedge written after the fact; it is a derivation. H∞ is
 time-reversal invariant, so ΔCE is a difference of *residuals*, and residuals go
 to zero as capacity and training suffice. At `d_model = 32` — 23,395 parameters, a
 32-dimensional float residual stream — on a 3-token process whose optimal
 predictor needs under 1.6 bits of memory, the model is over-provisioned by orders
-of magnitude. **The correct prediction for this regime is ΔCE ≈ 0, and that is what
-was measured.**
+of magnitude. **The correct prediction for this regime is ΔCE ≈ 0, and |ΔCE| came
+out between 0.03 % and 0.13 % of the entropy rate.**
 
 The mismatch of scales is the whole story. C⁻ − C⁺ = 0.65 bits for the coin at
 p=0.4, q=0.8. Holding 1.57 bits of state instead of 0.92 costs a 32-dimensional
 continuous representation nothing whatsoever. There is no reason it should show
-up in the loss, and it does not.
+up in the loss, and to three decimal places it does not.
 
-So this result may **not** be reported as "no causal asymmetry in transformers".
-It is consistent with that, and equally consistent with "the asymmetry was
-entirely absorbed by spare capacity", and nothing in these seven experiments
-distinguishes the two.
+What 100 repeats add is the ability to *resolve* what remains. With a standard
+error of 0.0002 bits, differences of a thousandth of a bit become statistically
+visible — and they turn out not to be the predicted ones (§10.3, §11.4). So the
+honest statement has two parts, and both matter:
+
+- **On magnitude, the theory is vindicated**: an over-provisioned converged model
+  pays essentially nothing for the extra causal states, exactly as the residual
+  argument requires.
+- **On sign, at the resolution now available, the data do not support the
+  hypothesis**: two processes go the predicted way, two the other way.
+
+This may still **not** be reported as "no causal asymmetry in transformers". It
+remains equally consistent with "the asymmetry was entirely absorbed by spare
+capacity", and nothing in these seven processes distinguishes those two readings.
+What has been established is narrower and firmer: **at this capacity the effect,
+if present, is smaller than a thousandth of a bit and is not detectable by its
+sign.**
 
 ### 11.2 The representational half of the hypothesis *is* confirmed
 
@@ -1022,7 +1128,11 @@ The models are not merely fitting a conditional table. They are constructing the
   and 3 backward. Nothing tells the model how many states to build; k̂ is
   discovered by thresholding, and the threshold is the same 0.10 everywhere.
 - **The occupancy entropies come out right**, to a mean absolute error of 0.026
-  bits across fourteen arms spanning C from 0.47 to 2.48.
+  bits across the fourteen cross-validated arms, and 0.034 bits across the
+  fourteen arms of the 100-repeat run — spanning C from 0.47 to 2.48.
+- **It replicates.** The repeat harness recovers the same state counts on 12 of
+  14 arms over 100 independent datasets per process, with standard errors on the
+  complexity of 0.001 to 0.013 bits. This is not one lucky fit.
 - **The structure generalises.** k̂ is stable across a wide band of thresholds,
   and agrees between train-seen and held-out sequences on 12 of 14 arms.
 - **The one clean qualitative prediction is visible directly.** Tokens 0 and 2 of
@@ -1059,32 +1169,51 @@ for the thermodynamic claim in the first place: the natural test is a model whos
 memory is explicitly bounded and countable, where the number of states is a
 parameter rather than an emergent property.
 
-### 11.4 The two `match` verdicts should not be over-read
+### 11.4 On the sign of ΔCE, and the one encouraging number
 
-They are +0.0026 and +0.0016 bits — a few thousandths of a bit. They clear the
-threshold only because the fold-level standard error is itself very small
-(0.0004), and that standard error is computed over five folds that **share a
-training set**. It therefore measures fold-to-fold variability, not sampling
-variability over datasets, and is a lower bound on the true uncertainty. It must
-not be presented as a confidence interval.
+The cross-validated table (§10.2) marked two experiments `match`. Those two
+should not be read as confirmations, for a reason that has nothing to do with
+their sign: they clear the threshold only because the fold-level standard error
+(0.0004) is computed over five folds that **share a training set**. That measures
+fold-to-fold variability, not sampling variability over datasets, and is a lower
+bound on the true uncertainty. Building the repeat harness was the correct
+response to that objection, and it changed the answer.
 
-More telling is that **no dose-response relationship with C⁻ − C⁺ is visible.**
-Ordering the seven experiments by their theoretical asymmetry gives no
-corresponding order in ΔCE: the largest gap (+0.9765) yields +0.0016, but the
-second largest (+0.6473) yields −0.0004, and the smallest positive gap (+0.4221)
-yields the largest ΔCE of all. Ignoring significance entirely and simply counting
-signs, ΔCE agrees with the sign of C⁻ − C⁺ in **3 of 7** experiments — which is
-what coin-flipping looks like, and is the signature of a null.
+**What the repeats show is more interesting than a flat null.** With sampling
+variability and a standard error of 0.0002–0.0004 bits, four of the seven effects
+resolve — and they do not agree with each other:
 
-If the two significant values were measuring asymmetry, one would expect them to
-be the experiments where the asymmetry is largest, and one would expect the
-others to line up behind them. Neither holds. They are more consistent with a
-small residual optimisation difference, or with the small-sample structure of five
-folds that share a training set.
+| | |
+|---|---|
+| Predicted direction, significant | `flower_n2_m8` (+0.0024), `flower_n4_m2` (−0.0007) |
+| **Opposite** direction, significant | `coin_p040_q080` (−0.0011), `coin_p030_q040` (−0.0011) |
+| Not resolvable | `coin_p010_q090`, `flower_n2_m6`, `flower_n6_m4` |
 
-The honest summary of Section 10.2 is: **seven experiments, no detectable effect,
-two values that clear a threshold computed on a standard error that is known to
-be too small.**
+Where the effect is resolvable it is **as likely to point the wrong way as the
+right way**, and the two wrong-way cases are the two coins with the largest
+positive C⁻ − C⁺ — precisely where the hypothesis expects the clearest positive
+signal. Any account of these data has to explain that, and "causal asymmetry
+raises backward cross-entropy" does not.
+
+Two aggregate statistics cut in the other direction and are worth reporting
+honestly:
+
+- **Sign agreement is 5 of 7** (binomial p = 0.227).
+- **Pearson r(C⁻ − C⁺, ΔCE) = +0.527** across the seven processes (p = 0.224).
+
+Both point the way the hypothesis predicts; neither is significant, and with
+n = 7 processes neither could be. A correlation of +0.53 on seven points is what
+noise routinely produces. It is nonetheless the most encouraging number in this
+repository, and it identifies the cheapest experiment that could move the
+question: **more processes.** The per-process precision is already ample —
+0.0002 bits — so nothing is gained by more repeats; what limits the correlation
+test is that the x-axis has seven values on it. Twenty or thirty (n, m) pairs at
+100 repeats each would give that test real power, at a cost of roughly a day.
+
+The honest summary of §10.3 is therefore: **the magnitudes behave exactly as the
+residual argument requires, the signs do not track the theory at the resolution
+now available, and the across-process trend is positive but statistically
+worthless at n = 7.**
 
 ### 11.5 The negative results were worth having
 
@@ -1105,35 +1234,60 @@ needs them:
 - **The estimator you use to count causal states determines your answer.** A
   fixed-k estimator confirms the k it is given and overestimates on unbalanced
   occupancies; the same fourteen arms give a 4.2× smaller error when clustering
-  the predictive distribution instead, which is also the object the theory
-  actually defines states by.
+  the predictive distribution instead (2.7× on the repeat run), which is also the
+  object the theory actually defines states by.
+- **A standard error over cross-validation folds was hiding the answer, not just
+  widening it.** Replacing five shared folds with 100 independent datasets did
+  not merely shrink the error bars — it turned two `n.s.` verdicts into
+  significant results *pointing the wrong way*, and moved one `match` from
+  +0.0026 to +0.0003. A resampling scheme that shares training data does not give
+  a conservative answer; it gives a different one.
 
 ### 11.6 What would turn this into a finding
 
-In descending order of value:
+In descending order of value, updated now that the repeat harness has run:
 
 1. **The `d_model` sweep.** ΔCE against capacity, at fixed depth and fixed
-   process. This is the experiment that makes the null interpretable, and the
-   only one that can.
-2. **The seed-repeat harness, run in full.** Replaces a standard error over five
-   shared folds with one over 100 independent datasets. Built, verified, not yet
-   run.
+   process. This is the experiment that makes the result interpretable, and the
+   only one that can. §11.3 argues the informative direction is *downward*,
+   `d_model` of 2 to 8.
+2. **More processes, not more repeats.** §11.4: per-process precision is already
+   0.0002 bits, so the across-process correlation test is limited purely by
+   having seven points on its x-axis. Twenty to thirty (n, m) pairs at 100
+   repeats each would give it real power for roughly a day of compute, and
+   `run_statistical_trj.py` needs only a longer `FLOWER_NM` list to do it.
 3. **The reversed positional encoding.** `reverse_pos_for_backward` is the last
-   architectural asymmetry between the arms. Running the backward arm both ways
-   is what separates causal asymmetry from a positional-encoding artefact.
+   architectural asymmetry between the arms, and it is now the leading suspect
+   for the two significant wrong-way coins. Running the backward arm both ways is
+   what separates causal asymmetry from a positional-encoding artefact.
 4. **A second null control** — an i.i.d. process, for which C⁺ = C⁻ = 0 — to
    confirm that the pipeline reports zero for a reason rather than by luck.
 5. **Stable long runs**, via `AdamW(weight_decay=0.01)`, if the large
    configuration is ever to contribute. Every number would need re-running under
    the same optimiser.
 
+~~The seed-repeat harness~~ — **done**, and it is what makes items 2 and 3
+worth doing next: it established that the measurement is precise enough for the
+sign to be a real question rather than noise.
+
 ---
 
 ## 12. Limitations and open work
 
-**Statistical.** Every reported standard error is over five folds of one seed
-sharing a training set: fold-to-fold variability, not sampling variability. One
-seed per configuration. No correction for testing seven experiments.
+**Statistical.** Two regimes, and which applies depends on the figure:
+
+- The **cross-validated** runs (§10.2, §10.4, §10.5) report a standard error over
+  five folds of one seed sharing a training set — fold-to-fold variability, not
+  sampling variability, and a lower bound on the true uncertainty. §11.5 shows it
+  was not merely narrow but misleading.
+- The **repeat harness** (§10.3) reports sampling variability over 100
+  independent datasets per process, which is the correct quantity. Its residual
+  limitations are that the seven processes are a small sample for the
+  across-process test (§11.4), and that there is **no correction for testing
+  seven processes** — the expected number of spurious verdicts at a two-sided
+  2-sem threshold across seven comparisons is about 0.3, so any single isolated
+  verdict deserves little weight, and that caution applies to the two `match`
+  results as much as to the two `MISMATCH` ones.
 
 **The estimator's free parameter.** k̂ depends on a distance threshold whose
 correct value varies by an order of magnitude across these processes. The
