@@ -936,6 +936,7 @@ def parse_args(argv=None):
                     help="redraw every figure from the saved pickle, no training")
     ap.add_argument("--verbose", action="store_true",
                     help="do not suppress the per-run training output")
+
     return ap.parse_args(argv)
 
 
