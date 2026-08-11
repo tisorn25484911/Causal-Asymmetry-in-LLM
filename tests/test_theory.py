@@ -763,3 +763,96 @@ def test_split_indices_reproduce_the_pipeline_split_exactly():
     assert list(te_loader.dataset.indices) == te_idx
     assert set(tr_idx).isdisjoint(te_idx)
     assert len(te_idx) == 40
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Weight decay — WEIGHT_DECAY_PLAN.md §4
+# ─────────────────────────────────────────────────────────────────────────────
+def test_adamw_zero_decay_equals_adam():
+    """
+    The guarantee the whole change rests on: at weight_decay=0.0 AdamW takes the
+    same steps as Adam, so every number produced before this change stays valid.
+    """
+    def run(opt_cls, **kw):
+        torch.manual_seed(0)
+        m = torch.nn.Linear(6, 4)
+        opt = opt_cls(m.parameters(), lr=1e-2, **kw)
+        g = torch.Generator().manual_seed(1)
+        for _ in range(20):
+            x = torch.randn(8, 6, generator=g)
+            opt.zero_grad()
+            m(x).pow(2).mean().backward()
+            opt.step()
+        return [p.detach().clone() for p in m.parameters()]
+
+    a = run(torch.optim.Adam)
+    w = run(torch.optim.AdamW, weight_decay=0.0)
+    for pa, pw in zip(a, w):
+        assert torch.allclose(pa, pw, atol=0, rtol=0), \
+            f"max|delta| = {(pa - pw).abs().max().item():.3e}"
+
+
+def test_weight_decay_defaults_to_zero():
+    """
+    Guards against adopting PyTorch's AdamW default of 0.01.  AdamW is not a
+    drop-in for Adam, and a silent 0.01 would change every existing result.
+    """
+    from configs import BASE, CONFIGS
+    from OneHot_model import OneHotDecoder
+    assert BASE["weight_decay"] == 0.0
+    for name, cfg in CONFIGS.items():
+        assert cfg["weight_decay"] == 0.0, f"{name} ships a nonzero default"
+    assert OneHotDecoder(token_size=3, d_model=8, max_len=16).weight_decay == 0.0
+
+
+def test_weight_decay_reaches_the_optimiser():
+    """
+    The threading bug this change risks is a value accepted and then dropped --
+    exactly what happened to n_layers (B11), unnoticed because every config
+    happened to agree.  Assert it arrives.
+    """
+    from OneHot_model import OneHotDecoder
+    m = OneHotDecoder(token_size=3, d_model=8, max_len=16, weight_decay=0.03)
+    opt = m.configure_optimizers()
+    assert isinstance(opt, torch.optim.AdamW)
+    assert opt.param_groups[0]["weight_decay"] == 0.03
+
+
+def test_weight_decay_threads_through_train_model():
+    """The same, one level up: train_model must forward it to the model."""
+    from Training_model import train_model
+
+    class _DS(torch.utils.data.Dataset):
+        def __len__(self):
+            return 4
+
+        def __getitem__(self, i):
+            x = torch.randint(0, 3, (8,), generator=torch.Generator().manual_seed(i))
+            return x, x
+
+    loader = torch.utils.data.DataLoader(_DS(), batch_size=2)
+    rec = train_model(loader, num_token=3, d_model=8, max_len=8, max_epochs=1,
+                      mode="forward", accelerator="cpu", weight_decay=0.03)
+    assert rec.model.weight_decay == 0.03
+    assert rec.model.configure_optimizers().param_groups[0]["weight_decay"] == 0.03
+
+
+def test_old_checkpoints_still_load():
+    """
+    Adding a keyword argument adds no parameters and no buffers, so every .pt
+    written before this change must still load.
+    """
+    import glob
+    import json as _json
+    from OneHot_model import OneHotDecoder
+    paths = sorted(glob.glob("results_quick/models/*_fw.pt"))
+    if not paths:
+        pytest.skip("no saved checkpoints in this clone")
+    side = os.path.splitext(paths[0])[0] + ".json"
+    if not os.path.exists(side):
+        pytest.skip("checkpoint has no sidecar")
+    meta = _json.load(open(side))
+    m = OneHotDecoder(token_size=meta["token_size"], d_model=meta["d_model"],
+                      max_len=meta["max_len"], n_layers=meta["n_layers"],
+                      mode="forward")
+    m.load_state_dict(torch.load(paths[0], map_location="cpu"))
