@@ -5,7 +5,7 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 import lightning as L
-from torch.optim import Adam
+from torch.optim import AdamW
 
 
 class PositionalEncoding(nn.Module):
@@ -131,6 +131,7 @@ class OneHotDecoder(L.LightningModule):
         mode="forward",
         reverse_pos_for_backward: bool = False,
         n_layers=2,
+        weight_decay: float = 0.0,
     ):
         super().__init__()
         self.mode = mode
@@ -141,6 +142,9 @@ class OneHotDecoder(L.LightningModule):
         self.d_model = d_model
         self.max_len = max_len
         self.lr = lr
+        # 0.0 keeps this bit-identical to the plain Adam every result in the
+        # repository was produced with -- see configure_optimizers.
+        self.weight_decay = weight_decay
 
         # This was an nn.Parameter, which makes
         # `one_hot @ self.rand_prj` a LEARNED embedding table -- mathematically
@@ -318,5 +322,36 @@ class OneHotDecoder(L.LightningModule):
         return loss
 
     def configure_optimizers(self):
-        return Adam(self.parameters(), lr=self.lr)
+        """
+        AdamW, whose weight_decay defaults to 0.0 here.
+
+        At weight_decay=0.0 AdamW is bit-identical to Adam -- verified over 20
+        seeded steps on a Linear, max|delta param| = 0.0 -- so every number
+        produced before this change stays valid and comparable.
+
+        TRAP, and the reason the value is always passed explicitly: PyTorch's
+        AdamW defaults to weight_decay=0.01 while Adam defaults to 0.0.  AdamW is
+        NOT a drop-in replacement; relying on its default would silently change
+        every existing result.
+
+        Why AdamW rather than L2 added to the loss: AdamW decouples the decay
+        from the adaptive scaling, applying `p -= lr * weight_decay * p` directly.
+        An L2 term inside the loss gets divided by Adam's second-moment estimate,
+        so its effective strength varies per parameter and it stops being a clean
+        norm bound.
+
+        Weight decay is here for two reasons.  It restores a FINITE optimum --
+        cross-entropy on a deterministic transition has none, which is why
+        training eventually blows up (diagnose_divergence) -- and it provides a
+        continuous capacity axis, which is what a null delta_CE needs before it
+        can be told apart from "capacity absorbed the asymmetry".
+
+        Note the decay's total effect scales with lr * weight_decay * steps, so a
+        given lambda bites much harder in a long run than a short one: at
+        lr=1e-2 over 130 steps, lambda=0.01 shrinks a weight by 1.3%, while at
+        lr=5e-3 over 1600 steps it shrinks it by 7.7%.  A lambda grid has to be
+        chosen for the step budget it will run at.
+        """
+        return AdamW(self.parameters(), lr=self.lr,
+                     weight_decay=self.weight_decay)
 

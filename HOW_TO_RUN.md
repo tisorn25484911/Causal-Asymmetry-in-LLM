@@ -17,13 +17,14 @@ state of the repository.
 5. [Running the training suite](#5-running-the-training-suite)
 6. [Running the controls](#6-running-the-controls)
 7. [Running the seed-repeat harness](#7-running-the-seed-repeat-harness)
-8. [Generating the causal-state figures](#8-generating-the-causal-state-figures)
-9. [The post-hoc evaluators](#9-the-post-hoc-evaluators)
-10. [Verification and documentation](#10-verification-and-documentation)
-11. [Understanding the outputs](#11-understanding-the-outputs)
-12. [Interpreting the results](#12-interpreting-the-results)
-13. [Troubleshooting](#13-troubleshooting)
-14. [Command reference](#14-command-reference)
+8. [The parameter sweep](#8-the-parameter-sweep)
+9. [Generating the causal-state figures](#9-generating-the-causal-state-figures)
+10. [The post-hoc evaluators](#10-the-post-hoc-evaluators)
+11. [Verification and documentation](#11-verification-and-documentation)
+12. [Understanding the outputs](#12-understanding-the-outputs)
+13. [Interpreting the results](#13-interpreting-the-results)
+14. [Troubleshooting](#14-troubleshooting)
+15. [Command reference](#15-command-reference)
 
 ---
 
@@ -79,7 +80,7 @@ Before running any experiment, confirm that the test suite passes:
 pytest tests/ -q
 ```
 
-The expected result is `61 passed` in approximately twenty seconds. These tests
+The expected result is `66 passed` in approximately twenty seconds. These tests
 pin the correctness fixes that are *silent* when broken — a numerically wrong
 loss function, for example, produces plausible-looking numbers rather than an
 error. If any test fails, do not run experiments until the cause is understood.
@@ -224,7 +225,7 @@ The p-q sweep trains a model and then evaluates it on the same loader. Its
 heatmaps are training-set quantities. This is pre-existing behaviour and is
 documented rather than corrected.
 
-The figures produced by `plot_state_clusters.py` (Section 8) address the second
+The figures produced by `plot_state_clusters.py` (Section 9) address the second
 row of this table directly, by separating the train-seen and held-out
 sequences into different panels.
 
@@ -266,7 +267,7 @@ the comparison into a controlled one. It writes into `results_quick/` alongside
 the QUICK results, and only runs the processes QUICK does not already cover.
 
 **`LARGE`** increases every dimension. Its cross-validation results are **not
-usable**; see Section 12.3.
+usable**; see Section 13.3.
 
 ### 4.3 Output directories and tags
 
@@ -282,6 +283,63 @@ literal at different parameters and overwrote one another's checkpoints.
 The same derivation supplies the `traj_` tags of the repeat harness (Section 7),
 which writes to `results_trajectories/` and so cannot collide with a training
 run's output either.
+
+### 4.4 Weight decay, and the optimiser
+
+Training uses **AdamW**, with `weight_decay` taken from the configuration and
+defaulting to **0.0**. At 0.0, AdamW is bit-identical to the plain Adam that
+produced every result in this repository — verified over 20 seeded steps,
+`max|Δparam| = 0` — so the default changes nothing, and **a non-zero λ is a new
+experimental condition, not a correction of the earlier ones.**
+
+> **Trap.** PyTorch's `AdamW` defaults to `weight_decay=0.01` where `Adam`
+> defaults to `0.0`. It is not a drop-in replacement; the value is always passed
+> explicitly, and `tests/test_theory.py` asserts that every configuration ships
+> 0.0 and that a non-zero value actually reaches `opt.param_groups[0]`.
+
+λ is threaded the way `n_layers` and `val_every_n_steps` are — config → runner →
+pipeline → `train_model` → model — so a runner cannot record one value in its
+`run_config_*.json` while training at another. Every `.pt` sidecar now also
+records `optimizer` and `weight_decay`, because a checkpoint trained at λ = 0.03
+is otherwise indistinguishable from one trained at λ = 0.
+
+Set it per run with `--weight-decay` on `run_sweep_experiment.py`, or in
+`configs.py` for the other runners.
+
+**Choosing λ requires knowing the step budget.** The decay's cumulative effect is
+`(1 − lr·λ)^steps`, so the same λ bites very differently in a short run than a
+long one:
+
+| λ | shrinkage over 130 steps at lr 1e-2 | over 1600 steps at lr 5e-3 |
+|---|---|---|
+| 0.01 | 1.3 % | 7.7 % |
+| 0.1 | 12.2 % | 55.1 % |
+| 1.0 | 72.9 % | 100 % |
+
+**Measured λ response** on the flower process at the repeat harness's 130 steps
+(2 repeats per point, `δ(λ) = CE − H∞`):
+
+| λ | shrinkage | δ(λ) | verdict |
+|---|---|---|---|
+| 0 – 1.0 | 0 – 73 % | 0.011 – 0.016 | **does not bind** — the model still reaches H∞ |
+| 3.0 | 98 % | 0.090 – 0.178 | binds hard, and **unequally**: ΔCE reaches −0.27 and −0.41 bits, both negative despite opposite-sign C⁻ − C⁺ |
+| ≥ 10 | 100 % | 0.61 – 1.11 | both arms destroyed; ΔCE collapses to noise |
+
+Two operational conclusions. **λ ≤ 1 is safe but does not bound capacity here** —
+the task needs so little of the model that a 73 % norm reduction leaves it
+converging to within 0.016 bits of H∞. And **λ ≥ 3 must not be used for a ΔCE
+measurement**: the artefact is a hundred times the effect, its sign does not
+track C⁻ − C⁺, and δ(λ) exceeds the 0.10-bit convergence tolerance so every
+repeat is flagged non-converged. That last point matters differently per runner:
+`run_sweep_experiment.py` reports all-repeat statistics and is unaffected, whereas
+`run_experiments.py` and `sanity_check.py` read the *converged-only* headline and
+would print a confident verdict from a single surviving fold.
+
+Weight decay is also the principled suppressant for the divergence of Section
+13.3 — cross-entropy on a deterministic transition has no finite minimiser, and a
+norm penalty restores one (measured 4/6 → 1/6 on the flower null control at 600
+steps). But at the 130 steps these harnesses run, divergence is already rare (3 in
+3,750 repeats), so that is not a reason to enable it.
 
 ---
 
@@ -374,7 +432,7 @@ During the run the following are printed for each experiment:
 - the theoretical quantities: H∞, C⁺, C⁻, and the predicted sign of ΔCE;
 - per-fold validation and test losses;
 - a warning for any fold that **diverged** — that is, reached a good loss and
-  then blew up (Section 12.3);
+  then blew up (Section 13.3);
 - the recovered number of causal states k̂ with its stability profile;
 - the paired ΔCE, reported both over all folds and over converged folds only.
 
@@ -442,7 +500,7 @@ Seven processes, each trained one hundred times in both causal directions.
 Runtime is approximately two and a quarter hours; output is written to
 `results_trajectories/`.
 
-This is the answer to the second caveat in Section 12.2. Every standard error
+This is the answer to the second caveat in Section 13.2. Every standard error
 reported by `run_experiments.py` is computed over the five cross-validation folds
 of a single seed, and those folds share a training set: the quantity measured is
 fold-to-fold variability, not sampling variability over datasets. Each repeat
@@ -599,7 +657,7 @@ python run_statistical_trj.py --plots-only
 
 `--khat` additionally runs `recover_causal_states` on each arm of each repeat,
 recording k̂, S_hat and the stability plateau. This is the better estimator —
-Section 12.2, caveat 3 — but it costs an agglomerative clustering pass per arm
+Section 13.2, caveat 3 — but it costs an agglomerative clustering pass per arm
 per repeat, and it is off by default so that the headline run is not delayed by
 it. When it has been used, the complexity figure carries the median k̂ and the
 mean S_hat beneath the axis for comparison with `S_emp`.
@@ -642,7 +700,158 @@ results from it are quoted in Section 12.
 
 ---
 
-## 8. Generating the causal-state figures
+## 8. The parameter sweep
+
+```bash
+python run_sweep_experiment.py --dry-run     # spec table and coverage, no training
+python run_sweep_experiment.py --repeats 30  # 125 processes, ~7.6 h
+```
+
+Where Section 7 measures seven processes precisely, this measures 125 coarsely,
+to answer the stronger question: **across many processes spanning a wide range of
+C⁻ − C⁺, does the measured asymmetry track the theoretical one?** A single
+process cannot show a trend.
+
+Everything that trains or measures one process is imported from
+`run_statistical_trj.py`; this file only chooses the processes and aggregates
+across them. Output goes to `results_sweep/`.
+
+### 8.1 The two grids, and why they are not equivalent
+
+| | processes | C⁻ − C⁺ | corr with H∞ | tests |
+|---|---|---|---|---|
+| coin, p,q ∈ {0.05 … 0.95} | 100 | +0.014 to +0.683, **all positive** | **+0.590** | magnitude only |
+| flower, n,m ∈ {2,4,6,8,10} | 25 | −1.164 to +1.069 | −0.011 | **the sign** |
+
+Two consequences govern how the output must be read.
+
+**Every negative-x point is a flower process**, so `corr(family, C⁻−C⁺) = −0.46`
+and a **pooled** correlation over all 125 points substantially tests "do flower
+processes differ from coin processes" — vocabulary 3 versus 4–20, H∞ 0.29–0.99
+versus 0.87–3.07. The within-family rows are the real statistics, and the pooled
+row is labelled as not being the test.
+
+**On the coin grid C⁻ − C⁺ correlates with H∞ at +0.59**, so a partial
+correlation controlling for H∞ is reported for that family. This is not
+decoration: the raw coin trend for ΔCE is ρ = −0.415 (p < 1e-5), significant and
+in the *wrong* direction, and it vanishes entirely once H∞ is controlled
+(ρ = +0.068, p = 0.50). Within the flower grid C⁻ − C⁺ is uncorrelated with both
+H∞ and vocabulary, which is what makes it the better-designed axis.
+
+### 8.2 Options
+
+```
+--repeats N            Independent repeats per process.  Default 30.
+--sweep-coin [P ...]   Coin grid; bare flag uses the default 10-point grid.
+--sweep-flower [N ...] Flower grid; bare flag uses {2,4,6,8,10}.
+--weight-decay LAMBDA  AdamW decay; see Section 4.4.  Omit for plain Adam.
+--only TAG [TAG ...]   Restrict to tags containing these substrings.
+--area-burn-coin N     Integrate the coin area from step N (see 8.4).
+--area-burn-flower N   The same, for flower.
+--dry-run              Print the spec table and coverage, then stop.
+--plots-only           Redraw the figures from the saved pickle.
+--redo                 Retrain processes that are already complete.
+--khat                 Also recover k̂ per arm per repeat (adds ~1 h per 2500).
+```
+
+Runs are **resumable**: any process already holding `--repeats` repeats is
+skipped, so re-issuing the same command after an interruption continues where it
+stopped. State is written at least once a minute.
+
+### 8.3 Three response variables, only one of which the theory predicts
+
+1. **Final ΔCE — PRIMARY.** The held-out endpoint difference. The only quantity
+   the hypothesis makes a statement about.
+2. **Trajectory area — exploratory.** The mean of `CE_BW(s) − CE_FW(s)` over the
+   settled portion of training. The intuition is that the harder direction should
+   sit above the other throughout optimisation; but the integral of a loss
+   difference along an Adam trajectory depends on the learning rate, the
+   initialisation and the landscape's curvature, none of which appear in
+   computational mechanics. A positive result here generates a hypothesis; it
+   does not confirm one.
+3. **Convergence-step difference — exploratory.** Steps for the backward arm to
+   settle minus the forward arm's. Immune to the magnitude of the transient and
+   to a diverged run's spike, both of which corrupt an integral.
+
+### 8.4 The integration window, and why it is not a free choice
+
+The area is computed at **analysis** time from the stored trajectories, so any
+window can be recomputed in about 0.2 s for all 125 processes — no retraining.
+Four are stored per process: the shared settled window (plotted), each process's
+own settling step, a fixed fraction, and the whole trajectory.
+
+The window matters because convergence time varies systematically across the
+sweep: the coins settle at step 32–104 and the flowers at 58–125. Integrating
+from a **fixed** step therefore folds a different amount of transient into each
+family — and since every negative-x point is a flower, that contamination lands
+on one side of the x-axis, which manufactures a slope. So the default window
+starts at the **slowest** process's settling step, capped at 60 % of the run so
+one pathological cell cannot shrink the window to nothing. When the cap binds,
+the run prints `! CAPPED`.
+
+The sensitivity is worth knowing before quoting anything from this panel:
+
+| window | flower ρ | coin ρ given H∞ |
+|---|---|---|
+| whole trajectory | +0.872 | −0.763 |
+| from step 20 | +0.835 | −0.871 |
+| from step 30 | +0.764 | −0.851 |
+| shared settled (default) | +0.805 | −0.301 |
+| from step 110 | — | −0.027 (p = 0.79) |
+
+The flower trend is insensitive — +0.69 to +0.87 across every window. The coin
+column is monotone in the window: strong when the window is all transient,
+vanishing once it is all settled, and +0.07 at the endpoint. Whatever the coin
+trend is, it is a property of the descent, not of the converged residuals.
+
+### 8.5 What is produced
+
+```
+results_sweep/
+├── all_sweep.pkl          every repeat's trajectory, resumable state
+├── sweep_rows.pkl          the per-process scalars the figures use
+├── run_config_QUICK.json   parameters, grids, λ, timestamp
+├── sweep_scatter.png       4 panels against C⁻ − C⁺
+└── sweep_trajectories.png  one mean D(s) curve per process, coloured by C⁻−C⁺
+```
+
+The run also prints a per-process table, the within-family correlations, and a
+**baseline cross-check**: the default flower grid contains (2,6), (2,8), (4,2)
+and (6,4) — every flower process the Section 7 harness ran, at the same dice
+seed — so those cells must reproduce its ΔCE within combined error. They do,
+with |z| ≤ 0.79 and one cell agreeing to z = +0.01.
+
+### 8.6 The results, and the caveats that travel with them
+
+From the completed 125-process run at 30 repeats (7.6 h, 7,500 trainings, 3
+divergences):
+
+| | ρ against C⁻ − C⁺ | p |
+|---|---|---|
+| **flower, final ΔCE** | **+0.826** | < 1e-5 |
+| coin, final ΔCE, raw | −0.415 | < 1e-5 |
+| coin, final ΔCE, controlling H∞ | +0.068 | 0.50 |
+| pooled | −0.046 | 0.61 |
+
+The flower trend is robust to every exclusion tried: dropping the two
+marginal-convergence cells gives +0.878, dropping cells containing a divergence
++0.809, dropping the n = m diagonal +0.850. The five near-zero-gap diagonal cells
+read ΔCE ≈ 0, which is the built-in null control behaving.
+
+Three caveats belong with that number. Magnitudes remain 0.0003–0.0044 bits,
+about 0.2 % of the entropy rate, consistent throughout with ΔCE being a
+difference of residuals. `corr(C⁻−C⁺, m−n) = +0.973` on the flower family, so
+this design **cannot** separate "tracks C⁻ − C⁺" from "tracks m − n" — arguably
+the same mechanism, since the forward arm must represent one conditional per die
+and the backward arm one per distinguishable outcome, but that is a structural
+argument rather than an empirical one. And the nominal p-values are
+anti-conservative: C⁻ − C⁺ is a smooth function of (p,q) and (n,m), so
+neighbouring cells are near-duplicate processes and the effective degrees of
+freedom are well below 125.
+
+---
+
+## 9. Generating the causal-state figures
 
 ```bash
 python plot_state_clusters.py
@@ -651,7 +860,7 @@ python plot_state_clusters.py
 This script must be run **after** a training run. It loads saved weights and
 does not retrain, so it is inexpensive.
 
-### 8.1 Options
+### 9.1 Options
 
 ```
 --config CFG          Which configuration's experiments to plot.  Default: QUICK.
@@ -667,7 +876,7 @@ Example:
 python plot_state_clusters.py --out-root results_large --metrics js
 ```
 
-### 8.2 What is produced
+### 9.2 What is produced
 
 For every experiment and every metric, one 2 × 2 figure is written to
 `results_quick/<tag>/<tag>_states_<metric>.png`:
@@ -685,7 +894,7 @@ off the figure: on the coin's forward arm, tokens 0 and 2 appear in *different
 colours* but with the *same marker*, within a single group — two tokens, one
 causal state.
 
-### 8.3 Why the train/held-out split appears here
+### 9.3 Why the train/held-out split appears here
 
 As noted in Section 3.3, the complexity and latent quantities reported elsewhere
 are computed on the full dataset, roughly 80 % of which the model was trained
@@ -703,7 +912,7 @@ The exception is the flower configuration with n = 2, m = 8 backward, which has
 the largest number of states (9) and therefore the fewest held-out sequences per
 state.
 
-### 8.4 The three distance metrics
+### 9.4 The three distance metrics
 
 The predictive distributions are points on the probability simplex. Three
 distances are implemented:
@@ -727,7 +936,7 @@ disagree only where the model itself under-resolves the states.
 
 ---
 
-## 9. The post-hoc evaluators
+## 10. The post-hoc evaluators
 
 ```bash
 python Test_data_eval.py
@@ -736,7 +945,7 @@ python LLM_asymmetry_testing.py
 
 These load saved checkpoints and score them on freshly generated data.
 
-### 9.1 Configuration
+### 10.1 Configuration
 
 Neither script has a command-line interface. Each is configured by a `RUN`
 dictionary — near the bottom of `Test_data_eval.py`, and at approximately line
@@ -757,7 +966,7 @@ architecture and the process it was trained on, and the loaders verify against
 it; a mismatch produces an explicit warning rather than a confusing shape error
 or, worse, silently incorrect numbers.
 
-### 9.2 A note on metrics
+### 10.2 A note on metrics
 
 `Test_data_eval.py` reports two perplexities and they must not be conflated.
 The **teacher-forced** perplexity scores both models on the same ground-truth
@@ -768,15 +977,15 @@ informational only.
 
 ---
 
-## 10. Verification and documentation
+## 11. Verification and documentation
 
-### 10.1 The test suite
+### 11.1 The test suite
 
 ```bash
 pytest tests/ -q
 ```
 
-Sixty-one tests, approximately twenty seconds. They should be run after any
+Sixty-six tests, approximately twenty seconds. They should be run after any
 modification to `Model_analysis.py`, `Training_model.py` or `OneHot_model.py`.
 
 The suite pins the properties that fail *silently* when broken: that the loss
@@ -786,7 +995,7 @@ closed forms reproduce their reference values; that vectorised code produces the
 same numbers as the loops it replaced; and that the causal-state estimator
 merges tokens with equal futures while separating those with different ones.
 
-### 10.2 The walkthrough notebook
+### 11.2 The walkthrough notebook
 
 ```bash
 python build_walkthrough.py
@@ -801,9 +1010,9 @@ consolidated list of caveats.
 
 ---
 
-## 11. Understanding the outputs
+## 12. Understanding the outputs
 
-### 11.1 Directory layout
+### 12.1 Directory layout
 
 ```
 results_quick/
@@ -827,7 +1036,7 @@ results_quick/
 Everything other than the source files is excluded from version control and
 should be regenerated rather than committed.
 
-### 11.2 The schema of `results.pkl`
+### 12.2 The schema of `results.pkl`
 
 ```python
 import pickle
@@ -882,9 +1091,9 @@ applied to existing results without re-running anything.
 
 ---
 
-## 12. Interpreting the results
+## 13. Interpreting the results
 
-### 12.1 The current findings
+### 13.1 The current findings
 
 The QUICK configuration converges: the forward cross-entropy exceeds H∞ by
 between 0.0010 and 0.0082 bits across the seven experiments. The measured ΔCE
@@ -920,7 +1129,7 @@ reported as "no causal asymmetry", because it remains ambiguous until the
 `d_model` sweep distinguishes that conclusion from "capacity absorbed the
 asymmetry".
 
-### 12.2 Caveats attaching to every reported number
+### 13.2 Caveats attaching to every reported number
 
 1. ΔCE is a difference of residuals; a converged, sufficient-capacity model
    yields approximately zero regardless of C⁻ − C⁺.
@@ -944,7 +1153,7 @@ asymmetry".
 6. Results are not bit-reproducible across runs on MPS, though the pairing of
    the two arms is unaffected.
 
-### 12.3 The LARGE configuration
+### 13.3 The LARGE configuration
 
 **The cross-validation results from the LARGE configuration are not usable.**
 In the completed run, **all forty folds diverged** — five of five on each of its
@@ -977,13 +1186,13 @@ measured divergence rate from four in six to one in six. Adopting it would
 change every number, so QUICK and the controls would require re-running under
 the same optimiser to remain comparable.
 
-### 12.4 Which run to report
+### 13.4 Which run to report
 
 **QUICK.** All five folds converge, in all seven experiments.
 
 ---
 
-## 13. Troubleshooting
+## 14. Troubleshooting
 
 **A test fails.** Do not proceed to experiments. The tests cover failures that
 are silent in ordinary use.
@@ -997,7 +1206,7 @@ estimator measures what the *model* represents, and a model that has not
 resolved all the states of its process will legitimately return a smaller k̂.
 Consult the stability profile before concluding that the estimator is at fault.
 
-**A run reports many diverged folds.** See Section 12.3. This is expected for
+**A run reports many diverged folds.** See Section 13.3. This is expected for
 long runs and is reported rather than concealed.
 
 **The paired standard error is `nan`.** Fewer than two folds survived the
@@ -1008,7 +1217,7 @@ Section 1.2.
 
 ---
 
-## 14. Command reference
+## 15. Command reference
 
 ```bash
 # Environment
@@ -1028,6 +1237,13 @@ python run_experiments.py --config QUICK --seed 1 --out-root results_quick_seed1
 
 # Controls
 python sanity_check.py                              # ~7 min
+
+# Parameter sweep (Section 8)
+python run_sweep_experiment.py --dry-run            # coverage table, no training
+python run_sweep_experiment.py --repeats 30         # ~7.6 h, 125 processes
+python run_sweep_experiment.py --sweep-flower --repeats 30 --weight-decay 0.1 \
+       --out-root results_sweep_wd/wd0.100          # one lambda, ~3 h
+python run_sweep_experiment.py --plots-only         # redraw, no training
 
 # Repeat statistics (Section 7)
 python run_statistical_trj.py                       # ~2.25 h, 7 x 100, not yet run

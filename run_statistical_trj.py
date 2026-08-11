@@ -270,6 +270,7 @@ def one_repeat(spec: dict, cfg: dict, seed: int, khat: bool = False) -> dict:
             val_loader=test_loader, n_layers=cfg["n_layers"],
             accelerator=cfg["accelerator"],
             val_every_n_steps=cfg["val_every_n_steps"],
+            weight_decay=cfg.get("weight_decay", 0.0),
         )
         to_cpu_for_analysis(rec.model)
 

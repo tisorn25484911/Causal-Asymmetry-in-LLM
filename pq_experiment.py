@@ -62,6 +62,7 @@ def pq_experiment(
     p_values=None,
     q_values=None,
     max_batches_for_empirical=10,
+    weight_decay=0.0,
 ):
     """
     Runs empirical experiments on a p-q grid.
@@ -102,6 +103,7 @@ def pq_experiment(
                 max_epochs=max_epochs,
                 lr=lr,
                 mode="forward",
+                weight_decay=weight_decay,
             )
 
             print("\n[2/2] Training Backward Model...")
@@ -113,6 +115,7 @@ def pq_experiment(
                 max_epochs=max_epochs,
                 lr=lr,
                 mode="backward",
+                weight_decay=weight_decay,
             )
 
             print("\n[Analysis] Computing empirical complexity...")
@@ -381,6 +384,7 @@ def pq_experiment_full(
     p_values=None,
     q_values=None,
     max_batches_for_empirical=10,
+    weight_decay=0.0,
 ):
     """
     Identical training loop to pq_experiment, but ALSO computes true
@@ -434,6 +438,7 @@ def pq_experiment_full(
                 max_epochs=max_epochs,
                 lr=lr,
                 mode="forward",
+                weight_decay=weight_decay,
             )
 
             print("  [2/2] Backward model ...")
@@ -445,6 +450,7 @@ def pq_experiment_full(
                 max_epochs=max_epochs,
                 lr=lr,
                 mode="backward",
+                weight_decay=weight_decay,
             )
 
             # ── Statistical complexity (k-means on latents) ───────────────

@@ -159,6 +159,12 @@ def weight_meta(cfg, tag, num_token, max_len, res) -> dict:
         "max_len":    max_len,
         "embed_type": cfg["embed_type"],
         "seed":       cfg["seed"],
+        # Without BOTH of these a checkpoint trained at lambda=0.03 is
+        # indistinguishable from one trained at lambda=0 -- the A4 failure the
+        # sidecar exists to prevent, and worse here because the difference leaves
+        # no trace in the architecture.
+        "optimizer":    "adamw",
+        "weight_decay": cfg["weight_decay"],
         "p":          res.get("p"),
         "q":          res.get("q"),
         "n":          res.get("n"),
@@ -467,6 +473,7 @@ def experiment_1(cfg, out_root, all_results):
         save_plot=os.path.join(odir, f"{tag}_fw_cv.png"), seed=seed,
         n_layers=cfg["n_layers"], accelerator=cfg["accelerator"],
         val_every_n_steps=cfg["val_every_n_steps"],
+        weight_decay=cfg["weight_decay"],
     )
     cleanup()  # FIX-4
 
@@ -479,6 +486,7 @@ def experiment_1(cfg, out_root, all_results):
         save_plot=os.path.join(odir, f"{tag}_bw_cv.png"), seed=seed,
         n_layers=cfg["n_layers"], accelerator=cfg["accelerator"],
         val_every_n_steps=cfg["val_every_n_steps"],
+        weight_decay=cfg["weight_decay"],
     )
     cleanup()  # FIX-4
 
@@ -561,6 +569,7 @@ def experiment_1_2(cfg, out_root, all_results):
         save_plot=os.path.join(odir, f"{tag}_fw_cv.png"), seed=seed,
         n_layers=cfg["n_layers"], accelerator=cfg["accelerator"],
         val_every_n_steps=cfg["val_every_n_steps"],
+        weight_decay=cfg["weight_decay"],
     )
     cleanup()
     cv_bw = train_test_val_pipeline(
@@ -571,6 +580,7 @@ def experiment_1_2(cfg, out_root, all_results):
         save_plot=os.path.join(odir, f"{tag}_bw_cv.png"), seed=seed,
         n_layers=cfg["n_layers"], accelerator=cfg["accelerator"],
         val_every_n_steps=cfg["val_every_n_steps"],
+        weight_decay=cfg["weight_decay"],
     )
     cleanup()
 
@@ -611,6 +621,7 @@ def experiment_1_2(cfg, out_root, all_results):
         num_token=num_token, d_model=cfg["d_model"],
         max_len=cfg["pq_len"], batch_size=cfg["coin_batch"],
         num_samples=cfg["pq_samples"], max_epochs=cfg["pq_epochs"],
+        weight_decay=cfg["weight_decay"],
         lr=cfg["lr"], p_values=cfg["pq_grid"], q_values=cfg["pq_grid"],
     )
     cleanup()
@@ -733,6 +744,7 @@ def experiment_2(cfg, out_root, all_results, n, m, role):
         save_plot=os.path.join(odir, f"{tag}_fw_cv.png"), seed=seed,
         n_layers=cfg["n_layers"], accelerator=cfg["accelerator"],
         val_every_n_steps=cfg["val_every_n_steps"],
+        weight_decay=cfg["weight_decay"],
     )
     cleanup()
 
@@ -745,6 +757,7 @@ def experiment_2(cfg, out_root, all_results, n, m, role):
         save_plot=os.path.join(odir, f"{tag}_bw_cv.png"), seed=seed,
         n_layers=cfg["n_layers"], accelerator=cfg["accelerator"],
         val_every_n_steps=cfg["val_every_n_steps"],
+        weight_decay=cfg["weight_decay"],
     )
     cleanup()
 

@@ -107,6 +107,8 @@ CFG = dict(
     seed           = 0,
     accelerator    = "auto",   # see configs.py / train_model on MPS determinism
     val_every_n_steps = 25,    # D1: validation cadence (train curve stays at 1)
+    weight_decay   = 0.0,      # AdamW; 0.0 == the plain Adam these controls used
+
     d_model        = 64,
     embed_type     = "onehot",
     n_folds        = 5,
@@ -478,6 +480,7 @@ def exp_coin(cfg, out_root):
         max_epochs=cfg["coin_max_epochs"], lr=cfg["lr"], mode="forward",
         save_plot=os.path.join(odir, f"{tag}_fw_cv.png"), seed=cfg["seed"], accelerator=cfg["accelerator"],
         val_every_n_steps=cfg["val_every_n_steps"],
+        weight_decay=cfg.get("weight_decay", 0.0),
     ); cleanup()
 
     # Backward model
@@ -489,6 +492,7 @@ def exp_coin(cfg, out_root):
         max_epochs=cfg["coin_max_epochs"], lr=cfg["lr"], mode="backward",
         save_plot=os.path.join(odir, f"{tag}_bw_cv.png"), seed=cfg["seed"], accelerator=cfg["accelerator"],
         val_every_n_steps=cfg["val_every_n_steps"],
+        weight_decay=cfg.get("weight_decay", 0.0),
     ); cleanup()
 
     # Analyse
@@ -598,6 +602,7 @@ def exp_flower(cfg, out_root):
         max_epochs=cfg["flower_max_epochs"], lr=cfg["lr"], mode="forward",
         save_plot=os.path.join(odir, f"{tag}_fw_cv.png"), seed=cfg["seed"], accelerator=cfg["accelerator"],
         val_every_n_steps=cfg["val_every_n_steps"],
+        weight_decay=cfg.get("weight_decay", 0.0),
     ); cleanup()
 
     # Backward model
@@ -609,6 +614,7 @@ def exp_flower(cfg, out_root):
         max_epochs=cfg["flower_max_epochs"], lr=cfg["lr"], mode="backward",
         save_plot=os.path.join(odir, f"{tag}_bw_cv.png"), seed=cfg["seed"], accelerator=cfg["accelerator"],
         val_every_n_steps=cfg["val_every_n_steps"],
+        weight_decay=cfg.get("weight_decay", 0.0),
     ); cleanup()
 
     # Analyse

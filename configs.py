@@ -28,6 +28,23 @@ BASE = dict(
     embed_type       = "onehot",
     n_folds          = 5,
     n_layers         = 2,
+    # ── optimiser ──────────────────────────────────────────────────────
+    # AdamW's decay coefficient.  0.0 is bit-identical to the plain Adam every
+    # result in this repository was produced with, so this default changes
+    # nothing; a nonzero value is a NEW experimental condition, not a
+    # correction of the old ones.
+    #
+    # Two uses.  It restores a finite optimum -- cross-entropy on a
+    # deterministic transition has none, which is why long runs diverge
+    # (measured on the flower null control, 6 seeds: Adam lr=5e-3 diverged 4/6,
+    # AdamW wd=0.01 1/6) -- and it is a continuous capacity axis, which is what
+    # a null delta_CE needs before it can be distinguished from "capacity
+    # absorbed the asymmetry".
+    #
+    # Its total effect scales with lr * weight_decay * steps, so a grid must be
+    # chosen for the step budget it runs at: at lr=1e-2 over the 130 steps the
+    # repeat harness uses, lambda=0.01 shrinks a weight by only 1.3%.
+    weight_decay     = 0.0,
     # D1: the train-loss curve stays at every step (free -- the loss is
     # already computed); only the expensive validation pass is sub-sampled.
     # Measured overhead of validating every step, vs not validating at all:

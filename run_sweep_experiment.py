@@ -505,6 +505,38 @@ def _partial_spearman(x, y, z):
     return float(rho), float(p), int(ok.sum())
 
 
+# A point whose standard error is this many times the family's median is not a
+# measurement -- it is one or two diverged repeats.  Measured at lambda=0.03:
+# n10_m8 carried 2 diverged repeats and a sem 67x the median, n8_m10 one and 51x,
+# and their delta_CE of -0.069 and -0.033 (against a typical 0.002) set the whole
+# y-axis by themselves.  Both are also the late-settling large-vocabulary cells.
+UNSTABLE_SEM_FACTOR = 5.0
+
+
+def unstable_mask(rows: list, key: str) -> np.ndarray:
+    """
+    Which points are too noisy to plot or correlate, judged per response.
+
+    Instability is response-specific: a process can have a wild delta_CE and a
+    perfectly tight area, so the mask is recomputed for each panel rather than
+    shared.  The threshold is relative to the family's own median sem, so it
+    transfers across lambda values and across response variables whose units
+    differ by orders of magnitude.
+
+    Excluded points are never hidden: the count and the tags are annotated on the
+    panel, printed in the summary, and the correlation is reported both with and
+    without them.
+    """
+    sem = np.array([r.get(key + "_sem", np.nan) for r in rows], dtype=float)
+    ok = np.isfinite(sem) & (sem > 0)
+    if ok.sum() < 3:
+        return np.zeros(len(rows), dtype=bool)
+    med = float(np.median(sem[ok]))
+    if med <= 0:
+        return np.zeros(len(rows), dtype=bool)
+    return np.nan_to_num(sem, nan=np.inf) > UNSTABLE_SEM_FACTOR * med
+
+
 def mixed_windows(rows: list) -> bool:
     """True when the families' areas were integrated over different windows."""
     return len({r.get("burn_used") for r in rows}) > 1
@@ -520,10 +552,12 @@ def correlations(rows: list, key: str, drop_pooled: bool = False) -> list:
     would then be mixing two different quantities.
     """
     out = []
-    groups = (("coin", [r for r in rows if r["kind"] == "coin"]),
-              ("flower", [r for r in rows if r["kind"] == "flower"]))
+    bad = unstable_mask(rows, key)
+    stable = [r for r, b in zip(rows, bad) if not b]
+    groups = (("coin", [r for r in stable if r["kind"] == "coin"]),
+              ("flower", [r for r in stable if r["kind"] == "flower"]))
     if not drop_pooled:
-        groups = (("pooled", rows),) + groups
+        groups = (("pooled", stable),) + groups
     for label, sub in groups:
         if len(sub) < 4:
             continue
@@ -534,6 +568,16 @@ def correlations(rows: list, key: str, drop_pooled: bool = False) -> list:
                                           [r[key] for r in sub],
                                           [r["theory"] for r in sub])
             out.append(("coin | H_inf", rho, p, n))
+    # Nothing is hidden: when points were dropped, the all-points value is shown
+    # beside the filtered one so the reader can see what the filter did.
+    if bad.any():
+        for label, sub in (("coin", [r for r in rows if r["kind"] == "coin"]),
+                           ("flower", [r for r in rows if r["kind"] == "flower"])):
+            if len(sub) >= 4 and any(b for r, b in zip(rows, bad)
+                                     if r["kind"] == sub[0]["kind"]):
+                rho, p, n = _spearman([r["gap"] for r in sub],
+                                      [r[key] for r in sub])
+                out.append((f"{label} + unstable", rho, p, n))
     return out
 
 
@@ -549,7 +593,19 @@ def _corr_caption(corrs) -> str:
 
 
 def _scatter_panel(ax, rows, key, sem_key, ylabel, title, corrs):
-    """One response variable against C- - C+, coloured by family."""
+    """
+    One response variable against C- - C+, coloured by family.
+
+    Points flagged by unstable_mask are dropped from the drawing, from the
+    y-limits and from the correlations.  Keeping them made the panel unreadable:
+    at lambda=0.03 two cells with diverged repeats carried delta_CE of -0.069 and
+    -0.033 against a typical 0.002, so the trend in the other 23 collapsed onto
+    the zero line.  The exclusion is annotated on the panel, never silent.
+    """
+    bad = unstable_mask(rows, key)
+    dropped = [r["tag"].replace("sweep_flower_", "").replace("sweep_coin_", "")
+               for r, b in zip(rows, bad) if b]
+    rows = [r for r, b in zip(rows, bad) if not b]
     for kind, colour, marker in (("coin", COIN_COLOUR, "o"),
                                  ("flower", FLOWER_COLOUR, "s")):
         sub = [r for r in rows if r["kind"] == kind]
@@ -578,10 +634,16 @@ def _scatter_panel(ax, rows, key, sem_key, ylabel, title, corrs):
         span = max(span, float(np.nanpercentile(np.abs(y[np.isfinite(y)]), 100)) * 0.2, 1e-9)
         ax.set_ylim(-span * 1.35, span * 1.35)
         n_out = int((np.abs(y) > span * 1.35).sum())
+        note = []
+        if dropped:
+            note.append(f"excluded, sem > {UNSTABLE_SEM_FACTOR:g}× median: "
+                        + ", ".join(dropped))
         if n_out:
-            ax.text(0.98, 0.02, f"{n_out} point(s) outside the frame",
-                    transform=ax.transAxes, fontsize=6.5, ha="right",
-                    va="bottom", color="0.35")
+            note.append(f"{n_out} plotted point(s) outside the frame")
+        if note:
+            # Lower LEFT: the legend sits lower right and the two collided.
+            ax.text(0.02, 0.02, "\n".join(note), transform=ax.transAxes,
+                    fontsize=6.5, ha="left", va="bottom", color="0.35")
 
     ax.set_xlabel("C− − C+ (bits, closed form)")
     ax.set_ylabel(ylabel)
@@ -684,6 +746,14 @@ def plot_sweep_trajectories(rows: list, out_root: str):
     """
     if not rows:
         return
+    # Same exclusion as the scatter, judged on the primary response: a process
+    # whose delta_CE is one diverged repeat also has a mean D(s) curve that would
+    # set the y-limits for everyone else.
+    bad = unstable_mask(rows, "dce")
+    n_drop = int(bad.sum())
+    rows = [r for r, b in zip(rows, bad) if not b]
+    if not rows:
+        return
     gaps = np.array([r["gap"] for r in rows])
     lo, hi = float(gaps.min()), float(gaps.max())
     norm = TwoSlopeNorm(vmin=min(lo, -1e-6), vcenter=0.0, vmax=max(hi, 1e-6))
@@ -735,7 +805,9 @@ def plot_sweep_trajectories(rows: list, out_root: str):
         "Per-step paired difference, one mean curve per process, coloured by "
         "theoretical asymmetry\n"
         "stratification by colour would be trajectory-level evidence; y is "
-        "clipped to the settled range so the transient is off-scale",
+        "clipped to the settled range so the transient is off-scale"
+        + (f"\n{n_drop} process(es) excluded as unstable "
+           f"(delta_CE sem > {UNSTABLE_SEM_FACTOR:g}× median)" if n_drop else ""),
         fontsize=11, fontweight="bold")
     savefig(fig, os.path.join(out_root, "sweep_trajectories.png"))
 
@@ -795,12 +867,31 @@ def print_sweep_summary(rows: list, out_root: str):
     print(f"  {'process':<22}{'C- - C+':>9}{'H_inf':>7}{'V':>4}{'n':>4}{'div':>4}"
           f"{'dCE':>10}{'sem':>8}{'verdict':>9}{'area':>10}{'sem':>8}"
           f"{'dstep':>7}{'settles':>8}")
+    bad_dce = unstable_mask(rows, "dce")
+    flagged = {r["tag"] for r, b in zip(rows, bad_dce) if b}
     for r in sorted(rows, key=lambda r: (r["kind"], -r["gap"])):
+        mark = "  <-- UNSTABLE, excluded" if r["tag"] in flagged else ""
         print(f"  {r['tag'].replace('sweep_',''):<22}{r['gap']:>+9.4f}"
               f"{r['theory']:>7.3f}{r['vocab']:>4}{r['n_repeats']:>4}{r['n_div']:>4}"
               f"{r['dce']:>+10.5f}{r['dce_sem']:>8.5f}{r['verdict']:>9}"
               f"{r['area']:>+10.5f}{r['area_sem']:>8.5f}"
-              f"{r['d_step']:>+7.1f}{r['burn_settled']:>8}")
+              f"{r['d_step']:>+7.1f}{r['burn_settled']:>8}{mark}")
+    if flagged:
+        sem = np.array([r["dce_sem"] for r in rows], float)
+        med = float(np.median(sem[np.isfinite(sem)]))
+        print(f"\n  {len(flagged)} process(es) excluded from the delta_CE figures "
+              f"and correlations: their sem exceeds {UNSTABLE_SEM_FACTOR:g}x the "
+              f"median of {med:.5f}.")
+        for r in rows:
+            if r["tag"] in flagged:
+                print(f"      {r['tag'].replace('sweep_',''):<22}"
+                      f"dCE={r['dce']:+.5f}  sem={r['dce_sem']:.5f} "
+                      f"({r['dce_sem']/med:.0f}x median)  "
+                      f"{r['n_div']} diverged repeat(s)  settles at "
+                      f"{r['burn_settled']}/{r['L']}")
+        print("      They are one or two diverged repeats, not measurements.  "
+              "The rows above keep them so the\n      exclusion can be checked, "
+              "and the correlations are reported both with and without.")
     print(f"\n  'settles' is that process's own convergence step; 'area' is the "
           f"mean difference over the SHARED window steps "
           f"{rows[0].get('burn_used', 0)}–{rows[0]['L']}.")
@@ -870,6 +961,12 @@ def parse_args(argv=None):
                     help="flower grid; bare flag uses the default {2,4,6,8,10}")
     ap.add_argument("--only", nargs="+", default=None, metavar="TAG",
                     help="restrict to tags containing any of these substrings")
+    ap.add_argument("--weight-decay", type=float, default=None, metavar="LAMBDA",
+                    help="AdamW weight decay.  Omitted or 0.0 reproduces the "
+                         "plain-Adam condition every earlier result used; a "
+                         "nonzero value is a NEW condition, not a correction. "
+                         "Recommended grid for this step budget: 0.03 0.1 0.3 1.0 "
+                         "(see WEIGHT_DECAY_PLAN.md and the note in configs.py)")
     ap.add_argument("--khat", action="store_true",
                     help="also recover k-hat per arm per repeat.  Adds roughly "
                          "an hour per 2500 repeats; off by default")
@@ -899,6 +996,8 @@ def main(argv=None):
     cfg = dict(CONFIGS[args.config])
     if args.seed is not None:
         cfg["seed"] = args.seed
+    if args.weight_decay is not None:
+        cfg["weight_decay"] = args.weight_decay
 
     # Neither flag given: run both grids, which is the plan's default sweep.
     both = args.sweep_coin is None and args.sweep_flower is None
@@ -920,8 +1019,13 @@ def main(argv=None):
     print(f"\n{'='*78}")
     print(f"  config={args.config}  repeats={args.repeats}  "
           f"base_seed={cfg['seed']}  out_root={out_root}")
+    wd = cfg["weight_decay"]
     print(f"  d_model={cfg['d_model']}  n_layers={cfg['n_layers']}  "
           f"lr={cfg['lr']}  chunk={cfg['train_chunk_len']}  khat={args.khat}")
+    print(f"  optimiser=AdamW  weight_decay={wd}"
+          + ("   (= plain Adam, the condition every earlier result used)" if wd == 0
+             else f"   -> a weight shrinks by "
+                  f"{(1-(1-cfg['lr']*wd)**130)*100:.1f}% over 130 steps from decay alone"))
     print(f"  coin grid   : {coin_grid}")
     print(f"  flower grid : {flower_grid}")
     print(f"  processes   : {len(specs)}")

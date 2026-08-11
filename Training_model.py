@@ -430,9 +430,16 @@ def train_model(
     n_layers:  int   = 2,
     accelerator: str = "auto",
     val_every_n_steps: int = 25,
+    weight_decay: float = 0.0,
 ):
     """
     Trains a OneHotDecoder and returns a Record_training object.
+
+    `weight_decay` defaults to 0.0, at which AdamW is bit-identical to the Adam
+    every earlier result used.  It is threaded rather than read from a global so
+    that a runner cannot record one value in its run_config while training at
+    another -- the failure mode `n_layers` had (B11), which went unnoticed only
+    because every config happened to agree.
 
     `n_layers` is now a real parameter — IMPROVEMENT_PLAN.md B11.  It used to
     be absent here and never forwarded, so OneHotDecoder's default of 2 applied
@@ -455,7 +462,7 @@ def train_model(
                          "remains; WordEmbDecoder was deleted (C5).")
     model = OneHotDecoder(
         token_size=num_token, d_model=d_model, max_len=max_len, lr=lr, mode=mode,
-        n_layers=n_layers,
+        n_layers=n_layers, weight_decay=weight_decay,
     )
 
     recorder = Record_training(
@@ -561,6 +568,7 @@ def train_test_val_pipeline(
     n_layers:    int   = 2,
     accelerator: str   = "auto",
     val_every_n_steps: int = 25,
+    weight_decay: float = 0.0,
 ):
     """
     Full cross-validation pipeline with step-level training + validation curves.
@@ -669,6 +677,7 @@ def train_test_val_pipeline(
             n_layers=n_layers,            # B11
             accelerator=accelerator,
             val_every_n_steps=val_every_n_steps,   # D1
+            weight_decay=weight_decay,
         )
         all_recorders.append(recorder)
 
@@ -902,4 +911,5 @@ def train_test_val_pipeline(
         "n_layers"      : n_layers,
         "fold_divergence": fold_divergence,
         "val_every_n_steps": val_every_n_steps,
+        "weight_decay"   : weight_decay,
     }
