@@ -85,6 +85,20 @@ matplotlib.use("Agg")
 import matplotlib.pyplot as plt
 import numpy as np
 
+# ── repo path bootstrap ────────────────────────────────────────────────────
+# REORGANISATION_FIX_PLAN.md 4.1.  The tree is split across Transformer_model/
+# and Experimental_setup/ but the modules are still flat (`from utils import
+# ...`), so both directories have to be importable.  Python only ever puts the
+# *script's own* directory on sys.path -- which is why this is needed, and why
+# cd-ing elsewhere does not help.  Anchored on __file__, so the script runs
+# from any working directory.
+import sys
+_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+for _d in ("Transformer_model", "Experimental_setup"):
+    _p = os.path.join(_ROOT, _d)
+    if _p not in sys.path:
+        sys.path.insert(0, _p)
+
 # ── project ────────────────────────────────────────────────────────────────
 from configs import CONFIGS, QUICK
 from Data_generation import CoinDataset, coin_generation
@@ -112,8 +126,8 @@ from Model_analysis import (
     statistical_complexity_empirical,
 )
 from utils import (
-    cleanup, coin_tag, entropy_rate_coin, flower_tag, mkdir, save_pkl,
-    save_weights, to_cpu_for_analysis,
+    cleanup, coin_tag, entropy_rate_coin, flower_tag, mkdir, repo_path,
+    save_pkl, save_weights, to_cpu_for_analysis,
 )
 from Training_model import (
     make_analysis_loader, make_chunked_loader, set_seed,
@@ -864,7 +878,9 @@ def main(argv=None):
         cfg["seed"] = args.seed
     if args.out_root is not None:
         cfg["out_root"] = args.out_root
-    out_root = cfg["out_root"]
+    # REORGANISATION_FIX_PLAN.md 4.2.  cfg["out_root"] stays relative so the
+    # provenance JSON below records a portable path; it is resolved here.
+    out_root = repo_path(cfg["out_root"])
     warm_up_umap(cfg.get("umap_n_neighbors", 15))
     set_seed(cfg["seed"])                    # A2: reproducible end to end
     mkdir(out_root)

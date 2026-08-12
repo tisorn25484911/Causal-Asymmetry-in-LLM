@@ -798,7 +798,7 @@ at different parameters and overwrote each other's checkpoints.
 
 | | SMOKE | QUICK | LARGE | QUICK_LARGE_HMM |
 |---|---|---|---|---|
-| `out_root` | `results_smoke` | `results_quick` | `results_large` | `results_quick` |
+| `out_root` | `All_Results/results_smoke` | `All_Results/results_quick` | `All_Results/results_large` | `All_Results/results_quick` |
 | `d_model` | 16 | 32 | 64 | 32 |
 | `lr` | 1e-2 | 1e-2 | 5e-3 | 1e-2 |
 | `train_chunk_len` | 64 | 256 | 512 | 256 |
@@ -827,38 +827,68 @@ tags are derived, the process the two configurations share is not duplicated.
 ## 8. Repository structure
 
 ```
-Foundation
+Transformer_model/                the primitives — no dependency on a runner
 ├── Data_generation.py            coin generator, CoinDataset, make_loader
 ├── Flower_process_generation.py  flower generator, FlowerDataset (single definition)
 ├── OneHot_model.py               OneHotDecoder, attention, PE, loss in bits
 ├── Training_model.py             chunking, loaders, CV pipeline, recorder, divergence
-├── utils.py                      tags, filesystem, entropy rate, checkpoint sidecars
-└── configs.py                    every configuration, one place
-
-Analysis
 ├── Model_analysis.py             CE/PPL, complexity (both estimators), distances,
 │                                 UMAP, attention, paired ΔCE, result slimming
-└── pq_experiment.py              the p-q grid sweep and its heatmaps
+├── utils.py                      tags, filesystem, path anchoring, entropy rate,
+│                                 checkpoint sidecars
+├── Test_data_eval.py             post-hoc evaluation of saved weights
+└── plot_state_clusters.py        causal states, train vs held-out, per metric
 
-Runners
+Experimental_setup/               the drivers
+├── configs.py                    every configuration, one place
 ├── run_experiments.py            THE training runner — exp1, exp1.2, exp2
 ├── sanity_check.py               positive and null controls
 ├── run_statistical_trj.py        seed-repeat harness, 7 processes x 100 repeats
-├── plot_state_clusters.py        causal states, train vs held-out, per metric
-├── Test_data_eval.py             post-hoc evaluation of saved weights
+├── run_sweep_experiment.py       125-process sweep: does measured track theoretical?
+├── pq_experiment.py              the p-q grid sweep and its heatmaps
 └── LLM_asymmetry_testing.py      post-hoc metric suite (LaTeX figures)
 
-Verification and documentation
-├── tests/test_theory.py          61 regression tests
+Jupyter_notebooks/
+├── walkthrough.ipynb             the Phase 0-3 demonstration (generated)
 ├── build_walkthrough.py          regenerates walkthrough.ipynb
+├── metric_panel_plot.ipynb       ┐
+├── sequence_prediction.ipynb     ├ read the saved pickles and weights
+└── umap_analysis.ipynb           ┘
+
+All_Results/                      every results tree
+├── results_smoke|quick|large/    run_experiments.py, one per config
+├── results_trajectories/         run_statistical_trj.py, 7 x 100 repeats
+├── results_sweep/                run_sweep_experiment.py at weight_decay 0
+├── results_sweep_wd/wd<λ>/       the weight-decay sweep, one folder per λ
+└── results/                      the original pre-refactor outputs
+
+Run_logs/                         run logs, requirements*.txt, run_all.sh
+sanity_check_flower_process/      sanity_check.py's controls (at the root)
+
+Verification and documentation
+├── conftest.py                   makes the split tree importable for pytest
+├── tests/test_theory.py          66 regression tests
 ├── HOW_TO_RUN.md                 the operating manual
-└── implementation_logbook/       the audit and the phase handoffs
+└── implementation_logbook/       the audit, the phase handoffs, the fix plans
 ```
 
-Notebooks (`walkthrough.ipynb`, `metric_panel_plot.ipynb`,
-`sequence_prediction.ipynb`, `umap_analysis.ipynb`) read the saved pickles and
-weights; `walkthrough.ipynb` is generated from `build_walkthrough.py` rather than
-edited by hand so it can be regenerated after a re-run.
+The source is split by role: `Transformer_model/` holds the primitives and
+`Experimental_setup/` the drivers. The modules are **flat** — they import each
+other as `from utils import ...` — so every runnable script carries a short
+`sys.path` bootstrap anchored on its own `__file__`, and every command is run from
+the repository root as `python <dir>/<script>.py`. Output directories are named
+repo-relative and resolved through `utils.repo_path()`, so they mean the same
+place whatever the working directory. `HOW_TO_RUN.md` §1.2 covers this, and
+`implementation_logbook/REORGANISATION_FIX_PLAN.md` records why it is done this
+way rather than with packages.
+
+Two files sit in `Transformer_model/` but import `configs` from
+`Experimental_setup/`, so that directory is not yet the clean leaf layer the split
+intends — `Test_data_eval.py` and `plot_state_clusters.py` are both entry points
+and arguably belong with the drivers. See the fix plan §7.1.
+
+`walkthrough.ipynb` is generated from `build_walkthrough.py` rather than edited by
+hand so it can be regenerated after a re-run.
 
 Every `.pt` is written with a **JSON sidecar** recording `d_model`, `n_layers`,
 `token_size`, `max_len`, `seed` and the process parameters, and both post-hoc
@@ -874,19 +904,27 @@ checkpoint against the wrong process.
 ```bash
 conda activate qdrug
 
-pytest tests/ -q                              # 61 tests, ~20 s
-python run_experiments.py --config SMOKE      # ~2 min, exercises every path
+pytest tests/ -q                              # 66 tests, ~20 s
+python Experimental_setup/run_experiments.py --config SMOKE      # ~2 min, exercises every path
 
-python run_experiments.py --config QUICK      # ~9 min  ← the reportable run
-python sanity_check.py                        # ~7 min, the controls
-python plot_state_clusters.py                 # causal-state figures
-python run_statistical_trj.py --khat          # ~2.3 h, repeat statistics (done)
-python run_statistical_trj.py --plots-only    # redraw its figures, no training
+python Experimental_setup/run_experiments.py --config QUICK      # ~9 min  ← the reportable run
+python Experimental_setup/sanity_check.py                        # ~7 min, the controls
+python Transformer_model/plot_state_clusters.py                 # causal-state figures
+python Experimental_setup/run_statistical_trj.py --khat          # ~2.3 h, repeat statistics (done)
+python Experimental_setup/run_statistical_trj.py --plots-only    # redraw its figures, no training
+
+python Experimental_setup/run_sweep_experiment.py --dry-run      # 125-process coverage table
+python Experimental_setup/run_sweep_experiment.py --repeats 30   # ~7.6 h, the sweep (done)
 ```
 
+Every command is run from the repository root; see §8 and `HOW_TO_RUN.md` §1.2.
+Before resuming any long run, `--dry-run` first — it prints how many processes it
+would skip and how many it would train, which is the difference between
+continuing and silently starting over (`HOW_TO_RUN.md` §14.6).
+
 `HOW_TO_RUN.md` documents every flag, every output file, the schema of each
-pickle, and troubleshooting. Dependencies are in `requirements.txt`, with exact
-pins in `requirements-lock.txt`.
+pickle, and troubleshooting. Dependencies are in `Run_logs/requirements.txt`,
+with exact pins in `Run_logs/requirements-lock.txt`.
 
 ---
 
@@ -895,10 +933,10 @@ pins in `requirements-lock.txt`.
 Two independent measurements of the same quantity are reported, and they should
 be read in this order:
 
-- **The cross-validated runs** (§10.2) — `results_quick/all_results.pkl`, seven
+- **The cross-validated runs** (§10.2) — `All_Results/results_quick/all_results.pkl`, seven
   experiments, five folds of one seed each. Their standard error is over folds
   that share a training set, so it understates the uncertainty.
-- **The repeat harness** (§10.3) — `results_trajectories/all_trajectories.pkl`,
+- **The repeat harness** (§10.3) — `All_Results/results_trajectories/all_trajectories.pkl`,
   seven processes × 100 independent datasets, 1,400 trainings. Its standard error
   is sampling variability. **This is the measurement to quote.**
 
@@ -1414,7 +1452,7 @@ bridging the classical experiments here to quantum extensions.
 ---
 
 *Every quantitative claim in Sections 10 and 11 is drawn from
-`results_quick/all_results.pkl` and `sanity_check_flower_process/*/results.pkl`,
+`All_Results/results_quick/all_results.pkl` and `sanity_check_flower_process/*/results.pkl`,
 and can be recomputed from those files. The divergence tables in Section 4.6 come
 from `factorial.log` and `divtest.log`. The reasoning behind each correction
 described here is recorded in `implementation_logbook/`, and demonstrated

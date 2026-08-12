@@ -39,6 +39,22 @@ import numpy as np
 import torch
 import torch.utils.data as tud
 
+# ── repo path bootstrap ────────────────────────────────────────────────────
+# REORGANISATION_FIX_PLAN.md 4.1.  This file lives in Transformer_model/ but
+# imports `configs` from Experimental_setup/, so both directories have to be
+# importable.  Python only ever puts the *script's own* directory on sys.path --
+# which is why this is needed, and why cd-ing elsewhere does not help.  Anchored
+# on __file__, so the script runs from any working directory.
+#
+# (That cross-directory import is also why this script arguably belongs in
+# Experimental_setup/ -- see REORGANISATION_FIX_PLAN.md 7.1.)
+import sys
+_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+for _d in ("Transformer_model", "Experimental_setup"):
+    _p = os.path.join(_ROOT, _d)
+    if _p not in sys.path:
+        sys.path.insert(0, _p)
+
 from configs import CONFIGS, QUICK
 from Data_generation import CoinDataset, coin_generation
 from Flower_process_generation import FlowerDataset, flower_process_generation
@@ -46,7 +62,7 @@ from Model_analysis import (DEFAULT_STATE_TOL, DISTANCE_MATRICES, _project2d,
                             recover_causal_states, savefig, warm_up_umap)
 from OneHot_model import OneHotDecoder
 from Training_model import ChunckDataset, set_seed
-from utils import coin_tag, flower_tag, mkdir
+from utils import coin_tag, flower_tag, mkdir, repo_path
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -217,7 +233,7 @@ def main(argv=None):
     args = ap.parse_args(argv)
 
     cfg = dict(CONFIGS[args.config])
-    out_root = args.out_root or cfg["out_root"]
+    out_root = repo_path(args.out_root or cfg["out_root"])   # FIX_PLAN 4.2
     warm_up_umap(cfg["umap_n_neighbors"])
 
     todo = experiments(cfg)

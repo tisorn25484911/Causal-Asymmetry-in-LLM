@@ -1,3 +1,18 @@
+# ── repo path bootstrap ────────────────────────────────────────────────────
+# REORGANISATION_FIX_PLAN.md 4.1.  The tree is split across Transformer_model/
+# and Experimental_setup/ but the modules are still flat (`from utils import
+# ...`), so both directories have to be importable.  Python only ever puts the
+# *script's own* directory on sys.path -- which is why this is needed, and why
+# cd-ing elsewhere does not help.  Anchored on __file__, so the script runs
+# from any working directory.
+import os
+import sys
+_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+for _d in ("Transformer_model", "Experimental_setup"):
+    _p = os.path.join(_ROOT, _d)
+    if _p not in sys.path:
+        sys.path.insert(0, _p)
+
 from Data_generation import coin_generation, make_loader
 from Training_model import train_model
 from Model_analysis import (

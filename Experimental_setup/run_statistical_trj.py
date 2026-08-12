@@ -112,6 +112,20 @@ import matplotlib.pyplot as plt
 import numpy as np
 import torch
 
+# ── repo path bootstrap ────────────────────────────────────────────────────
+# REORGANISATION_FIX_PLAN.md 4.1.  The tree is split across Transformer_model/
+# and Experimental_setup/ but the modules are still flat (`from utils import
+# ...`), so both directories have to be importable.  Python only ever puts the
+# *script's own* directory on sys.path -- which is why this is needed, and why
+# cd-ing elsewhere does not help.  Anchored on __file__, so the script runs
+# from any working directory.
+import sys
+_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+for _d in ("Transformer_model", "Experimental_setup"):
+    _p = os.path.join(_ROOT, _d)
+    if _p not in sys.path:
+        sys.path.insert(0, _p)
+
 # ── project ────────────────────────────────────────────────────────────────
 from configs import CONFIGS
 from Data_generation import CoinDataset, coin_generation
@@ -126,8 +140,8 @@ from Model_analysis import (
     statistical_complexity_empirical,
 )
 from utils import (
-    cleanup, coin_tag, entropy_rate_coin, flower_tag, mkdir, save_pkl,
-    to_cpu_for_analysis,
+    cleanup, coin_tag, entropy_rate_coin, flower_tag, mkdir, repo_path,
+    save_pkl, to_cpu_for_analysis,
 )
 from Training_model import (
     _eval_loss_on_loader, diagnose_divergence, make_analysis_loader,
@@ -142,7 +156,7 @@ from run_experiments import full_seq_len
 COIN_PQ   = [(0.1, 0.9), (0.3, 0.4), (0.4, 0.8)]
 FLOWER_NM = [(2, 6), (2, 8), (4, 2), (6, 4)]
 
-OUT_ROOT_DEFAULT = "results_trajectories"
+OUT_ROOT_DEFAULT = "All_Results/results_trajectories"
 
 FW_COLOUR, BW_COLOUR, D_COLOUR = "#4c72b0", "#dd8452", "crimson"
 
@@ -970,7 +984,12 @@ def main(argv=None):
     cfg  = dict(CONFIGS[args.config])
     if args.seed is not None:
         cfg["seed"] = args.seed
-    out_root = args.out_root
+    # REORGANISATION_FIX_PLAN.md 4.2.  repo_path so a relative --out-root is
+    # resolved against the repo root, not the cwd.  mkdir below is
+    # exist_ok=True and load_combined treats a missing pickle as 'nothing done
+    # yet', so a stale path silently re-runs the whole experiment instead of
+    # failing.
+    out_root = repo_path(args.out_root)
     mkdir(out_root)
 
     specs = select_specs(process_specs(cfg), args.only)

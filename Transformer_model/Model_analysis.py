@@ -71,12 +71,14 @@ General purpose plotting:
 # single definition in utils.py.  They are re-exported here because several
 # modules and the notebooks import them from Model_analysis.
 from utils import (            # noqa: F401  -- deliberate re-export
+    REPO_ROOT,
     cleanup,
     coin_tag,
     entropy_bits,
     entropy_rate_coin,
     flower_tag,
     mkdir,
+    repo_path,
     save_pkl,
     save_weights,
     to_cpu_for_analysis,

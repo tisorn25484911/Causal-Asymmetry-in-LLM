@@ -109,7 +109,7 @@ def _cfg(**overrides) -> dict:
 # Not for results: 3 epochs on 40 sequences measures nothing.
 # ─────────────────────────────────────────────────────────────────────────────
 SMOKE = _cfg(
-    out_root            = "results_smoke",
+    out_root            = "All_Results/results_smoke",
     d_model             = 16,
     n_folds             = 2,
     lr                  = 1e-2,
@@ -136,7 +136,7 @@ SMOKE = _cfg(
 # QUICK — the old Main_call.py.  ~1 hour.
 # ─────────────────────────────────────────────────────────────────────────────
 QUICK = _cfg(
-    out_root            = "results_quick",
+    out_root            = "All_Results/results_quick",
     d_model             = 32,
     lr                  = 1e-2,
     train_chunk_len     = 256,   # tokens seen per training step
@@ -161,7 +161,7 @@ QUICK = _cfg(
 # LARGE — the old main_large.py.  ~13 hours, most of it the pq sweep.
 # ─────────────────────────────────────────────────────────────────────────────
 LARGE = _cfg(
-    out_root            = "results_large",
+    out_root            = "All_Results/results_large",
     d_model             = 64,
     lr                  = 5e-3,
     train_chunk_len     = 512,

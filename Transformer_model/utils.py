@@ -43,6 +43,32 @@ def flower_tag(prefix: str, n: int, m: int) -> str:
 # ─────────────────────────────────────────────────────────────────────────────
 # Filesystem
 # ─────────────────────────────────────────────────────────────────────────────
+# REORGANISATION_FIX_PLAN.md 4.2.  This file lives in Transformer_model/, so the
+# repo root is two levels up from __file__.  Anchoring on __file__ rather than
+# the cwd is the whole point: every output directory in this repo is named
+# repo-relative ("All_Results/results_quick"), which was unambiguous while the
+# scripts sat at the root and is not any more.
+REPO_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+
+
+def repo_path(p: str) -> str:
+    """
+    Resolve a repo-relative path against the repo root rather than the cwd.
+
+    Absolute paths pass through untouched, so `--out-root /tmp/scratch` still
+    means /tmp/scratch.  A *relative* argument resolves against the repo root,
+    which makes the documented invariant ("run from the repo root") true by
+    construction instead of a thing the caller has to remember.
+
+    This matters more than it looks.  `mkdir` below is exist_ok=True and
+    `load_combined` treats a missing pickle as "nothing done yet", so a stale
+    relative path does not raise -- it silently creates an empty directory and
+    re-runs the whole experiment.  That failure mode cost a 23 h sweep once
+    already; resolving paths from a fixed anchor is what stops it recurring.
+    """
+    return p if os.path.isabs(p) else os.path.join(REPO_ROOT, p)
+
+
 def mkdir(path: str) -> str:
     os.makedirs(path, exist_ok=True)
     return path

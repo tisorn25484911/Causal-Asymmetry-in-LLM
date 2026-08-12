@@ -4,9 +4,13 @@ Generate walkthrough.ipynb — the Phase 0-3 demonstration notebook.
 Written as a generator script rather than by hand so the notebook can be
 regenerated after a re-run without hand-editing JSON.  Run:
 
-    python build_walkthrough.py
+    python Jupyter_notebooks/build_walkthrough.py
+
+The notebook is written next to THIS file, not into the working directory, so it
+lands in Jupyter_notebooks/ wherever the command is run from.
 """
 import json
+import os
 
 cells = []
 
@@ -84,7 +88,21 @@ import numpy as np
 import matplotlib.pyplot as plt
 import torch
 
-sys.path.insert(0, os.getcwd())
+# REORGANISATION_FIX_PLAN.md 5.8.  The modules are flat but live in
+# Transformer_model/ and Experimental_setup/, and this notebook sits in
+# Jupyter_notebooks/, so neither cwd nor a single directory is enough.  Walk up to
+# the .git marker, chdir there so the repo-relative data paths below resolve, and
+# put both source directories on the path.  Idempotent -- safe to re-run.
+_p = os.path.abspath(os.getcwd())
+while not os.path.isdir(os.path.join(_p, ".git")) and _p != os.path.dirname(_p):
+    _p = os.path.dirname(_p)
+ROOT = _p
+os.chdir(ROOT)
+for _d in ("Transformer_model", "Experimental_setup"):
+    if os.path.join(ROOT, _d) not in sys.path:
+        sys.path.insert(0, os.path.join(ROOT, _d))
+print("repo root:", ROOT)
+
 np.set_printoptions(precision=4, suppress=True)
 
 from Model_analysis import (flower_complexity, flower_entropy_rate,
@@ -543,7 +561,7 @@ pure training-set numbers. This is pre-existing and outside Phase 1–3 scope.
 """)
 
 code(r"""
-res_path = "results_quick/all_results.pkl"
+res_path = "All_Results/results_quick/all_results.pkl"
 if os.path.exists(res_path):
     R = pickle.load(open(res_path, "rb"))
     print(f"{'experiment':<26}{'H_inf':>8}{'C+':>8}{'C-':>8}{'C--C+':>9}"
@@ -885,5 +903,10 @@ nb = {"cells": cells,
 
 nb = nbformat.from_dict(nb)
 nbformat.validate(nbformat.v4.upgrade(nb))
-nbformat.write(nb, "walkthrough.ipynb")
-print(f"wrote walkthrough.ipynb — {len(cells)} cells")
+# REORGANISATION_FIX_PLAN.md 5.7.  Written next to THIS script, not into the cwd.
+# The notebook lives in Jupyter_notebooks/ while the data cells it generates read
+# repo-root-relative paths, so no single cwd satisfies both: the emitted cells
+# chdir to the root, and the file itself is anchored here.
+_out = os.path.join(os.path.dirname(os.path.abspath(__file__)), "walkthrough.ipynb")
+nbformat.write(nb, _out)
+print(f"wrote {_out} — {len(cells)} cells")

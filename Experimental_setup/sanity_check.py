@@ -64,6 +64,20 @@ matplotlib.use("Agg")
 import matplotlib.pyplot as plt
 import numpy as np
 
+# ── repo path bootstrap ────────────────────────────────────────────────────
+# REORGANISATION_FIX_PLAN.md 4.1.  The tree is split across Transformer_model/
+# and Experimental_setup/ but the modules are still flat (`from utils import
+# ...`), so both directories have to be importable.  Python only ever puts the
+# *script's own* directory on sys.path -- which is why this is needed, and why
+# cd-ing elsewhere does not help.  Anchored on __file__, so the script runs
+# from any working directory.
+import sys
+_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+for _d in ("Transformer_model", "Experimental_setup"):
+    _p = os.path.join(_ROOT, _d)
+    if _p not in sys.path:
+        sys.path.insert(0, _p)
+
 from Data_generation import CoinDataset, coin_generation
 from Flower_process_generation import FlowerDataset, flower_process_generation
 from Model_analysis import (
@@ -92,7 +106,7 @@ from Training_model import (
     train_test_val_pipeline,
 )
 from utils import (
-    cleanup, entropy_rate_coin, mkdir, save_pkl, save_weights,
+    cleanup, entropy_rate_coin, mkdir, repo_path, save_pkl, save_weights,
     to_cpu_for_analysis as to_cpu,
 )
 
@@ -765,8 +779,12 @@ def main():
     t_total = time.time()
     warm_up_umap(CFG["umap_n_neighbors"])   # D4: once, up front
     set_seed(CFG["seed"])          # A2: reproducible end to end
-    mkdir(OUT_ROOT)
-    mkdir(os.path.join(OUT_ROOT, "models"))
+    # REORGANISATION_FIX_PLAN.md 4.2.  Resolved once, here, against the repo root
+    # rather than the cwd -- OUT_ROOT stays a bare relative name so it still
+    # reads as a name in the printout below.
+    out_root = repo_path(OUT_ROOT)
+    mkdir(out_root)
+    mkdir(os.path.join(out_root, "models"))
 
     print("\n" + "="*65)
     print("  CONTROLS — Coin p=q=0.5 (positive)  vs  Flower n=1, m=2 (null)")
@@ -777,13 +795,13 @@ def main():
     print("="*65)
 
     # Run Experiment A: coin p=q=0.5
-    res_coin   = exp_coin(CFG, OUT_ROOT)
+    res_coin   = exp_coin(CFG, out_root)
 
     # Run Experiment B: flower n=1, m=2
-    res_flower = exp_flower(CFG, OUT_ROOT)
+    res_flower = exp_flower(CFG, out_root)
 
     # Cross-experiment comparison
-    plot_cross_comparison(res_coin, res_flower, OUT_ROOT)
+    plot_cross_comparison(res_coin, res_flower, out_root)
 
     # Final summary
     sep = "=" * 65
@@ -850,7 +868,7 @@ def main():
         print(f"    BW convergence  = |CE_BW - H∞| = {conv_bw:.4f}  "
               f"({'OK' if conv_bw < 0.5 else 'NOT CONVERGED'})")
     print(f"\n  Total time: {(time.time()-t_total)/60:.1f} min")
-    print(f"  Outputs in: {OUT_ROOT}/")
+    print(f"  Outputs in: {out_root}/")
     print(sep)
 
 

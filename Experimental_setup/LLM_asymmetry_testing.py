@@ -7,6 +7,20 @@ import matplotlib.pyplot as plt
 import numpy as np
 import torch
 
+# ── repo path bootstrap ────────────────────────────────────────────────────
+# REORGANISATION_FIX_PLAN.md 4.1.  The tree is split across Transformer_model/
+# and Experimental_setup/ but the modules are still flat (`from utils import
+# ...`), so both directories have to be importable.  Python only ever puts the
+# *script's own* directory on sys.path -- which is why this is needed, and why
+# cd-ing elsewhere does not help.  Anchored on __file__, so the script runs
+# from any working directory.
+import sys
+_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+for _d in ("Transformer_model", "Experimental_setup"):
+    _p = os.path.join(_ROOT, _d)
+    if _p not in sys.path:
+        sys.path.insert(0, _p)
+
 from configs import CONFIGS
 from Data_generation import CoinDataset, coin_generation
 from Flower_process_generation import FlowerDataset, flower_process_generation
@@ -22,7 +36,8 @@ from Model_analysis import (
     stepwise_kl_coin,
     savefig,
 )
-from utils import check_weight_meta, coin_tag, entropy_rate_coin, flower_tag, mkdir
+from utils import (check_weight_meta, coin_tag, entropy_rate_coin, flower_tag,
+                   mkdir, repo_path)
 
 # ── LaTeX rendering ───────────────────────────────────────────────────────────
 plt.rcParams.update({
@@ -657,7 +672,7 @@ def eval_flower(tag, n, m, models_dir, out_root, cfg):
 # =============================================================================
 def main():
     cfg          = build_cfg()
-    results_dir  = RUN["results_dir"] or cfg["out_root"]
+    results_dir  = repo_path(RUN["results_dir"] or cfg["out_root"])  # FIX_PLAN 4.2
     models_dir   = os.path.join(results_dir, "models")
     out_root     = RUN["out_dir"] or os.path.join(results_dir, "asymmetry_test")
     mkdir(out_root)

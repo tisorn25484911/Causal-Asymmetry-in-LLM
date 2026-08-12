@@ -51,10 +51,47 @@ were produced with:
 | NumPy | 2.4.2 |
 | scikit-learn | 1.8.0 |
 
-To reproduce the environment elsewhere, install from `requirements.txt`; for a
-byte-exact reproduction, use `requirements-lock.txt`.
+To reproduce the environment elsewhere, install from `Run_logs/requirements.txt`;
+for a byte-exact reproduction, use `Run_logs/requirements-lock.txt`.
 
-### 1.2 Hardware and the accelerator
+### 1.2 Repository layout, and why every command starts from the root
+
+The source is split across two directories by role, with results, notebooks and
+logs in three more:
+
+```
+Transformer_model/     the primitives: process generators, the model, training,
+                       the analysis library, shared utilities
+Experimental_setup/    the drivers: configs.py and the six runnable experiments
+Jupyter_notebooks/     the four notebooks and the script that generates one
+All_Results/           every results tree (results_quick/, results_sweep/, ...)
+Run_logs/              run logs, requirements files, the launcher shells
+tests/                 the regression suite
+implementation_logbook/  the audit trail and the phase/fix plans
+```
+
+Two consequences matter in practice.
+
+**Run every command from the repository root, as `python <dir>/<script>.py`.**
+The modules are flat — they import each other as `from utils import ...`, not
+`from Transformer_model.utils import ...` — so each runnable script puts both
+source directories on `sys.path` itself, anchored on its own location. That is
+why `python Experimental_setup/run_experiments.py` works and why there is no
+`PYTHONPATH` to set. It also means `cd Experimental_setup && python
+run_experiments.py` works too, though nothing in this guide is written that way.
+
+**Relative output paths resolve against the repository root, not the working
+directory.** `--out-root All_Results/results_sweep` means the same directory
+whatever your cwd is, because the runners pass it through `utils.repo_path()`.
+Absolute paths are used verbatim, so `--out-root /tmp/scratch` is still
+`/tmp/scratch`. The reason for anchoring rather than trusting the cwd is in
+§14.6: a stale relative out-root does not raise, it silently starts the run over.
+
+`configs.py` keeps its `out_root` values *relative* (`All_Results/results_quick`)
+so the `run_config_*.json` provenance file each run writes records a portable
+path rather than one specific to this machine.
+
+### 1.3 Hardware and the accelerator
 
 The code selects an accelerator automatically. On this machine that is Apple
 MPS, which is approximately six times faster than the CPU at these model sizes.
@@ -72,7 +109,7 @@ Should exact run-to-run reproducibility be required — for instance when
 preparing final reported figures — set `accelerator = "cpu"` in `configs.py`
 and accept roughly six times the wall-clock time.
 
-### 1.3 Verifying the installation
+### 1.4 Verifying the installation
 
 Before running any experiment, confirm that the test suite passes:
 
@@ -243,10 +280,10 @@ Four configurations are defined:
 
 | Name | Output directory | `d_model` | Learning rate | Epochs | Gradient steps per fold | Approximate runtime |
 |---|---|---|---|---|---|---|
-| `SMOKE` | `results_smoke/` | 16 | 1e-2 | 3 | ≈ 15 | 2 minutes |
-| `QUICK` | `results_quick/` | 32 | 1e-2 | 10 | 100 | 9 minutes |
-| `QUICK_LARGE_HMM` | `results_quick/` | 32 | 1e-2 | 10 | 100 | 3 minutes |
-| `LARGE` | `results_large/` | 64 | 5e-3 | 80 | 1600 | 3.5 hours |
+| `SMOKE` | `All_Results/results_smoke/` | 16 | 1e-2 | 3 | ≈ 15 | 2 minutes |
+| `QUICK` | `All_Results/results_quick/` | 32 | 1e-2 | 10 | 100 | 9 minutes |
+| `QUICK_LARGE_HMM` | `All_Results/results_quick/` | 32 | 1e-2 | 10 | 100 | 3 minutes |
+| `LARGE` | `All_Results/results_large/` | 64 | 5e-3 | 80 | 1600 | 3.5 hours |
 
 ### 4.2 The purpose of each configuration
 
@@ -263,7 +300,7 @@ every one of its seven experiments.
 LARGE's *processes*. It exists because QUICK and LARGE differ along several axes
 simultaneously — data volume, capacity, learning rate, and the processes
 themselves — which makes them non-comparable. Holding the process fixed converts
-the comparison into a controlled one. It writes into `results_quick/` alongside
+the comparison into a controlled one. It writes into `All_Results/results_quick/` alongside
 the QUICK results, and only runs the processes QUICK does not already cover.
 
 **`LARGE`** increases every dimension. Its cross-validation results are **not
@@ -281,7 +318,7 @@ produced it. This was a genuine defect previously: two runners used the same tag
 literal at different parameters and overwrote one another's checkpoints.
 
 The same derivation supplies the `traj_` tags of the repeat harness (Section 7),
-which writes to `results_trajectories/` and so cannot collide with a training
+which writes to `All_Results/results_trajectories/` and so cannot collide with a training
 run's output either.
 
 ### 4.4 Weight decay, and the optimiser
@@ -351,7 +388,7 @@ steps). But at the 130 steps these harnesses run, divergence is already rare (3 
 configured entirely by command-line flags; no editing is required.
 
 ```bash
-python run_experiments.py --config QUICK
+python Experimental_setup/run_experiments.py --config QUICK
 ```
 
 ### 5.2 Available options
@@ -389,8 +426,8 @@ loader.
 To obtain the asymmetry numbers without paying for the sweep:
 
 ```bash
-python run_experiments.py --config LARGE --only exp1
-python run_experiments.py --config LARGE --only exp2
+python Experimental_setup/run_experiments.py --config LARGE --only exp1
+python Experimental_setup/run_experiments.py --config LARGE --only exp2
 ```
 
 ### 5.4 Worked examples
@@ -398,20 +435,20 @@ python run_experiments.py --config LARGE --only exp2
 Run a second seed into a separate directory, so that the two are not confused:
 
 ```bash
-python run_experiments.py --config QUICK --seed 1 --out-root results_quick_seed1
+python Experimental_setup/run_experiments.py --config QUICK --seed 1 --out-root All_Results/results_quick_seed1
 ```
 
 Run only the flower experiments:
 
 ```bash
-python run_experiments.py --config QUICK --only exp2
+python Experimental_setup/run_experiments.py --config QUICK --only exp2
 ```
 
 Add LARGE's processes to the QUICK results directory:
 
 ```bash
-python run_experiments.py --config QUICK_LARGE_HMM --only exp1
-python run_experiments.py --config QUICK_LARGE_HMM --only exp2
+python Experimental_setup/run_experiments.py --config QUICK_LARGE_HMM --only exp1
+python Experimental_setup/run_experiments.py --config QUICK_LARGE_HMM --only exp2
 ```
 
 ### 5.5 Behaviour on repeated runs
@@ -446,7 +483,7 @@ distinguishable from zero.
 ## 6. Running the controls
 
 ```bash
-python sanity_check.py
+python Experimental_setup/sanity_check.py
 ```
 
 Runtime is approximately seven minutes; output is written to
@@ -493,12 +530,12 @@ Each control is scored against its own prediction, using a three-way verdict:
 ## 7. Running the seed-repeat harness
 
 ```bash
-python run_statistical_trj.py
+python Experimental_setup/run_statistical_trj.py
 ```
 
 Seven processes, each trained one hundred times in both causal directions.
 Runtime is approximately two and a quarter hours; output is written to
-`results_trajectories/`.
+`All_Results/results_trajectories/`.
 
 This is the answer to the second caveat in Section 13.2. Every standard error
 reported by `run_experiments.py` is computed over the five cross-validation folds
@@ -520,7 +557,7 @@ claim about the sign of ΔCE that the per-fold statistic cannot.
                       Default: the configuration's seed.
 
 --out-root DIR        Where figures and pickles are written.
-                      Default: results_trajectories.
+                      Default: All_Results/results_trajectories.
 
 --only TAG [TAG ...]  Run a subset.  Matches a full tag or any substring of
                       one, so --only coin_p030 flower_n2 is accepted.
@@ -592,7 +629,7 @@ sets of numbers comparable.
 ### 7.4 What is produced
 
 ```
-results_trajectories/
+All_Results/results_trajectories/
 ├── run_config_QUICK.json                   parameters, repeat count, timestamp
 ├── all_trajectories.pkl                    every process, merged by tag
 ├── summary_delta_ce.png                    cross-process summary, two panels
@@ -644,13 +681,13 @@ so a subsequent partial run does not discard earlier processes.
 
 ```bash
 # one process only, into the same directory
-python run_statistical_trj.py --only flower_n6_m4
+python Experimental_setup/run_statistical_trj.py --only flower_n6_m4
 
 # a short shakedown before committing to the full run
-python run_statistical_trj.py --repeats 3 --out-root /tmp/traj_check
+python Experimental_setup/run_statistical_trj.py --repeats 3 --out-root /tmp/traj_check
 
 # regenerate all figures after editing a plotting function
-python run_statistical_trj.py --plots-only
+python Experimental_setup/run_statistical_trj.py --plots-only
 ```
 
 ### 7.6 The recovered state count
@@ -666,7 +703,7 @@ mean S_hat beneath the axis for comparison with `S_emp`.
 
 ```python
 import pickle
-r = pickle.load(open("results_trajectories/traj_coin_p040_q080/results.pkl", "rb"))
+r = pickle.load(open("All_Results/results_trajectories/traj_coin_p040_q080/results.pkl", "rb"))
 r["runs"][0]["fw"]["final_ce"]        # held-out CE of repeat 0, forward arm
 ```
 
@@ -703,8 +740,8 @@ results from it are quoted in Section 12.
 ## 8. The parameter sweep
 
 ```bash
-python run_sweep_experiment.py --dry-run     # spec table and coverage, no training
-python run_sweep_experiment.py --repeats 30  # 125 processes, ~7.6 h
+python Experimental_setup/run_sweep_experiment.py --dry-run     # spec table and coverage, no training
+python Experimental_setup/run_sweep_experiment.py --repeats 30  # 125 processes, ~7.6 h
 ```
 
 Where Section 7 measures seven processes precisely, this measures 125 coarsely,
@@ -714,7 +751,7 @@ process cannot show a trend.
 
 Everything that trains or measures one process is imported from
 `run_statistical_trj.py`; this file only chooses the processes and aggregates
-across them. Output goes to `results_sweep/`.
+across them. Output goes to `All_Results/results_sweep/`.
 
 ### 8.1 The two grids, and why they are not equivalent
 
@@ -807,7 +844,7 @@ trend is, it is a property of the descent, not of the converged residuals.
 ### 8.5 What is produced
 
 ```
-results_sweep/
+All_Results/results_sweep/
 ├── all_sweep.pkl          every repeat's trajectory, resumable state
 ├── sweep_rows.pkl          the per-process scalars the figures use
 ├── run_config_QUICK.json   parameters, grids, λ, timestamp
@@ -854,7 +891,7 @@ freedom are well below 125.
 ## 9. Generating the causal-state figures
 
 ```bash
-python plot_state_clusters.py
+python Transformer_model/plot_state_clusters.py
 ```
 
 This script must be run **after** a training run. It loads saved weights and
@@ -873,13 +910,13 @@ does not retrain, so it is inexpensive.
 Example:
 
 ```bash
-python plot_state_clusters.py --out-root results_large --metrics js
+python Transformer_model/plot_state_clusters.py --out-root All_Results/results_large --metrics js
 ```
 
 ### 9.2 What is produced
 
 For every experiment and every metric, one 2 × 2 figure is written to
-`results_quick/<tag>/<tag>_states_<metric>.png`:
+`All_Results/results_quick/<tag>/<tag>_states_<metric>.png`:
 
 ```
 forward / TRAIN          backward / TRAIN
@@ -939,8 +976,8 @@ disagree only where the model itself under-resolves the states.
 ## 10. The post-hoc evaluators
 
 ```bash
-python Test_data_eval.py
-python LLM_asymmetry_testing.py
+python Transformer_model/Test_data_eval.py
+python Experimental_setup/LLM_asymmetry_testing.py
 ```
 
 These load saved checkpoints and score them on freshly generated data.
@@ -998,7 +1035,7 @@ merges tokens with equal futures while separating those with different ones.
 ### 11.2 The walkthrough notebook
 
 ```bash
-python build_walkthrough.py
+python Jupyter_notebooks/build_walkthrough.py
 ```
 
 This regenerates `walkthrough.ipynb`, a thirty-seven-cell notebook that
@@ -1015,7 +1052,7 @@ consolidated list of caveats.
 ### 12.1 Directory layout
 
 ```
-results_quick/
+All_Results/results_quick/
 ├── run_config_QUICK.json                  complete parameter set + timestamp
 ├── run_config_QUICK_LARGE_HMM.json
 ├── all_results.pkl                        every experiment, merged by tag
@@ -1040,7 +1077,7 @@ should be regenerated rather than committed.
 
 ```python
 import pickle
-r = pickle.load(open("results_quick/exp1_coin_p040_q080/results.pkl", "rb"))
+r = pickle.load(open("All_Results/results_quick/exp1_coin_p040_q080/results.pkl", "rb"))
 ```
 
 | Key | Contents |
@@ -1213,7 +1250,71 @@ long runs and is reported rather than concealed.
 convergence filter. The paired statistic is not meaningful for that arm.
 
 **Results differ slightly between identical runs.** Expected on MPS; see
-Section 1.2.
+Section 1.3.
+
+**`ModuleNotFoundError: No module named 'Data_generation'` (or `Model_analysis`,
+`utils`, `configs`).** The script was invoked in a way that bypassed its path
+bootstrap — most likely it was copied elsewhere, or a new script was added
+without the bootstrap block. Every runnable file carries a short block that puts
+`Transformer_model/` and `Experimental_setup/` on `sys.path`, anchored on
+`__file__`; see §1.1.1 and copy the block from any existing runner. For a new
+*test* file nothing is needed: `conftest.py` at the repository root does it for
+the whole pytest session.
+
+### 14.6 A resumable run appears to start over
+
+This one is worth knowing about, because it is silent and it is expensive.
+
+`--out-root` is created if it does not exist (`os.makedirs(exist_ok=True)`), and
+a missing `all_sweep.pkl` / `all_trajectories.pkl` is treated as "no repeats
+completed yet" — which is exactly what has to happen on a genuine first run. The
+consequence is that a *wrong* out-root does not raise. It silently produces an
+empty resume state and retrains everything. A 23-hour weight-decay sweep was lost
+this way once, when the results tree was moved while the run was in progress.
+
+Two things now guard against it:
+
+1. Relative out-roots resolve against the repository root rather than the
+   working directory (§1.1.1), so the same command means the same directory
+   wherever it is typed.
+2. `run_sweep_experiment.py` prints a **resume plan** before training, and
+   `--dry-run` prints it too:
+
+   ```
+   resume plan : 97 complete and skipped, 3 to train
+   partial     : sweep_coin_p095_q075 (18/30)
+   ```
+
+   If the out-root holds nothing, the run says so in three loud lines rather than
+   quietly beginning again.
+
+**Always `--dry-run` first when resuming.** It costs a second and it answers the
+only question that matters before committing hours of compute: am I continuing,
+or starting over?
+
+Note the two harnesses resume at **different granularities**, which is easy to
+get wrong:
+
+| | `run_sweep_experiment.py` | `run_statistical_trj.py` |
+|---|---|---|
+| Skips processes already at `--repeats` | yes | **no** |
+| Preserves *other* processes in the pickle | yes | yes |
+| Effect of re-running one process | continues from the repeats it has | **discards them and retrains all `--repeats`** |
+
+So `--only flower_n6_m4` on the trajectory harness does not continue a
+half-finished process — it replaces that process's record with a fresh 100-repeat
+run (~20 min) while leaving the other six untouched. Only the sweep counts
+completed repeats and skips them.
+
+```bash
+python Experimental_setup/run_sweep_experiment.py --sweep-coin --repeats 30 \
+       --weight-decay 1.0 --out-root All_Results/results_sweep_wd/wd1.000 --dry-run
+```
+
+Relatedly, if the baseline cross-check (§8) is missing from a sweep's output, the
+run will now say `! BASELINE CROSS-CHECK SKIPPED` and name the path it tried. It
+used to skip in silence, which meant a stale `--baseline` removed the sweep's only
+end-to-end regression check without leaving a trace.
 
 ---
 
@@ -1225,43 +1326,44 @@ conda activate qdrug
 cd /Users/tisornnaphattalung/Desktop/Quantum/URECA/LLM_final_version
 
 # Verification
-pytest tests/ -q                                    # 61 tests, ~20 s
-python run_experiments.py --config SMOKE            # ~2 min, exercises all paths
+pytest tests/ -q                                    # 66 tests, ~20 s
+python Experimental_setup/run_experiments.py --config SMOKE            # ~2 min, exercises all paths
 
 # Training
-python run_experiments.py --config QUICK            # ~9 min   ← the reportable run
-python run_experiments.py --config QUICK_LARGE_HMM --only exp1
-python run_experiments.py --config QUICK_LARGE_HMM --only exp2
-python run_experiments.py --config LARGE            # ~3.5 h   ← CV not usable
-python run_experiments.py --config QUICK --seed 1 --out-root results_quick_seed1
+python Experimental_setup/run_experiments.py --config QUICK            # ~9 min   ← the reportable run
+python Experimental_setup/run_experiments.py --config QUICK_LARGE_HMM --only exp1
+python Experimental_setup/run_experiments.py --config QUICK_LARGE_HMM --only exp2
+python Experimental_setup/run_experiments.py --config LARGE            # ~3.5 h   ← CV not usable
+python Experimental_setup/run_experiments.py --config QUICK --seed 1 --out-root All_Results/results_quick_seed1
 
 # Controls
-python sanity_check.py                              # ~7 min
+python Experimental_setup/sanity_check.py                              # ~7 min
 
 # Parameter sweep (Section 8)
-python run_sweep_experiment.py --dry-run            # coverage table, no training
-python run_sweep_experiment.py --repeats 30         # ~7.6 h, 125 processes
-python run_sweep_experiment.py --sweep-flower --repeats 30 --weight-decay 0.1 \
-       --out-root results_sweep_wd/wd0.100          # one lambda, ~3 h
-python run_sweep_experiment.py --plots-only         # redraw, no training
+python Experimental_setup/run_sweep_experiment.py --dry-run            # coverage table, no training
+python Experimental_setup/run_sweep_experiment.py --dry-run --repeats 30  # ALWAYS check the resume plan first
+python Experimental_setup/run_sweep_experiment.py --repeats 30         # ~7.6 h, 125 processes
+python Experimental_setup/run_sweep_experiment.py --sweep-flower --repeats 30 --weight-decay 0.1 \
+       --out-root All_Results/results_sweep_wd/wd0.100          # one lambda, ~3 h
+python Experimental_setup/run_sweep_experiment.py --plots-only         # redraw, no training
 
 # Repeat statistics (Section 7)
-python run_statistical_trj.py                       # ~2.25 h, 7 x 100, not yet run
-python run_statistical_trj.py --repeats 3 --out-root /tmp/traj_check
-python run_statistical_trj.py --only flower_n6_m4   # one process, resumable
-python run_statistical_trj.py --khat                # ~3 h, adds k-hat per run
-python run_statistical_trj.py --plots-only          # redraw, no training
+python Experimental_setup/run_statistical_trj.py                       # ~2.25 h, 7 x 100  ← done
+python Experimental_setup/run_statistical_trj.py --repeats 3 --out-root /tmp/traj_check
+python Experimental_setup/run_statistical_trj.py --only flower_n6_m4   # one process, retrained (see 14.6)
+python Experimental_setup/run_statistical_trj.py --khat                # ~3 h, adds k-hat per run
+python Experimental_setup/run_statistical_trj.py --plots-only          # redraw, no training
 
 # Analysis of saved weights
-python plot_state_clusters.py                       # all metrics, results_quick
-python plot_state_clusters.py --out-root results_large --metrics js
+python Transformer_model/plot_state_clusters.py                       # all metrics, All_Results/results_quick
+python Transformer_model/plot_state_clusters.py --out-root All_Results/results_large --metrics js
 
 # Post-hoc evaluation (edit the RUN dict first)
-python Test_data_eval.py
-python LLM_asymmetry_testing.py
+python Transformer_model/Test_data_eval.py
+python Experimental_setup/LLM_asymmetry_testing.py
 
 # Documentation
-python build_walkthrough.py                         # regenerate walkthrough.ipynb
+python Jupyter_notebooks/build_walkthrough.py                         # regenerate walkthrough.ipynb
 ```
 
 ### Further reading within this repository

@@ -132,6 +132,20 @@ import numpy as np
 from matplotlib.colors import TwoSlopeNorm
 from scipy import stats as sstats
 
+# ── repo path bootstrap ────────────────────────────────────────────────────
+# REORGANISATION_FIX_PLAN.md 4.1.  The tree is split across Transformer_model/
+# and Experimental_setup/ but the modules are still flat (`from utils import
+# ...`), so both directories have to be importable.  Python only ever puts the
+# *script's own* directory on sys.path -- which is why this is needed, and why
+# cd-ing elsewhere does not help.  Anchored on __file__, so the script runs
+# from any working directory.
+import sys
+_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+for _d in ("Transformer_model", "Experimental_setup"):
+    _p = os.path.join(_ROOT, _d)
+    if _p not in sys.path:
+        sys.path.insert(0, _p)
+
 # ── project ────────────────────────────────────────────────────────────────
 # Every measurement primitive comes from the harness: one_repeat trains and
 # scores a paired repeat, paired_stats runs the same paired estimator the rest of
@@ -150,7 +164,7 @@ from run_statistical_trj import (
     paired_stats,
     quiet,
 )
-from utils import coin_tag, flower_tag, mkdir, save_pkl
+from utils import coin_tag, flower_tag, mkdir, repo_path, save_pkl
 
 
 # ══════════════════════════════════════════════════════════════════════════
@@ -162,7 +176,7 @@ from utils import coin_tag, flower_tag, mkdir, save_pkl
 COIN_GRID_DEFAULT   = [0.05, 0.15, 0.25, 0.35, 0.45, 0.55, 0.65, 0.75, 0.85, 0.95]
 FLOWER_GRID_DEFAULT = [2, 4, 6, 8, 10]
 
-OUT_ROOT_DEFAULT = "results_sweep"
+OUT_ROOT_DEFAULT = "All_Results/results_sweep"
 
 COIN_COLOUR, FLOWER_COLOUR = "#4c72b0", "#dd8452"
 
@@ -828,6 +842,15 @@ def baseline_crosscheck(rows: list, baseline_path: str):
     """
     base = load_combined(baseline_path)
     if not base:
+        # REORGANISATION_FIX_PLAN.md 5.5.  This used to `return` in silence, so a
+        # stale --baseline path deleted the sweep's only end-to-end regression
+        # check without leaving a trace in the log.  A cross-check that can
+        # vanish unnoticed is not a check.
+        print(f"\n  ! BASELINE CROSS-CHECK SKIPPED — no readable baseline at "
+              f"{baseline_path}")
+        print(f"  !   the four overlapping flower cells were NOT verified against "
+              f"the 100-repeat run.")
+        print(f"  !   pass --baseline <path to all_trajectories.pkl> to restore it.")
         return
     by_key = {}
     for tag, rec in base.items():
@@ -984,7 +1007,8 @@ def parse_args(argv=None):
                     help="same, for the flower family.  Setting the two families "
                          "differently makes their areas non-comparable, so the "
                          "pooled correlation is then omitted rather than printed")
-    ap.add_argument("--baseline", default="results_trajectories/all_trajectories.pkl",
+    ap.add_argument("--baseline",
+                    default="All_Results/results_trajectories/all_trajectories.pkl",
                     help="pickle to cross-check overlapping processes against")
     ap.add_argument("--verbose", action="store_true",
                     help="do not suppress per-run training output")
@@ -1012,7 +1036,10 @@ def main(argv=None):
         if not specs:
             raise SystemExit(f"--only {args.only} matched nothing")
 
-    out_root = mkdir(args.out_root)
+    # REORGANISATION_FIX_PLAN.md 4.2.  Root-anchored: mkdir is exist_ok=True and
+    # load_combined returns {} for a missing pickle, so a stale relative path
+    # would silently discard every completed repeat and re-run the full grid.
+    out_root = mkdir(repo_path(args.out_root))
     combined_path = os.path.join(out_root, "all_sweep.pkl")
     combined = load_combined(combined_path)
 
@@ -1032,6 +1059,32 @@ def main(argv=None):
     print(f"{'='*78}")
     coverage_table(specs)
 
+    # REORGANISATION_FIX_PLAN.md 5.5.  The resume plan is computed HERE, above the
+    # --dry-run return, so `--dry-run` reports what a real run would skip and what
+    # it would train.  It used to be computed after that return, which meant the
+    # one flag whose entire job is "tell me what you are about to do" could not
+    # answer the most expensive question -- am I resuming, or silently starting a
+    # 23 h grid over?  A stale out_root reads as "nothing done yet" (mkdir is
+    # exist_ok=True, load_combined returns {} for a missing pickle), so this line
+    # is the check that separates the two.
+    todo = [s for s in specs
+            if args.redo
+            or len((combined.get(s["tag"], {}) or {}).get("runs", [])) < args.repeats]
+    n_skip = len(specs) - len(todo)
+    partial = [(s["tag"], len(combined[s["tag"]]["runs"])) for s in todo
+               if s["tag"] in combined and combined[s["tag"]].get("runs")]
+    print(f"  resume plan : {n_skip} complete and skipped, {len(todo)} to train"
+          + ("  (--redo forces all)" if args.redo else ""))
+    if not combined:
+        print(f"  ! no existing all_sweep.pkl at {combined_path}")
+        print(f"  ! nothing to resume from -- this trains all {len(specs)} "
+              f"process(es) from scratch.")
+        print(f"  ! if that is a surprise, check --out-root before committing "
+              f"the compute.")
+    if partial:
+        print(f"  partial     : " + ", ".join(f"{t} ({n}/{args.repeats})"
+                                              for t, n in partial))
+
     if args.dry_run:
         print("\n  --dry-run: nothing trained.")
         return
@@ -1048,13 +1101,7 @@ def main(argv=None):
         t0 = time.time()
         t_save = [0.0]          # mutable so the inner loop can update it
         done_repeats = 0
-        todo = [s for s in specs
-                if args.redo
-                or len((combined.get(s["tag"], {}) or {}).get("runs", [])) < args.repeats]
-        n_skip = len(specs) - len(todo)
-        if n_skip:
-            print(f"\n  resuming: {n_skip} process(es) already have "
-                  f"{args.repeats} repeats and are skipped (--redo to force)")
+        # `todo` / `n_skip` were computed above, before the --dry-run return.
         total_repeats = len(todo) * args.repeats
 
         for pi, spec in enumerate(todo, 1):
@@ -1134,7 +1181,7 @@ def main(argv=None):
              os.path.join(out_root, "sweep_rows.pkl"))
     plot_sweep_scatter(rows, out_root)
     plot_sweep_trajectories(rows, out_root)
-    baseline_crosscheck(rows, args.baseline)
+    baseline_crosscheck(rows, repo_path(args.baseline))
     print_sweep_summary(rows, out_root)
 
 

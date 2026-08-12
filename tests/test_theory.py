@@ -16,7 +16,15 @@ import numpy as np
 import pytest
 import torch
 
-sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+# REORGANISATION_FIX_PLAN.md 5.6.  The modules are flat but live in two sibling
+# directories, so both go on the path.  conftest.py at the repo root does this
+# too, for the whole pytest session; keeping it here as well means
+# `python tests/test_theory.py` and single-file runs outside pytest still work.
+_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+for _d in ("Transformer_model", "Experimental_setup"):
+    _p = os.path.join(_ROOT, _d)
+    if _p not in sys.path:
+        sys.path.insert(0, _p)
 
 from Data_generation import coin_generation                    # noqa: E402
 from Flower_process_generation import flower_process_generation  # noqa: E402
@@ -845,7 +853,13 @@ def test_old_checkpoints_still_load():
     import glob
     import json as _json
     from OneHot_model import OneHotDecoder
-    paths = sorted(glob.glob("results_quick/models/*_fw.pt"))
+    from utils import repo_path
+    # REORGANISATION_FIX_PLAN.md 5.6.  Root-anchored, and via repo_path so the
+    # test does not depend on the cwd.  The bare relative glob this replaced
+    # matched nothing after the results tree moved under All_Results/, and the
+    # skip below turned that into a silently passing test -- the worst outcome
+    # for a backward-compatibility check.
+    paths = sorted(glob.glob(repo_path("All_Results/results_quick/models/*_fw.pt")))
     if not paths:
         pytest.skip("no saved checkpoints in this clone")
     side = os.path.splitext(paths[0])[0] + ".json"
