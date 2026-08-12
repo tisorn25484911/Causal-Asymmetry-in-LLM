@@ -816,7 +816,17 @@ def statistical_complexity(p, q, mode):
     for prob in state_prob:
         S += - prob * np.log2(prob + 1e-12)
     return S
-def flower_complexity(n: int, m: int, dice_probs) -> tuple[float, float]:
+
+
+# How many decimals the posterior over dice is rounded to before outcomes are
+# compared for equality.  This is the ORIGINAL rule and the default, because every
+# C- this repo has ever reported was computed with it; changing it would make new
+# numbers incomparable with the 81-cell baseline.
+MERGE_ROUND_DP = 9
+
+
+def flower_complexity(n: int, m: int, dice_probs,
+                      merge_tol: float | None = None) -> tuple[float, float]:
     """
     Closed-form (C+, C-) for the n-m flower process
 
@@ -851,6 +861,32 @@ def flower_complexity(n: int, m: int, dice_probs) -> tuple[float, float]:
         originally in the repo had n > m, i.e. tested the negation of the
         hypothesis.
 
+    `merge_tol` -- when two posteriors count as "the same"
+    -----------------------------------------------------
+    REMAINING_WORK_PLAN.md C10.  `merge_tol=None` (the default) uses the original
+    rule: round the posterior to MERGE_ROUND_DP decimals and require exact
+    equality.  Passing a float instead groups posteriors within that distance in
+    max-norm.
+
+    These are NOT equivalent, and the difference is not academic.  Measured on
+    Dirichlet(alpha=0.2) dice at (n,m)=(2,8), seed 74, two outcomes had posteriors
+    [9.3e-12, ~1] and [6.5e-10, ~1] -- differing by 6.4e-10.  The rounding rule
+    calls them two backward states (C- = 2.1041); a 1e-9 tolerance calls them one
+    (C- = 2.0748).  A 0.029-bit difference in the x-axis of the whole experiment.
+
+    Both readings are defensible.  Exactly, an epsilon-machine is defined by exact
+    conditional distributions, so distinct posteriors are distinct states.
+    Operationally, telling those two apart from data needs of order 1e18 samples,
+    so a finite-sample predictor cannot possibly represent them separately -- and
+    the hypothesis under test is about what a *memory-bounded* model does.
+
+    The default is the rounding rule because every result this repo has reported
+    used it, and switching would make new numbers incomparable with the 81-cell
+    baseline.  It matters only for spiky dice (small alpha), where near-zero column
+    masses amplify float noise; over 3600 Dirichlet(1.0) draws the two rules agree
+    exactly.  Any experiment that deliberately uses small alpha should state which
+    rule it used, and preferably report both.
+
     """
     dp = np.asarray(dice_probs, dtype=float)
     if dp.shape != (n, m):
@@ -862,15 +898,37 @@ def flower_complexity(n: int, m: int, dice_probs) -> tuple[float, float]:
 
     pi_outcome = dp.mean(axis=0)                       # (1/n) sum_i dp[i, j]
     col_mass   = dp.sum(axis=0)
-    merged: dict[tuple, float] = {}
-    for j in range(m):
-        if col_mass[j] <= 0:                           # outcome never occurs
-            continue
-        posterior = np.round(dp[:, j] / col_mass[j], 9)   # P(die | outcome j)
-        key = tuple(posterior)
-        merged[key] = merged.get(key, 0.0) + pi_outcome[j]
 
-    C_minus = 1.0 + 0.5 * entropy_bits(list(merged.values()))
+    if merge_tol is None:
+        # ── the original rule, and the default ────────────────────────────
+        # Round the posterior to MERGE_ROUND_DP decimals and require exact
+        # equality.  Every C- this repo has reported uses this, so it stays the
+        # default; see the docstring for the one regime where it matters.
+        merged: dict[tuple, float] = {}
+        for j in range(m):
+            if col_mass[j] <= 0:                       # outcome never occurs
+                continue
+            key = tuple(np.round(dp[:, j] / col_mass[j], MERGE_ROUND_DP))
+            merged[key] = merged.get(key, 0.0) + pi_outcome[j]
+        mass = list(merged.values())
+    else:
+        # ── the operational rule, opt-in ──────────────────────────────────
+        # Group outcomes whose posteriors agree to within merge_tol in max-norm.
+        reps: list[np.ndarray] = []
+        mass = []
+        for j in range(m):
+            if col_mass[j] <= 0:
+                continue
+            posterior = dp[:, j] / col_mass[j]
+            for k, r in enumerate(reps):
+                if np.max(np.abs(posterior - r)) <= merge_tol:
+                    mass[k] += float(pi_outcome[j])
+                    break
+            else:
+                reps.append(posterior)
+                mass.append(float(pi_outcome[j]))
+
+    C_minus = 1.0 + 0.5 * entropy_bits(mass)
     return float(C_plus), float(C_minus)
 
 

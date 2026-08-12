@@ -13,7 +13,9 @@ and the consumers load it, so a tag computed differently in the two places
 would silently load the wrong weights.
 """
 
+import contextlib
 import gc
+import json
 import os
 import pickle
 
@@ -75,10 +77,97 @@ def mkdir(path: str) -> str:
 
 
 def save_pkl(obj, path: str):
-    with open(path, "wb") as f:
-        pickle.dump(obj, f, protocol=4)
+    """
+    Atomically replace `path` with a pickle of `obj`.
+
+    REMAINING_WORK_PLAN.md C1.  This used to be a bare open(path, "wb") +
+    pickle.dump, and open(..., "wb") TRUNCATES before a single byte is written.
+    A 12 MB sweep bundle takes real time to serialise, and for that whole window
+    the only copy on disk was a partial file -- which load_combined then reads as
+    "no repeats completed yet", silently discarding the run and restarting it.
+
+    That is not hypothetical: the lambda=1.0 coin run died inside this function.
+    It survived only because the failure was on open() with the results tree
+    already moved away, so there was nothing to truncate.  A kill one second
+    later would have destroyed 122 completed cells.
+
+    Writing to a sibling temp file and os.replace()-ing it is atomic within a
+    filesystem, so a reader sees either the whole old file or the whole new one.
+    The pid in the temp name matters because two sweeps have been run
+    concurrently before (different out_roots, same code path) -- a shared temp
+    name would let them corrupt each other.
+    """
+    tmp = f"{path}.tmp.{os.getpid()}"
+    try:
+        with open(tmp, "wb") as f:
+            pickle.dump(obj, f, protocol=4)
+            f.flush()
+            os.fsync(f.fileno())        # survive a power loss, not just a crash
+        os.replace(tmp, path)           # atomic
+    except BaseException:
+        # Never leave the temp file behind on Ctrl-C or an exception; the real
+        # bundle at `path` is untouched either way, which is the point.
+        with contextlib.suppress(OSError):
+            os.unlink(tmp)
+        raise
     mb = os.path.getsize(path) / 1024**2
     print(f"  pickle saved -> {path}  ({mb:.1f} MB)")
+
+
+def save_run_config(path: str, record: dict,
+                    keep_if_unset: tuple = (), union_lists: tuple = ()):
+    """
+    Merge a run's provenance into `path` instead of overwriting it.
+
+    REMAINING_WORK_PLAN.md C3.  Both runners used to write run_config_<CONFIG>.json
+    fresh on every invocation, recording only the grids THAT invocation set --
+    while the result pickle beside it MERGES across invocations.  The two then
+    disagree, and the JSON is the one a reader trusts.  It has already destroyed
+    information: All_Results/results_sweep holds 100 coin cells and 81 flower
+    cells, and its JSON says `coin_grid: null`, because the flower invocation ran
+    last.  The weight-decay folders escaped only because the launcher copied the
+    earlier record aside by hand.
+
+    `keep_if_unset` names keys whose previous value must survive when this
+    invocation leaves them falsy (the grids: `--sweep-coin` alone must not erase
+    the flower grid).  `union_lists` names keys that accumulate rather than
+    replace (the process list, so `--only` does not shrink the record).
+    Everything else is overwritten, which is right for scalars like `repeats`.
+
+    An `invocations` list preserves the per-run history, so the merge never hides
+    the fact that a folder was built up over several commands.
+    """
+    prev = {}
+    if os.path.exists(path):
+        try:
+            with open(path) as f:
+                prev = json.load(f)
+        except Exception as e:                 # corrupt or hand-edited: keep going
+            print(f"  ! could not read {path} ({e}) — starting a fresh record")
+
+    merged = dict(prev)
+    for k, v in record.items():
+        if k in keep_if_unset and not v:
+            continue                            # leave the earlier value in place
+        if k in union_lists:
+            old = prev.get(k) or []
+            new = v or []
+            seen, out = set(), []
+            for item in list(old) + list(new):
+                key = json.dumps(item, sort_keys=True, default=str)
+                if key not in seen:
+                    seen.add(key); out.append(item)
+            merged[k] = out
+            continue
+        merged[k] = v
+
+    merged["invocations"] = list(prev.get("invocations") or []) + [
+        {k: record.get(k) for k in ("utc", "repeats", *keep_if_unset, *union_lists)
+         if k in record}
+    ]
+    with open(path, "w") as f:
+        json.dump(merged, f, indent=2, default=str)
+    return merged
 
 
 def save_weights(model, path: str, meta: dict | None = None):

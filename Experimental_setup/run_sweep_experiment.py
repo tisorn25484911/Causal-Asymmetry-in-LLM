@@ -164,7 +164,8 @@ from run_statistical_trj import (
     paired_stats,
     quiet,
 )
-from utils import coin_tag, flower_tag, mkdir, repo_path, save_pkl
+from utils import (coin_tag, flower_tag, mkdir, repo_path, save_pkl,
+                   save_run_config)
 
 
 # ══════════════════════════════════════════════════════════════════════════
@@ -977,6 +978,13 @@ def parse_args(argv=None):
                     help="independent repeats per process (default 30)")
     ap.add_argument("--seed", type=int, default=None,
                     help="base seed; repeat i uses base + i for BOTH arms")
+    ap.add_argument("--accelerator", default=None,
+                    choices=["auto", "cpu", "mps", "gpu"],
+                    help="override cfg['accelerator'].  'cpu' is the only "
+                         "bit-reproducible setting -- MPS reductions are "
+                         "non-deterministic (README 1.3), so exact run-to-run "
+                         "comparison needs this.  Default: the config's value, "
+                         "i.e. unchanged behaviour.")
     ap.add_argument("--out-root", default=OUT_ROOT_DEFAULT)
     ap.add_argument("--sweep-coin", nargs="*", default=None, metavar="P",
                     help="coin grid; bare flag uses the default 10-point grid")
@@ -1022,6 +1030,8 @@ def main(argv=None):
         cfg["seed"] = args.seed
     if args.weight_decay is not None:
         cfg["weight_decay"] = args.weight_decay
+    if args.accelerator is not None:
+        cfg["accelerator"] = args.accelerator
 
     # Neither flag given: run both grids, which is the plan's default sweep.
     both = args.sweep_coin is None and args.sweep_flower is None
@@ -1090,13 +1100,17 @@ def main(argv=None):
         return
 
     if not args.plots_only:
-        with open(os.path.join(out_root, f"run_config_{args.config}.json"), "w") as f:
-            json.dump({"config": args.config, "repeats": args.repeats,
-                       "base_seed": cfg["seed"], "khat": args.khat,
-                       "coin_grid": coin_grid, "flower_grid": flower_grid,
-                       "n_processes": len(specs),
-                       "utc": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
-                       **{k: v for k, v in cfg.items()}}, f, indent=2, default=str)
+        # REMAINING_WORK_PLAN.md C3: merge, do not overwrite.  --sweep-coin alone
+        # must not erase the flower grid this folder also holds.
+        save_run_config(
+            os.path.join(out_root, f"run_config_{args.config}.json"),
+            {"config": args.config, "repeats": args.repeats,
+             "base_seed": cfg["seed"], "khat": args.khat,
+             "coin_grid": coin_grid, "flower_grid": flower_grid,
+             "n_processes": len(specs),
+             "utc": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
+             **{k: v for k, v in cfg.items()}},
+            keep_if_unset=("coin_grid", "flower_grid"))
 
         t0 = time.time()
         t_save = [0.0]          # mutable so the inner loop can update it

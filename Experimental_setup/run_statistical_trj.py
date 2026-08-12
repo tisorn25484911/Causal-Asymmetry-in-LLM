@@ -141,7 +141,7 @@ from Model_analysis import (
 )
 from utils import (
     cleanup, coin_tag, entropy_rate_coin, flower_tag, mkdir, repo_path,
-    save_pkl, to_cpu_for_analysis,
+    save_pkl, save_run_config, to_cpu_for_analysis,
 )
 from Training_model import (
     _eval_loss_on_loader, diagnose_divergence, make_analysis_loader,
@@ -947,6 +947,16 @@ def parse_args(argv=None):
     ap.add_argument("--khat", action="store_true",
                     help="also recover k-hat / S_hat from the predictive "
                          "distribution (slower, better estimator)")
+    ap.add_argument("--accelerator", default=None,
+                    choices=["auto", "cpu", "mps", "gpu"],
+                    help="override cfg['accelerator'].  'cpu' is the only "
+                         "bit-reproducible setting -- MPS reductions are "
+                         "non-deterministic (README 1.3), so exact run-to-run "
+                         "comparison needs this.  Default: the config's value, "
+                         "i.e. unchanged behaviour.")
+    ap.add_argument("--redo", action="store_true",
+                    help="retrain from scratch, discarding stored repeats "
+                         "(default is to resume; REMAINING_WORK_PLAN.md C2)")
     ap.add_argument("--plots-only", action="store_true",
                     help="redraw every figure from the saved pickle, no training")
     ap.add_argument("--verbose", action="store_true",
@@ -968,6 +978,52 @@ def select_specs(specs: list, only) -> list:
     return keep
 
 
+def resumable(prev: dict | None, spec: dict, cfg: dict, args) -> tuple[bool, str]:
+    """
+    May the repeats stored in `prev` be extended by this invocation?
+
+    REMAINING_WORK_PLAN.md C2.  This harness used to retrain every selected
+    process from scratch, discarding completed repeats.  Resuming is a large
+    saving (~20 min per process at 100 repeats) but it is only *sound* when the
+    stored repeats measure the same thing the new ones will: repeats are pooled
+    into one paired statistic, so silently mixing two different processes, two
+    base seeds, or two configs would corrupt delta_CE rather than merely waste
+    time.  A wrong resume is worse than no resume, so every identifying field is
+    checked and anything unrecognised refuses.
+
+    The seed check is the subtle one.  Repeat i uses seed = base_seed + i, so a
+    resume must CONTINUE that sequence.  If the stored seeds are not exactly
+    base..base+k-1 then the run was produced some other way and appending to it
+    would duplicate or skip seeds -- which breaks the pairing argument that makes
+    the whole comparison valid.
+    """
+    if not prev or not prev.get("runs"):
+        return False, "nothing stored"
+    if prev.get("config") != args.config:
+        return False, f"config {prev.get('config')!r} != {args.config!r}"
+    if prev.get("base_seed") != cfg["seed"]:
+        return False, f"base_seed {prev.get('base_seed')} != {cfg['seed']}"
+    if bool(prev.get("khat")) != bool(args.khat):
+        return False, "--khat differs"
+
+    old, new = prev.get("spec") or {}, spec
+    for k in ("kind", "p", "q", "n", "m", "num_token", "num_samples",
+              "seq_len", "max_epochs", "batch"):
+        if old.get(k) != new.get(k):
+            return False, f"spec differs at {k}: {old.get(k)!r} != {new.get(k)!r}"
+    od, nd = old.get("dice_probs"), new.get("dice_probs")
+    if (od is None) != (nd is None):
+        return False, "one spec has dice_probs and the other does not"
+    if od is not None and not np.array_equal(np.asarray(od), np.asarray(nd)):
+        return False, "different dice_probs (a different process)"
+
+    seeds = [r.get("seed") for r in prev["runs"]]
+    want = [cfg["seed"] + i for i in range(len(seeds))]
+    if seeds != want:
+        return False, "stored seeds are not a prefix of the seed sequence"
+    return True, ""
+
+
 def load_combined(path: str) -> dict:
     if not os.path.exists(path):
         return {}
@@ -984,6 +1040,8 @@ def main(argv=None):
     cfg  = dict(CONFIGS[args.config])
     if args.seed is not None:
         cfg["seed"] = args.seed
+    if args.accelerator is not None:
+        cfg["accelerator"] = args.accelerator
     # REORGANISATION_FIX_PLAN.md 4.2.  repo_path so a relative --out-root is
     # resolved against the repo root, not the cwd.  mkdir below is
     # exist_ok=True and load_combined treats a missing pickle as 'nothing done
@@ -999,14 +1057,16 @@ def main(argv=None):
     # Provenance next to the outputs, named per config so two configs sharing an
     # out_root cannot overwrite each other's record.
     if not args.plots_only:
-        with open(os.path.join(out_root,
-                               f"run_config_{args.config}.json"), "w") as f:
-            json.dump({"config": args.config, "repeats": args.repeats,
-                       "base_seed": cfg["seed"], "khat": args.khat,
-                       "processes": [s["tag"] for s in specs],
-                       "utc": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
-                       **{k: v for k, v in cfg.items()}},
-                      f, indent=2, default=str)
+        # REMAINING_WORK_PLAN.md C3: merge, do not overwrite.  A run with --only
+        # must not shrink the record to the one process it touched.
+        save_run_config(
+            os.path.join(out_root, f"run_config_{args.config}.json"),
+            {"config": args.config, "repeats": args.repeats,
+             "base_seed": cfg["seed"], "khat": args.khat,
+             "processes": [s["tag"] for s in specs],
+             "utc": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
+             **{k: v for k, v in cfg.items()}},
+            union_lists=("processes",))
 
     print(f"\n{'='*70}")
     print(f"  config={args.config}  repeats={args.repeats}  "
@@ -1041,10 +1101,31 @@ def main(argv=None):
             mkdir(odir)
         else:
             mkdir(odir)
-            rec = dict(spec=spec, config=args.config, base_seed=cfg["seed"],
-                       repeats=args.repeats, khat=args.khat, runs=[])
+            # ── resume (REMAINING_WORK_PLAN.md C2) ─────────────────────────
+            prev = combined.get(tag)
+            ok, why = (False, "--redo") if args.redo else resumable(prev, spec, cfg, args)
+            if ok:
+                rec = dict(prev)
+                rec["runs"] = list(prev["runs"])
+                rec["repeats"] = args.repeats
+                start = len(rec["runs"])
+            else:
+                rec = dict(spec=spec, config=args.config, base_seed=cfg["seed"],
+                           repeats=args.repeats, khat=args.khat, runs=[])
+                start = 0
+                if prev and prev.get("runs"):
+                    print(f"  ! NOT resuming ({why}) — retraining all "
+                          f"{args.repeats} repeats from scratch")
+            if start >= args.repeats:
+                print(f"  already has {start} >= {args.repeats} repeats — "
+                      f"skipping training (--redo to force)")
+            elif start:
+                print(f"  resuming: {start} repeat(s) kept, training "
+                      f"{args.repeats - start} more (seeds "
+                      f"{cfg['seed']+start}..{cfg['seed']+args.repeats-1})")
+
             t_proc = time.time()
-            for i in range(args.repeats):
+            for i in range(start, args.repeats):
                 seed = cfg["seed"] + i
                 t0 = time.time()
                 with quiet(not args.verbose):
@@ -1057,7 +1138,10 @@ def main(argv=None):
                             f"({'fw' if run['fw']['diverged'] else ''}"
                             f"{'bw' if run['bw']['diverged'] else ''})")
                 done = i + 1
-                eta = (time.time() - t_proc) / done * (args.repeats - done) / 60
+                # Rate over what THIS session trained, not over `done`, which
+                # includes resumed repeats that cost no time here.
+                trained = i - start + 1
+                eta = (time.time() - t_proc) / trained * (args.repeats - done) / 60
                 extra = ""
                 if args.khat:
                     extra = (f"  k̂ {run['fw'].get('k_hat')}/"

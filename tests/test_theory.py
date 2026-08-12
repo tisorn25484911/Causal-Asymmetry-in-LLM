@@ -10,6 +10,7 @@ added because those are the two bugs that were silent in production.
 
 import math
 import os
+import pickle
 import sys
 
 import numpy as np
@@ -870,3 +871,169 @@ def test_old_checkpoints_still_load():
                       max_len=meta["max_len"], n_layers=meta["n_layers"],
                       mode="forward")
     m.load_state_dict(torch.load(paths[0], map_location="cpu"))
+
+
+# ═══════════════════════════════════════════════════════════════════════════
+# REMAINING_WORK_PLAN.md Phase 0 — the repair work these lock in
+# ═══════════════════════════════════════════════════════════════════════════
+def test_repo_path_anchors_relative_and_passes_absolute():
+    """REORGANISATION_FIX_PLAN 4.2.  Output paths must not depend on the cwd."""
+    from utils import REPO_ROOT, repo_path
+    assert repo_path("/tmp/scratch") == "/tmp/scratch"
+    assert repo_path("All_Results/x") == os.path.join(REPO_ROOT, "All_Results/x")
+    assert os.path.isdir(os.path.join(REPO_ROOT, "Transformer_model"))
+
+
+def test_every_default_out_root_resolves_to_existing_data():
+    """
+    A default out_root that resolves to a NEW EMPTY directory is the silent
+    failure that cost a 23 h sweep: mkdir is exist_ok=True and a missing pickle
+    reads as "nothing done yet", so the run restarts instead of resuming.
+    """
+    from configs import CONFIGS
+    from utils import repo_path
+    import run_statistical_trj as trj
+    import run_sweep_experiment as swp
+    roots = [CONFIGS[c]["out_root"] for c in ("SMOKE", "QUICK", "LARGE")]
+    roots += [trj.OUT_ROOT_DEFAULT, swp.OUT_ROOT_DEFAULT]
+    for rel in roots:
+        assert rel.startswith("All_Results/"), f"{rel} is not under All_Results/"
+        p = repo_path(rel)
+        assert os.path.isdir(p), f"default out_root does not exist: {p}"
+        assert os.listdir(p), f"default out_root is empty: {p}"
+
+
+def test_every_entry_point_imports_without_pythonpath():
+    """
+    The test that would have caught the reorganisation breakage.  PYTHONPATH is
+    scrubbed so the shell environment cannot mask a missing bootstrap.
+    """
+    import glob
+    import subprocess
+    from utils import REPO_ROOT
+    env = {k: v for k, v in os.environ.items() if k != "PYTHONPATH"}
+    targets = []
+    for d in ("Experimental_setup", "Transformer_model"):
+        for f in sorted(glob.glob(os.path.join(REPO_ROOT, d, "*.py"))):
+            if "__main__" in open(f).read():
+                targets.append((d, os.path.basename(f)[:-3]))
+    assert len(targets) >= 8, f"expected the known entry points, found {targets}"
+    for d, mod in targets:
+        r = subprocess.run([sys.executable, "-c",
+                            f"import sys; sys.path.insert(0, {os.path.join(REPO_ROOT, d)!r}); "
+                            f"import {mod}"],
+                           capture_output=True, text=True, env=env, cwd="/")
+        assert r.returncode == 0, f"{d}/{mod}.py fails to import:\n{r.stderr[-600:]}"
+
+
+def test_save_pkl_is_atomic(tmp_path):
+    """
+    C1.  A crash mid-write must leave the previous bundle intact.  The old
+    implementation truncated on open(), so this is the regression that matters.
+    """
+    from utils import save_pkl
+    p = str(tmp_path / "bundle.pkl")
+    save_pkl({"generation": 1}, p)
+    original = open(p, "rb").read()
+
+    class Boom:
+        def __reduce__(self):
+            raise KeyboardInterrupt("simulated interrupt mid-dump")
+
+    with pytest.raises(KeyboardInterrupt):
+        save_pkl({"generation": 2, "bad": Boom()}, p)
+    assert open(p, "rb").read() == original, "the old bundle was damaged"
+    assert pickle.load(open(p, "rb"))["generation"] == 1
+    assert not list(tmp_path.glob("*.tmp.*")), "a temp file was left behind"
+
+
+def test_save_run_config_merges_instead_of_overwriting(tmp_path):
+    """
+    C3.  A coin-only invocation must not erase the flower grid recorded by an
+    earlier run into the same folder -- that is how results_sweep lost its coin
+    provenance while its pickle held 100 coin cells.
+    """
+    import json as _json
+    from utils import save_run_config
+    p = str(tmp_path / "run_config_QUICK.json")
+    save_run_config(p, {"coin_grid": [0.25], "flower_grid": None, "repeats": 1,
+                        "processes": ["a"]},
+                    keep_if_unset=("coin_grid", "flower_grid"),
+                    union_lists=("processes",))
+    save_run_config(p, {"coin_grid": None, "flower_grid": [2, 4], "repeats": 1,
+                        "processes": ["b"]},
+                    keep_if_unset=("coin_grid", "flower_grid"),
+                    union_lists=("processes",))
+    d = _json.load(open(p))
+    assert d["coin_grid"] == [0.25], "the earlier grid was erased"
+    assert d["flower_grid"] == [2, 4]
+    assert d["processes"] == ["a", "b"], "the process list did not accumulate"
+    assert len(d["invocations"]) == 2
+
+
+def test_trajectory_resume_refuses_incompatible_records():
+    """
+    C2.  Repeats are pooled into one paired statistic, so resuming across a
+    different process, base seed or config would corrupt delta_CE rather than
+    merely waste time.  A wrong resume is worse than no resume.
+    """
+    from configs import CONFIGS
+    import run_statistical_trj as trj
+
+    class Args:
+        config, khat, redo = "SMOKE", False, False
+
+    cfg = dict(CONFIGS["SMOKE"]); cfg["seed"] = 0
+    spec = trj.flower_spec(cfg, 2, 6)
+    good = dict(spec=spec, config="SMOKE", base_seed=0, khat=False,
+                runs=[{"seed": 0}, {"seed": 1}])
+    assert trj.resumable(good, spec, cfg, Args)[0] is True
+
+    for label, prev, c in [
+            ("base_seed",  good,                              {**cfg, "seed": 7}),
+            ("config",     {**good, "config": "QUICK"},       cfg),
+            ("khat",       {**good, "khat": True},            cfg),
+            ("dice",       {**good, "spec": trj.flower_spec({**cfg, "flower_dice_seed": 999}, 2, 6)}, cfg),
+            ("n,m",        {**good, "spec": trj.flower_spec(cfg, 2, 8)}, cfg),
+            ("seed gap",   {**good, "runs": [{"seed": 0}, {"seed": 5}]}, cfg),
+            ("empty",      {**good, "runs": []},              cfg)]:
+        ok, why = trj.resumable(prev, spec, c, Args)
+        assert ok is False, f"resume wrongly allowed across differing {label}"
+        assert why, "a refusal must say why"
+
+
+def test_flower_merge_default_is_the_historical_rule():
+    """
+    C10.  `merge_tol=None` must reproduce the round-to-9-decimals rule exactly,
+    including for spiky dice where the two rules genuinely disagree -- every C-
+    the repo has reported was computed that way.
+    """
+    from Model_analysis import flower_complexity
+    from utils import entropy_bits
+
+    def historical(n, m, dp):
+        dp = np.asarray(dp, dtype=float)
+        pi, col, merged = dp.mean(axis=0), dp.sum(axis=0), {}
+        for j in range(m):
+            if col[j] <= 0:
+                continue
+            key = tuple(np.round(dp[:, j] / col[j], 9))
+            merged[key] = merged.get(key, 0.0) + pi[j]
+        return 1.0 + 0.5 * entropy_bits(list(merged.values()))
+
+    for alpha in (0.2, 1.0, 5.0):
+        for n in (1, 2, 4, 6):
+            for m in (2, 4, 8):
+                for seed in (0, 7, 74):
+                    dp = np.random.default_rng(seed).dirichlet(np.full(m, alpha), size=n)
+                    assert flower_complexity(n, m, dice_probs=dp)[1] == historical(n, m, dp)
+
+
+def test_flower_null_control_holds_under_both_merge_rules():
+    """The n=1 process is exactly time-reversible; C- must equal C+ either way."""
+    from Model_analysis import flower_complexity
+    for m in (2, 4, 8):
+        dp = np.full((1, m), 1.0 / m)
+        for tol in (None, 1e-9, 1e-6):
+            cp, cm = flower_complexity(1, m, dice_probs=dp, merge_tol=tol)
+            assert abs(cm - cp) < 1e-12, f"null control broken at m={m}, tol={tol}"
