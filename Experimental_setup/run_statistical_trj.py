@@ -186,16 +186,29 @@ def coin_spec(cfg: dict, p: float, q: float) -> dict:
     )
 
 
-def flower_spec(cfg: dict, n: int, m: int) -> dict:
+def flower_spec(cfg: dict, n: int, m: int,
+                dice_seed: int | None = None, dice_alpha: float = 1.0) -> dict:
     """
     Everything about one flower process that does not depend on the repeat.
 
     The dice come from cfg["flower_dice_seed"], exactly as in
     run_experiments.experiment_2, so this is the same process that run trained
     on rather than a new one with the same (n, m).
+
+    `dice_seed` / `dice_alpha` override that draw, for the dice-axis experiment
+    (REMAINING_WORK_PLAN.md S1 / run_dice_experiment.py).  They exist because
+    C- - C+ = [H(pi_outcome) - log2 n] / 2 depends on how much the n dice OVERLAP,
+    not only on (n, m) -- so the theoretical asymmetry can be varied with (n, m)
+    held completely fixed, which is the only way to separate it from m - n.
+
+    The defaults reproduce the original draw exactly: dice_seed=None uses
+    cfg["flower_dice_seed"], and np.full(m, 1.0) is elementwise identical to
+    np.ones(m).  Verified against the behaviour fingerprint, so every existing
+    result is unaffected.
     """
-    dice_probs = np.random.default_rng(cfg["flower_dice_seed"]).dirichlet(
-        np.ones(m), size=n)
+    seed = cfg["flower_dice_seed"] if dice_seed is None else dice_seed
+    dice_probs = np.random.default_rng(seed).dirichlet(
+        np.full(m, float(dice_alpha)), size=n)
     C_plus, C_minus = flower_complexity(n, m, dice_probs)
     return dict(
         tag         = flower_tag("traj", n, m),
@@ -215,6 +228,11 @@ def flower_spec(cfg: dict, n: int, m: int) -> dict:
         C_plus      = C_plus,
         C_minus     = C_minus,
         theory      = flower_entropy_rate(n, m, dice_probs),
+        # Provenance for the dice-axis experiment.  `None` means "the config's
+        # flower_dice_seed", i.e. the historical process, so an old record and a
+        # new one are distinguishable without guessing.
+        dice_seed   = dice_seed,
+        dice_alpha  = float(dice_alpha),
     )
 
 

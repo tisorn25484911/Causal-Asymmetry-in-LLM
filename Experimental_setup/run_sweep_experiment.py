@@ -1138,6 +1138,13 @@ def parse_args(argv=None):
                          "non-deterministic (README 1.3), so exact run-to-run "
                          "comparison needs this.  Default: the config's value, "
                          "i.e. unchanged behaviour.")
+    ap.add_argument("--d-model", type=int, default=None,
+                    help="override cfg['d_model'].  The residual argument "
+                         "(README 1.2) predicts |delta_CE| shrinks as capacity "
+                         "grows, and that has never been measured -- see "
+                         "REMAINING_WORK_PLAN.md S5.  Give each capacity its "
+                         "OWN --out-root: tags do not encode d_model, so two "
+                         "capacities in one folder overwrite each other.")
     ap.add_argument("--out-root", default=OUT_ROOT_DEFAULT)
     ap.add_argument("--sweep-coin", nargs="*", default=None, metavar="P",
                     help="coin grid; bare flag uses the default 10-point grid")
@@ -1183,6 +1190,8 @@ def main(argv=None):
         cfg["seed"] = args.seed
     if args.weight_decay is not None:
         cfg["weight_decay"] = args.weight_decay
+    if args.d_model is not None:
+        cfg["d_model"] = args.d_model
     if args.accelerator is not None:
         cfg["accelerator"] = args.accelerator
 
@@ -1203,6 +1212,20 @@ def main(argv=None):
     # load_combined returns {} for a missing pickle, so a stale relative path
     # would silently discard every completed repeat and re-run the full grid.
     out_root = mkdir(repo_path(args.out_root))
+    # REMAINING_WORK_PLAN.md S5.  Tags are a function of the process, not of
+    # d_model, and the store is keyed by tag -- so mixing capacities in one
+    # out_root silently overwrites.  Refuse rather than corrupt.
+    if args.d_model is not None and args.d_model != CONFIGS[args.config]["d_model"]:
+        import re as _re
+        _tokens = {int(t) for t in _re.findall(r"(?:^|[^0-9a-zA-Z])d0*(\d+)", out_root)}
+        if args.d_model not in _tokens:
+            raise SystemExit(
+                f"--d-model {args.d_model} differs from the {args.config} default "
+                f"({CONFIGS[args.config]['d_model']}) but --out-root is "
+                f"{out_root!r}, whose name does not mention d{args.d_model}.\n"
+                f"    Tags do not encode d_model, so this would overwrite the "
+                f"other capacity's results.\n"
+                f"    Use e.g. --out-root .../d{args.d_model:03d}")
     combined_path = os.path.join(out_root, "all_sweep.pkl")
     combined = load_combined(combined_path)
 
