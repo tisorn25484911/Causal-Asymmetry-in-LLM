@@ -557,6 +557,103 @@ def mixed_windows(rows: list) -> bool:
     return len({r.get("burn_used") for r in rows}) > 1
 
 
+def weighted_slope(rows: list, key: str, sem_key: str | None = None) -> dict:
+    """
+    Inverse-variance weighted least squares of `key` on the theoretical gap.
+
+    REMAINING_WORK_PLAN.md S3.  The unweighted fit this supplements is not
+    trustworthy here, and the reason is measurable: on the 81-cell flower grid the
+    per-cell sems span 249x (0.00038 to 0.09442).  OLS assumes they are equal, so
+    a handful of unstable cells dominate the residual variance and flatten the
+    slope --
+
+        OLS, all 81 cells        b = +0.00344 +/- 0.00248   t = +1.38   (reads null)
+        OLS, unstable dropped    b = +0.00317 +/- 0.00025   t = +12.7
+        WLS, all 81 cells        b = +0.00294 +/- 0.00016   t = +18.9
+
+    -- and the WLS estimate is identical with or without the unstable filter,
+    because weighting down-weights those cells instead of discarding them.  That
+    is the right estimator when the y-errors are known and heteroscedastic, which
+    is exactly this situation: every point carries its own measured sem.
+
+    `unstable_mask` is kept for the FIGURES, where clipping the y-range genuinely
+    aids reading, but it no longer decides which cells enter the inference.
+    """
+    sem_key = sem_key or f"{key}_sem"
+    x = np.asarray([r["gap"] for r in rows], float)
+    y = np.asarray([r.get(key, np.nan) for r in rows], float)
+    s = np.asarray([r.get(sem_key, np.nan) for r in rows], float)
+    ok = np.isfinite(x) & np.isfinite(y) & np.isfinite(s) & (s > 0)
+    if ok.sum() < 4:
+        return {}
+    x, y, s = x[ok], y[ok], s[ok]
+    w = 1.0 / s ** 2
+    X = np.vstack([x, np.ones_like(x)]).T
+    XtW = X.T * w
+    try:
+        beta = np.linalg.solve(XtW @ X, XtW @ y)
+        cov = np.linalg.inv(XtW @ X)
+    except np.linalg.LinAlgError:
+        return {}
+    b, a = float(beta[0]), float(beta[1])
+    b_se, a_se = float(np.sqrt(cov[0, 0])), float(np.sqrt(cov[1, 1]))
+    # chi2/dof > 1 says the scatter exceeds the quoted sems, i.e. there is
+    # process-to-process variation the error bars do not account for.
+    resid = y - (b * x + a)
+    chi2 = float(np.sum(w * resid ** 2))
+    dof = max(len(x) - 2, 1)
+    return dict(slope=b, slope_se=b_se, t=b / b_se if b_se > 0 else float("nan"),
+                intercept=a, intercept_se=a_se, n=int(len(x)),
+                chi2_dof=chi2 / dof, sem_ratio=float(s.max() / s.min()))
+
+
+def block_bootstrap_rho(rows: list, key: str, n_boot: int = 2000,
+                        seed: int = 0) -> dict:
+    """
+    Spearman rho with a confidence interval from resampling grid ROWS, not cells.
+
+    REMAINING_WORK_PLAN.md S6.  The flower grid is a 9x9 lattice over (n,m) of a
+    SMOOTH deterministic function of the process parameters, with one dice draw
+    per cell, so neighbouring cells are near-duplicate processes.  The effective
+    degrees of freedom are far below the cell count and the nominal Spearman
+    p-value -- 1.9e-21 on 81 cells -- is correspondingly anti-conservative.  The
+    module docstring has always said so; this reports a number that acts on it.
+
+    Resampling whole rows (all cells sharing an `n`, or sharing a `p` for the
+    coins) keeps within-row dependence intact instead of assuming it away.  It is
+    a blunt instrument -- rows are not independent of each other either -- but it
+    is honest in the right direction, which the nominal p-value is not.
+    """
+    rows = [r for r in rows if np.isfinite(r.get(key, np.nan))]
+    if len(rows) < 8:
+        return {}
+    block_of = (lambda r: r["n"]) if rows[0]["kind"] == "flower" else (lambda r: r["p"])
+    blocks: dict = {}
+    for r in rows:
+        blocks.setdefault(block_of(r), []).append(r)
+    keys = list(blocks)
+    if len(keys) < 3:
+        return {}
+    rng = np.random.default_rng(seed)
+    obs = _spearman([r["gap"] for r in rows], [r[key] for r in rows])[0]
+    draws = []
+    for _ in range(n_boot):
+        pick = rng.choice(len(keys), size=len(keys), replace=True)
+        sub = [r for i in pick for r in blocks[keys[i]]]
+        rho = _spearman([r["gap"] for r in sub], [r[key] for r in sub])[0]
+        if np.isfinite(rho):
+            draws.append(rho)
+    if len(draws) < 100:
+        return {}
+    draws = np.sort(np.asarray(draws))
+    lo, hi = np.percentile(draws, [2.5, 97.5])
+    # A sign test is what the hypothesis actually predicts, so report the
+    # fraction of resamples that keep the observed sign.
+    same_sign = float(np.mean(np.sign(draws) == np.sign(obs))) if obs else float("nan")
+    return dict(rho=float(obs), lo=float(lo), hi=float(hi), n_blocks=len(keys),
+                n_boot=len(draws), sign_stability=same_sign)
+
+
 def correlations(rows: list, key: str, drop_pooled: bool = False) -> list:
     """
     (label, rho, p, n) for the pooled and the within-family tests.
@@ -942,6 +1039,62 @@ def print_sweep_summary(rows: list, out_root: str):
                 print(f"      {lbl:<14} n/a (nothing to control for on this grid)")
                 continue
             print(f"      {lbl:<14} rho={rho:+.3f}  p={p:.4f}  n={n}{flag}")
+
+    # ── the slope, properly weighted, and rho with an honest interval ───────
+    # REMAINING_WORK_PLAN.md S3 and S6.  rho above answers "is it monotone?";
+    # these answer "how big is it, and how sure are we given that neighbouring
+    # cells are near-duplicates?"  Both are per family, because a pooled slope
+    # would be fitting across two different vocabularies and entropy ranges.
+    print(f"\n{'-'*118}\n  HOW BIG, AND HOW SURE?  inverse-variance weighted "
+          f"slope of delta_CE on C- - C+\n{'-'*118}")
+    print(f"  {'family':<10}{'n':>4}{'WLS slope':>13}{'se':>9}{'t':>8}"
+          f"{'intercept':>12}{'se':>9}{'chi2/dof':>10}{'sem ratio':>11}")
+    for fam in ("flower", "coin"):
+        sub = [r for r in rows if r["kind"] == fam]
+        w = weighted_slope(sub, "dce")
+        if not w:
+            continue
+        print(f"  {fam:<10}{w['n']:>4}{w['slope']:>+13.5f}{w['slope_se']:>9.5f}"
+              f"{w['t']:>+8.2f}{w['intercept']:>+12.5f}{w['intercept_se']:>9.5f}"
+              f"{w['chi2_dof']:>10.2f}{w['sem_ratio']:>10.0f}x")
+        ols = sstats.linregress([r["gap"] for r in sub if np.isfinite(r["dce"])],
+                                [r["dce"] for r in sub if np.isfinite(r["dce"])])
+        print(f"    {'':<8}unweighted OLS for comparison: "
+              f"b={ols.slope:+.5f} +/- {ols.stderr:.5f}  t={ols.slope/ols.stderr:+.2f}"
+              + ("   <- the sem spread makes this the wrong estimator"
+                 if w["sem_ratio"] > 10 else ""))
+        bs = block_bootstrap_rho(sub, "dce")
+        if bs:
+            print(f"    {'':<8}rho={bs['rho']:+.3f}, block-bootstrap 95% CI "
+                  f"[{bs['lo']:+.3f}, {bs['hi']:+.3f}] over {bs['n_blocks']} "
+                  f"grid rows; sign stable in {bs['sign_stability']*100:.0f}% "
+                  f"of resamples")
+    print("    chi2/dof > 1 means the scatter exceeds the quoted sems, i.e. there")
+    print("    is process-to-process variation the error bars do not capture.")
+
+    # ── what the coin grid is actually measuring ───────────────────────────
+    # REMAINING_WORK_PLAN.md S2.  Reported here rather than left to the reader,
+    # because the raw coin rho has the WRONG SIGN and vanishes under control.
+    coin = [r for r in rows if r["kind"] == "coin" and np.isfinite(r["dce"])]
+    if len(coin) >= 8:
+        g = [r["gap"] for r in coin]; d = [r["dce"] for r in coin]
+        h = [r["theory"] for r in coin]
+        raw = _spearman(g, d); par = _partial_spearman(g, d, h); hce = _spearman(h, d)
+        print(f"\n{'-'*118}\n  THE COIN GRID IS A CONFOUND CONTROL, NOT EVIDENCE"
+              f"\n{'-'*118}")
+        print(f"  corr(C- - C+, H_inf) = {np.corrcoef(g, h)[0,1]:+.3f}  on this grid")
+        print(f"  raw      rho(gap, dCE) = {raw[0]:+.3f}  p={raw[1]:.2g}")
+        print(f"  partial  rho | H_inf   = {par[0]:+.3f}  p={par[1]:.2f}")
+        print(f"           rho(H_inf,dCE)= {hce[0]:+.3f}  p={hce[1]:.2g}")
+        if abs(par[0]) < abs(raw[0]) / 2:
+            print("  Reading: the raw coin trend is an H_inf artefact -- at a fixed step")
+            print("  budget, higher-entropy processes sit further from convergence and")
+            print("  their two arms' residuals differ differently.  Controlling for")
+            print("  H_inf removes it.  This grid therefore contributes no evidence")
+            print("  about causal asymmetry; it is a positive control showing the")
+            print("  measurement DOES respond to entropy rate, which is precisely why")
+            print("  the flower grid -- where corr(gap, H_inf) ~ 0 -- carries the claim.")
+            print("  Never quote a coin rho without its partial.")
 
     n_neg = sum(r["gap"] < -0.01 for r in rows)
     n_match = sum(r["verdict"] == "match" for r in rows)
