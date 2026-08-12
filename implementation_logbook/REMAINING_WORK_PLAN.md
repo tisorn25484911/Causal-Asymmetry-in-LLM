@@ -2,7 +2,11 @@
 
 **Written:** 2026-08-12, immediately after the reorganisation fix
 (`REORGANISATION_FIX_PLAN.md`) was committed.
-**Status:** audit complete, nothing here is implemented yet.
+**Status: Phases 0-3 EXECUTED 2026-08-12.** See
+[Execution record](#execution-record) at the bottom: what landed, what the data
+said, and the **three places where executing the plan corrected the plan** — S4
+most importantly, whose conclusion was drawn from the wrong estimator and is now
+reversed.
 
 Every number in this document was computed from the stored results or read out of
 the code during this audit. Where something is an inference rather than a
@@ -558,3 +562,83 @@ moves.
 - **Packaging the repo.** Verified during the reorganisation fix that no pickle or
   checkpoint references a repo class, so it is *safe* — but it buys nothing this
   project needs.
+
+
+---
+
+## Execution record
+
+Phases 0-3 were implemented and committed on 2026-08-12
+(`0df90c6`, `d848d6e`, `b44c89c`). Every change was gated on a before/after
+**behaviour fingerprint** — spec construction, a CPU-deterministic trained repeat,
+and aggregation over the stored results — which stayed byte-identical throughout,
+so nothing here moved an existing measurement. Tests went 66 → 74.
+
+### Corrections that executing the plan forced
+
+**S4 was wrong, and this is the substantive one.** The plan concluded "weight decay
+changes the variance, not the sensitivity" from the OLS fit. Building the
+decomposition properly, with the inverse-variance slope the plan itself argued for
+in S3, reverses that for λ = 1:
+
+| λ | 0 | 0.03 | 0.10 | 0.30 | 1.00 |
+|---|---|---|---|---|---|
+| flower b | +.00255 | +.00265 | +.00206 | +.00302 | **+.00503** |
+| coin b | −.00169 | −.00153 | −.00137 | −.00172 | **−.00404** |
+
+b is flat for λ ≤ 0.3 — that part stands, and it does rule out mild regularisation
+as an explanation for the near-null ΔCE. But at λ = 1 it roughly **doubles** in both
+families (like-for-like on the shared 25 cells, z = +5.91). That is not weight decay
+revealing causal structure: it amplifies the **coin** slope just as much, and the
+coin trend is a known H∞ artefact. It is a scale effect from degraded training —
+corroborated by the unstable-cell count going 2 → 7 and the coin intercept becoming
+a real offset (+0.00088 ± 0.00009) only at λ = 1. Reducing effective capacity does
+appear to enlarge ΔCE, which is what the residual argument predicts, so this raises
+the value of the d_model sweep rather than substituting for it.
+
+**C4 was half wrong.** The plan said the λ = 0.1 and 0.3 figures predated the
+`unstable_mask` fix. Checking timestamps against the commit that introduced it
+(`1ccbaed`, 08-11 12:38): only **wd1.000** was stale (06:11). Now finished and
+redrawn — 125/125 processes, no partials, baseline cross-check passing.
+
+**C10 was a scientific question, not a bug.** The plan proposed replacing the
+exact-equality merge with a tolerance. Measuring first showed the rounding rule is
+robust to 1e-10 perturbations, and that the knife-edge case is unreachable from the
+Dirichlet generator (0/3000 draws). More importantly, a tolerance *changes results*
+where it fires: at α = 0.2, (2,8), seed 74 two outcomes differ by 6.4e-10, and the
+rules give C⁻ = 2.1041 vs 2.0748 — 0.029 bits. Both readings are defensible, so
+`merge_tol` is now an explicit opt-in parameter with the historical rule as the
+default (verified byte-exact over 5400 draws), and the trade-off is documented in
+`HOW_TO_RUN.md` §4.5 rather than decided silently.
+
+### What landed beyond the plan
+
+- **`--accelerator`** on both runners. README §1.3 tells you to set
+  `accelerator="cpu"` for reproducibility but the only way was editing
+  `configs.py` — and without it the resume-equivalence test was not even
+  measurable, since MPS reductions are non-deterministic.
+- **`--dry-run` now prints the resume plan.** It was computed after the early
+  return, so the one flag whose job is "tell me what you're about to do" could not
+  answer the expensive question.
+- **A collision guard on `--d-model`.** Tags encode the process, not the capacity,
+  and the store is keyed by tag, so two capacities in one out-root would overwrite.
+  The runners refuse unless the out-root names the capacity.
+- **`resumable()` refuses across incompatible records** — different config, base
+  seed, `--khat`, (n,m), dice, or a seed sequence that is not a prefix. Repeats are
+  pooled into one paired statistic, so a wrong resume corrupts ΔCE, which is worse
+  than no resume. Verified bit-identical to training straight through, and all
+  eight refusal paths tested.
+
+### Still open
+
+- **Phase 2 result.** `run_dice_experiment.py` is implemented, its design verified
+  (corr(gap, H∞) falls from +0.526/+0.484 to +0.033/+0.055 inside the H∞ band, with
+  both signs present in both cells), and the run is in progress. The within-cell
+  slope is the number that decides whether the flower trend is causal asymmetry or
+  `m − n`.
+- **Phase 3 run.** The flag, the guard and `analyse_capacity.py` are in; the
+  capacity sweep itself has not been run. It should follow Phase 2, on the cells
+  Phase 2 shows are worth it.
+- **Phase 4.** C7 (`reverse_pos_for_backward` A/B — needs training, so deferred to
+  avoid competing with Phase 2), C5 (a launcher in the repo), S9 (per-step norm
+  logging), S10 (promote k̂ over S_emp), C9 (the structural moves).

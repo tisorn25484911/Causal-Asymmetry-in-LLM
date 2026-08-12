@@ -18,6 +18,9 @@ state of the repository.
 6. [Running the controls](#6-running-the-controls)
 7. [Running the seed-repeat harness](#7-running-the-seed-repeat-harness)
 8. [The parameter sweep](#8-the-parameter-sweep)
+   - 8A. [The dice-axis experiment — separating C⁻−C⁺ from m−n](#8a-the-dice-axis-experiment--separating-cc-from-mn)
+   - 8B. [The capacity axis — the direct test of the residual argument](#8b-the-capacity-axis--the-direct-test-of-the-residual-argument)
+   - 8C. [Weight decay across λ](#8c-weight-decay-across-λ)
 9. [Generating the causal-state figures](#9-generating-the-causal-state-figures)
 10. [The post-hoc evaluators](#10-the-post-hoc-evaluators)
 11. [Verification and documentation](#11-verification-and-documentation)
@@ -377,6 +380,36 @@ Weight decay is also the principled suppressant for the divergence of Section
 norm penalty restores one (measured 4/6 → 1/6 on the flower null control at 600
 steps). But at the 130 steps these harnesses run, divergence is already rare (3 in
 3,750 repeats), so that is not a reason to enable it.
+
+---
+
+### 4.5 When two flower outcomes count as one backward state
+
+`flower_complexity` decides that two outcomes share a backward causal state when
+they induce the same posterior over dice. The rule is a parameter:
+
+| `merge_tol` | rule | when to use it |
+|---|---|---|
+| `None` (default) | round the posterior to 9 decimals, require exact equality | **always, unless you have a reason** — every C⁻ this repo has reported uses it |
+| a float | group posteriors within that distance in max-norm | an explicitly operational reading, reported alongside the default |
+
+The two are not equivalent, and the difference is not academic. At Dirichlet
+α = 0.2, (n,m) = (2,8), seed 74, two outcomes have posteriors differing by
+**6.4 × 10⁻¹⁰**. The rounding rule calls them two backward states (C⁻ = 2.1041); a
+1e-9 tolerance calls them one (C⁻ = 2.0748) — a 0.029-bit difference in the x-axis
+of the whole experiment.
+
+Both readings are defensible. Exactly, an ε-machine is defined by exact conditional
+distributions, so distinct posteriors are distinct states. Operationally,
+distinguishing those two from data needs of order 10¹⁸ samples, so a finite-sample
+predictor cannot represent them separately — and the hypothesis is about what a
+*memory-bounded* model does.
+
+It matters only for spiky dice. Over 3600 Dirichlet(1.0) draws the two rules agree
+exactly, so nothing in the 81-cell grid or the seven-process harness is affected.
+Any experiment that deliberately uses small α should state which rule it used —
+`run_dice_experiment.py` writes `merge_tol` into its run config, and its selected
+dice were checked to give identical answers under both.
 
 ---
 
@@ -886,6 +919,192 @@ anti-conservative: C⁻ − C⁺ is a smooth function of (p,q) and (n,m), so
 neighbouring cells are near-duplicate processes and the effective degrees of
 freedom are well below 125.
 
+### 8.7 Which slope to quote
+
+The sweep prints two fits, and they disagree about whether there is a result at
+all:
+
+| estimator | n | slope b | t |
+|---|---|---|---|
+| unweighted OLS | 81 | +0.00344 ± 0.00248 | **+1.38** — reads null |
+| inverse-variance WLS | 81 | +0.00294 ± 0.00016 | **+18.9** |
+
+**Quote the WLS slope.** The per-cell sems span 249× on this grid (0.00038 to
+0.09442) because a few cells contain a diverged repeat. OLS assumes equal errors,
+so those cells dominate the residual variance and flatten the t-statistic. WLS
+gives the same estimate with or without `unstable_mask`, which is what you want
+from an estimator: the answer should not depend on a hand-set exclusion
+threshold.
+
+`chi²/dof` is printed beside it. At 2.17 (flower) and 4.35 (coin) the scatter
+exceeds the quoted sems, i.e. there is real process-to-process variation the per-
+cell error bars do not capture — so treat the WLS error as a lower bound.
+
+For ρ, quote the **block-bootstrap interval**, not the nominal p-value: ρ = +0.827
+with a 95% CI of [+0.638, +0.878] over 9 resampled grid rows, sign stable in 100%
+of resamples. Resampling rows rather than cells respects the near-duplicate
+structure; the nominal p = 1.9 × 10⁻²¹ does not.
+
+### 8.8 The coin grid is a control, not evidence
+
+The summary now says this outright, because the raw coin correlation has the
+**wrong sign** for the hypothesis and vanishes when controlled:
+
+```
+corr(C- - C+, H_inf) = +0.590
+raw      rho(gap, dCE) = -0.415   p = 1.8e-05
+partial  rho | H_inf   = +0.068   p = 0.50
+         rho(H_inf,dCE)= -0.793   p = 8.3e-23
+```
+
+At a fixed step budget, higher-entropy processes sit further from convergence and
+their two arms' residuals differ differently — so the coin grid is measuring how
+hard the process is, not how asymmetric. Read positively, that makes it a
+**confound control**: it demonstrates the measurement does respond to entropy
+rate, which is exactly why the flower grid, where corr(gap, H∞) = −0.010, is the
+axis that carries the claim. Never quote a coin ρ without its partial.
+
+---
+
+## 8A. The dice-axis experiment — separating C⁻−C⁺ from m−n
+
+```bash
+python Experimental_setup/run_dice_experiment.py --dry-run     # the design, no training
+python Experimental_setup/run_dice_experiment.py --repeats 30  # ~2.6 h, 20 processes
+python Experimental_setup/run_dice_experiment.py --plots-only
+```
+
+### 8A.1 Why it exists
+
+The flower sweep's ρ = +0.827 cannot distinguish two explanations, because on that
+grid
+
+```
+corr(C- - C+,  m - n) = +0.977      (spearman +0.986)
+```
+
+Anything that scales with `m − n` — token-frequency imbalance, how often each die
+is revisited, the ratio of selection to outcome tokens — reproduces the whole
+result. This is a property of the **design**, so no number of extra repeats fixes
+it.
+
+### 8A.2 How it escapes the confound
+
+C⁻ for the flower has a closed form,
+
+```
+C- = 1 + H(pi_outcome)/2       pi_outcome_j = (1/n) * sum_i dice_probs[i,j]
+so   C- - C+ = [ H(pi_outcome) - log2(n) ] / 2
+```
+
+which depends on how much the *n* dice overlap — not only on (n, m). Fix (n, m),
+vary only the dice, and `m − n`, vocabulary, C⁺, the forward state count, capacity
+and the step budget are all identical by construction while the gap still moves.
+
+Selecting the dice inside a narrow H∞ band removes the entropy-rate confound too.
+Measured over 3000 draws per cell:
+
+| cell | α | gap range in band | negatives | corr(gap, H∞) in band | unrestricted |
+|---|---|---|---|---|---|
+| (3,5) | 0.2 | −0.206 → +0.263 | 3 | **+0.033** | +0.526 |
+| (4,6) | 0.2 | −0.275 → +0.199 | 3 | **+0.055** | +0.484 |
+
+Both cells contain **both signs**, so this design can run a controlled sign test —
+the only thing the theory actually predicts — which the lattice grid cannot do
+anywhere.
+
+### 8A.3 Reading the result
+
+The reported statistic is the **within-cell** slope, plus a pooled fit that gives
+each cell its own intercept, so between-cell variation (where `m − n` lives) cannot
+contribute:
+
+- within-cell slope ≈ +0.0029 (the between-cell value) → the confounds are
+  exhausted; the trend is the theoretical gap.
+- within-cell slope ≈ 0 while the 81-cell grid still shows ρ = +0.83 → the flower
+  trend was `m − n` all along.
+- sign of ΔCE following sign of the gap inside one cell → the strongest available
+  outcome.
+
+### 8A.4 Two traps this file closes
+
+**Tags must carry the dice seed.** `sweep_specs` re-tags flower cells as
+`flower_tag("sweep", n, m)` — a function of (n, m) alone. Twenty realisations at
+one cell would collide on a single key, and since the result store is keyed by tag,
+nineteen would be silently overwritten. The dice runner tags as
+`dice_flower_n<N>_m<M>_s<SEED>`.
+
+**α = 0.2 is the merge-rule regime.** Spiky dice produce near-zero outcome masses,
+where C⁻ can depend on whether two vanishingly-rare outcomes count as one backward
+state — 0.029 bits at (2,8) seed 74. Checked for these exact dice: the two rules
+agree to 0.0e+00, and `merge_tol` is recorded in the run config regardless. See
+§4.5.
+
+---
+
+## 8B. The capacity axis — the direct test of the residual argument
+
+```bash
+for D in 8 16 32 64; do
+  python Experimental_setup/run_dice_experiment.py --repeats 30 --d-model $D \
+         --out-root All_Results/results_dice_cap/d$(printf %03d $D)
+done
+python Experimental_setup/analyse_capacity.py --root All_Results/results_dice_cap
+```
+
+§2.3 derives that ΔCE is a difference of **residuals**: H∞ is time-reversal
+invariant, so an unbounded predictor trained to convergence gives ΔCE = 0
+*regardless* of C⁻ − C⁺. A non-zero ΔCE is therefore a symptom of bounded memory,
+and that makes a sharp prediction nobody has tested — **|ΔCE| must shrink as
+`d_model` grows.**
+
+Until it is measured, every near-null ΔCE in this repo is ambiguous between
+
+- "this process pair is symmetric" (a result), and
+- "d_model = 32 was already enough for both arms" (no result),
+
+and nothing else here can break the tie. `sanity_check.py`'s own docstring flags
+the same gap for the positive control.
+
+**A flat profile would be the more interesting outcome**: it would falsify the
+residual argument as stated and mean ΔCE is measuring something that does not
+vanish with width — an optimisation asymmetry, say. So `analyse_capacity.py`
+reports the shape of the profile rather than testing only for the expected sign.
+
+Two operational points. `lr` is held **fixed** across capacities, which is what
+makes this a clean capacity manipulation and also means the extremes may be
+trained sub-optimally — so the divergence rate and mean settling step are printed
+per capacity, and a drift there is a caveat to state rather than a confound to
+hide. And each capacity **must** have its own `--out-root`: tags do not encode
+`d_model`, so the runners refuse unless the out-root names it (`d064` or `d64`).
+
+---
+
+## 8C. Weight decay across λ
+
+```bash
+python Experimental_setup/analyse_lambda_sweep.py --like-for-like
+```
+
+Fits ΔCE = a(λ) + b(λ)·(C⁻−C⁺) per λ and per family — the decomposition
+`WEIGHT_DECAY_PLAN.md` §6.2 asked for. On the shared 25 flower cells:
+
+| λ | 0 | 0.03 | 0.10 | 0.30 | 1.00 |
+|---|---|---|---|---|---|
+| flower b | +.00255 | +.00265 | +.00206 | +.00302 | **+.00503** |
+| coin b | −.00169 | −.00153 | −.00137 | −.00172 | **−.00404** |
+
+**b is flat for λ ≤ 0.3** — so mild regularisation is ruled out as an explanation
+for the near-null ΔCE; the signal was not being hidden by an unregularised fit.
+**At λ = 1 it roughly doubles in both families** (z = +5.91). That is *not* weight
+decay revealing causal structure: it amplifies the coin slope just as much, and
+the coin trend is a known H∞ artefact. It is a scale effect from degraded
+training, corroborated by the unstable-cell count going 2 → 7 and the coin
+intercept becoming a real offset (+0.00088 ± 0.00009) only at λ = 1.
+
+Use `--like-for-like` when comparing slopes: λ = 0 ran a 9×9 flower grid and the
+others 5×5, so an 81-point slope against a 25-point one confounds λ with grid size.
+
 ---
 
 ## 9. Generating the causal-state figures
@@ -1346,6 +1565,25 @@ python Experimental_setup/run_sweep_experiment.py --repeats 30         # ~7.6 h,
 python Experimental_setup/run_sweep_experiment.py --sweep-flower --repeats 30 --weight-decay 0.1 \
        --out-root All_Results/results_sweep_wd/wd0.100          # one lambda, ~3 h
 python Experimental_setup/run_sweep_experiment.py --plots-only         # redraw, no training
+
+# The dice axis (Section 8A) — separates C--C+ from m-n, ~2.6 h
+python Experimental_setup/run_dice_experiment.py --dry-run             # the design, no training
+python Experimental_setup/run_dice_experiment.py --repeats 30
+python Experimental_setup/run_dice_experiment.py --plots-only
+
+# The capacity axis (Section 8B) — the direct test of the residual argument
+for D in 8 16 32 64; do
+  python Experimental_setup/run_dice_experiment.py --repeats 30 --d-model $D \
+         --out-root All_Results/results_dice_cap/d$(printf %03d $D)
+done
+python Experimental_setup/analyse_capacity.py --root All_Results/results_dice_cap
+
+# Cross-lambda decomposition (Section 8C) — analysis only, no training
+python Experimental_setup/analyse_lambda_sweep.py --like-for-like
+
+# Reproducibility: 'cpu' is the only bit-reproducible accelerator (Section 1.3)
+python Experimental_setup/run_statistical_trj.py --repeats 4 --accelerator cpu \
+       --out-root /tmp/traj_check
 
 # Repeat statistics (Section 7)
 python Experimental_setup/run_statistical_trj.py                       # ~2.25 h, 7 x 100  ← done

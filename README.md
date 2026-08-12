@@ -845,6 +845,9 @@ Experimental_setup/               the drivers
 ├── sanity_check.py               positive and null controls
 ├── run_statistical_trj.py        seed-repeat harness, 7 processes x 100 repeats
 ├── run_sweep_experiment.py       125-process sweep: does measured track theoretical?
+├── run_dice_experiment.py        the dice axis — separates C⁻−C⁺ from m−n
+├── analyse_lambda_sweep.py       a(λ)/b(λ) decomposition across the weight-decay runs
+├── analyse_capacity.py           |ΔCE| against d_model — the residual-argument test
 ├── pq_experiment.py              the p-q grid sweep and its heatmaps
 └── LLM_asymmetry_testing.py      post-hoc metric suite (LaTeX figures)
 
@@ -860,6 +863,8 @@ All_Results/                      every results tree
 ├── results_trajectories/         run_statistical_trj.py, 7 x 100 repeats
 ├── results_sweep/                run_sweep_experiment.py at weight_decay 0
 ├── results_sweep_wd/wd<λ>/       the weight-decay sweep, one folder per λ
+├── results_dice/                 run_dice_experiment.py — (n,m) fixed, dice varied
+├── results_dice_cap/d<NNN>/      the capacity axis, one folder per d_model
 └── results/                      the original pre-refactor outputs
 
 Run_logs/                         run logs, requirements*.txt, run_all.sh
@@ -915,6 +920,10 @@ python Experimental_setup/run_statistical_trj.py --plots-only    # redraw its fi
 
 python Experimental_setup/run_sweep_experiment.py --dry-run      # 125-process coverage table
 python Experimental_setup/run_sweep_experiment.py --repeats 30   # ~7.6 h, the sweep (done)
+
+python Experimental_setup/run_dice_experiment.py --dry-run       # the dice design, no training
+python Experimental_setup/run_dice_experiment.py --repeats 30    # ~2.6 h  ← settles the m−n confound
+python Experimental_setup/analyse_lambda_sweep.py --like-for-like  # analysis only
 ```
 
 Every command is run from the repository root; see §8 and `HOW_TO_RUN.md` §1.2.
