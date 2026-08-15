@@ -106,7 +106,13 @@ from Data_generation import CoinDataset, coin_generation
 # used to carry a second, non-parametric copy of both, and every runner imported
 # the generator from there and the Dataset from here.
 from Flower_process_generation import FlowerDataset, flower_process_generation
+from DiscreteCausal_analysis import (
+    causal_state_report, plot_causal_states, plot_causal_states_pair,
+    print_state_summary,
+)
 from Model_analysis import (
+    causal_state_count,
+    coin_true_conditional,
     warm_up_umap,
     recover_causal_states,
     _sample_latents,
@@ -350,6 +356,21 @@ def analyse_model(tag, model, loader, num_token, out_dir,
     except Exception as e:
         print(f"  complexity failed: {e}")
         res["S_emp"] = float("nan")
+    # Explicit causal states, when the architecture has them.  Returns None for
+    # OneHotDecoder, so this is unconditional -- MODULAR_MODELS_PLAN.md 3.
+    csr = causal_state_report(model, loader, min_pos=5)
+    if csr is not None:
+        th = coin_true_conditional(p, q)[0 if mode == "forward" else 1] \
+             if (p is not None and q is not None) else None
+        plot_causal_states(csr, out_dir, tag, theory=th)
+        print_state_summary(csr, theory=th, label="  ")
+        res["S_emp_states"]  = csr["S_emp"]
+        res["n_states"]      = csr["n_states"]
+        res["n_states_used"] = len(csr["occupied"])
+        res["state_counts"]  = csr["counts"].tolist()
+        res["emission_table"] = csr["emissions"].tolist()
+        res["state_vectors"]  = csr["vectors"].tolist()
+
     return res
 
 
@@ -448,6 +469,45 @@ def compare_fw_bw(tag, cv_fw, cv_bw, ana_fw, ana_bw, loader_ana, num_token, out_
 # ══════════════════════════════════════════════════════════════════════════
 # EXPERIMENT 1 — Coin HMM  p=0.4, q=0.8
 # ══════════════════════════════════════════════════════════════════════════
+
+
+def _pair_report(res: dict, mode: str):
+    """Rebuild a causal-state report from what analyse_model returned, or None."""
+    if not res or "emission_table" not in res:
+        return None
+    counts = np.asarray(res["state_counts"], dtype=float)
+    return {
+        "counts":    counts.astype(int),
+        "occupancy": counts / counts.sum() if counts.sum() else counts,
+        "vectors":   np.asarray(res["state_vectors"], dtype=float),
+        "emissions": np.asarray(res["emission_table"], dtype=float),
+        "occupied":  [k for k in range(len(counts)) if counts[k] > 0],
+        "n_states":  int(res.get("n_states", len(counts))),
+        "S_emp":     float(res.get("S_emp_states", float("nan"))),
+        "mode":      mode,
+        "usage_beta": 0.0,
+    }
+
+
+def _discrete_kwargs(cfg, process, mode, **kw) -> dict:
+    """
+    Extra train_test_val_pipeline arguments for embed_type="discrete".
+
+    Empty for "onehot", so every existing call is byte-identical and the two
+    architectures share one code path.  n_states is the process's THEORETICAL
+    causal-state count for this arm -- coin 2/3, flower n+1 and 1+#distinguishable
+    -- computed here rather than defaulted in the model, which would silently pin
+    the state budget to the vocabulary.
+    """
+    if cfg.get("embed_type") != "discrete":
+        return {}
+    return dict(
+        n_states=causal_state_count(process, mode, **kw),
+        state_dim=cfg.get("state_dim"),
+        tau=cfg.get("tau", 1.0),
+        usage_beta=cfg.get("usage_beta", 0.0),
+    )
+
 def experiment_1(cfg, out_root, all_results):
     p, q = cfg["coin_p1"], cfg["coin_q1"]
     # B8: derive the tag from the parameters instead of hard-coding it.  The
@@ -488,6 +548,7 @@ def experiment_1(cfg, out_root, all_results):
         n_layers=cfg["n_layers"], accelerator=cfg["accelerator"],
         val_every_n_steps=cfg["val_every_n_steps"],
         weight_decay=cfg["weight_decay"],
+        **_discrete_kwargs(cfg, "coin", "forward"),
     )
     cleanup()  # FIX-4
 
@@ -501,6 +562,7 @@ def experiment_1(cfg, out_root, all_results):
         n_layers=cfg["n_layers"], accelerator=cfg["accelerator"],
         val_every_n_steps=cfg["val_every_n_steps"],
         weight_decay=cfg["weight_decay"],
+        **_discrete_kwargs(cfg, "coin", "backward"),
     )
     cleanup()  # FIX-4
 
@@ -526,6 +588,15 @@ def experiment_1(cfg, out_root, all_results):
                            max_batches=cfg["max_batches"],
                            state_tol=cfg["state_tol"])
     cleanup()
+
+    # The paired forward-vs-backward causal-state views (notebook style):
+    # occupancy, state vectors and transition probabilities, two arms side
+    # by side.  Draws nothing when the architecture has no explicit states.
+    _th = coin_true_conditional(p, q) if "coin" == "coin" else (None, None)
+    plot_causal_states_pair(_pair_report(ana_fw, "forward"),
+                            _pair_report(ana_bw, "backward"),
+                            odir, tag,
+                            theory_fw=_th[0], theory_bw=_th[1])
 
     print("\n  -- 1d Comparison --")
     compare_fw_bw(tag, cv_fw, cv_bw, ana_fw, ana_bw,
@@ -584,6 +655,7 @@ def experiment_1_2(cfg, out_root, all_results):
         n_layers=cfg["n_layers"], accelerator=cfg["accelerator"],
         val_every_n_steps=cfg["val_every_n_steps"],
         weight_decay=cfg["weight_decay"],
+        **_discrete_kwargs(cfg, "coin", "forward"),
     )
     cleanup()
     cv_bw = train_test_val_pipeline(
@@ -595,6 +667,7 @@ def experiment_1_2(cfg, out_root, all_results):
         n_layers=cfg["n_layers"], accelerator=cfg["accelerator"],
         val_every_n_steps=cfg["val_every_n_steps"],
         weight_decay=cfg["weight_decay"],
+        **_discrete_kwargs(cfg, "coin", "backward"),
     )
     cleanup()
 
@@ -616,6 +689,15 @@ def experiment_1_2(cfg, out_root, all_results):
                            max_batches=cfg["max_batches"],
                            state_tol=cfg["state_tol"])
     cleanup()
+
+    # The paired forward-vs-backward causal-state views (notebook style):
+    # occupancy, state vectors and transition probabilities, two arms side
+    # by side.  Draws nothing when the architecture has no explicit states.
+    _th = coin_true_conditional(p, q) if "coin" == "coin" else (None, None)
+    plot_causal_states_pair(_pair_report(ana_fw, "forward"),
+                            _pair_report(ana_bw, "backward"),
+                            odir, tag,
+                            theory_fw=_th[0], theory_bw=_th[1])
     compare_fw_bw(tag, cv_fw, cv_bw, ana_fw, ana_bw,
                   loader_fw_ana, num_token, odir, sample_seq,
                   theory, theory, cfg["attn_vis_len"], p, q, cfg=cfg)
@@ -759,6 +841,7 @@ def experiment_2(cfg, out_root, all_results, n, m, role):
         n_layers=cfg["n_layers"], accelerator=cfg["accelerator"],
         val_every_n_steps=cfg["val_every_n_steps"],
         weight_decay=cfg["weight_decay"],
+        **_discrete_kwargs(cfg, "flower", "forward", n=n, m=m, dice_probs=dice_probs),
     )
     cleanup()
 
@@ -772,6 +855,7 @@ def experiment_2(cfg, out_root, all_results, n, m, role):
         n_layers=cfg["n_layers"], accelerator=cfg["accelerator"],
         val_every_n_steps=cfg["val_every_n_steps"],
         weight_decay=cfg["weight_decay"],
+        **_discrete_kwargs(cfg, "flower", "backward", n=n, m=m, dice_probs=dice_probs),
     )
     cleanup()
 
@@ -801,6 +885,15 @@ def experiment_2(cfg, out_root, all_results, n, m, role):
                            state_tol=cfg["state_tol"])
     ana_bw["S_theory"] = C_minus
     cleanup()
+
+    # The paired forward-vs-backward causal-state views (notebook style):
+    # occupancy, state vectors and transition probabilities, two arms side
+    # by side.  Draws nothing when the architecture has no explicit states.
+    _th = coin_true_conditional(p, q) if "flower" == "coin" else (None, None)
+    plot_causal_states_pair(_pair_report(ana_fw, "forward"),
+                            _pair_report(ana_bw, "backward"),
+                            odir, tag,
+                            theory_fw=_th[0], theory_bw=_th[1])
 
     print("\n  -- 2d Comparison --")
     compare_fw_bw(tag, cv_fw, cv_bw, ana_fw, ana_bw,
@@ -863,6 +956,10 @@ def parse_args(argv=None):
                     help="which configuration from configs.py to run")
     ap.add_argument("--seed", type=int, default=None,
                     help="override cfg['seed']; both arms always share it")
+    ap.add_argument("--model", default=None, choices=("onehot", "discrete"),
+                    help="architecture; default from the config")
+    ap.add_argument("--usage-beta", type=float, default=None,
+                    help="anti-collapse penalty for --model discrete")
     ap.add_argument("--out-root", default=None,
                     help="override cfg['out_root']")
     ap.add_argument("--only", default="all",
@@ -880,6 +977,15 @@ def main(argv=None):
         cfg["out_root"] = args.out_root
     # REORGANISATION_FIX_PLAN.md 4.2.  cfg["out_root"] stays relative so the
     # provenance JSON below records a portable path; it is resolved here.
+    if args.model is not None:
+        cfg["embed_type"] = args.model
+    if args.usage_beta is not None:
+        cfg["usage_beta"] = args.usage_beta
+    # New runs go to All_Results/<model>/quick; the historical results_quick tree
+    # stays put as the onehot baseline and is reachable with an explicit
+    # --out-root.  See run_statistical_trj._default_out_root.
+    if args.out_root is None and cfg.get("out_root", "").startswith("All_Results/results_"):
+        cfg["out_root"] = f"All_Results/{cfg['embed_type']}/quick"
     out_root = repo_path(cfg["out_root"])
     warm_up_umap(cfg.get("umap_n_neighbors", 15))
     set_seed(cfg["seed"])                    # A2: reproducible end to end

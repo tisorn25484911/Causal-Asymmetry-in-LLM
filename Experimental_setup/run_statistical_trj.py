@@ -130,7 +130,13 @@ for _d in ("Transformer_model", "Experimental_setup"):
 from configs import CONFIGS
 from Data_generation import CoinDataset, coin_generation
 from Flower_process_generation import FlowerDataset, flower_process_generation
+from DiscreteCausal_analysis import (
+    causal_state_report, plot_causal_states, plot_causal_states_pair,
+    print_state_summary,
+)
 from Model_analysis import (
+    causal_state_count,
+    coin_true_conditional,
     flower_complexity,
     flower_entropy_rate,
     paired_delta_ce,
@@ -156,7 +162,25 @@ from run_experiments import full_seq_len
 COIN_PQ   = [(0.1, 0.9), (0.3, 0.4), (0.4, 0.8)]
 FLOWER_NM = [(2, 6), (2, 8), (4, 2), (6, 4)]
 
-OUT_ROOT_DEFAULT = "All_Results/results_trajectories"
+# Historical location, kept only so an explicit --out-root can still reach the
+# onehot baseline.  NEW runs go to All_Results/<model>/trajectories -- see
+# _default_out_root -- so the two architectures cannot overwrite one another.
+OUT_ROOT_LEGACY  = "All_Results/results_trajectories"
+OUT_ROOT_DEFAULT = OUT_ROOT_LEGACY
+
+
+def _default_out_root(model: str) -> str:
+    """
+    All_Results/<model>/trajectories.
+
+    The existing results_* trees stay exactly where they are -- they are the
+    onehot baseline and their provenance records repo-relative paths.  Replot or
+    resume THOSE with an explicit --out-root All_Results/results_trajectories;
+    without it a run against the new default finds an empty directory, and
+    load_combined reads a missing pickle as "nothing done yet" and silently
+    retrains everything.  That failure cost a 23-hour sweep once already.
+    """
+    return f"All_Results/{model}/trajectories"
 
 FW_COLOUR, BW_COLOUR, D_COLOUR = "#4c72b0", "#dd8452", "crimson"
 
@@ -180,6 +204,12 @@ def coin_spec(cfg: dict, p: float, q: float) -> dict:
         batch       = cfg["coin_batch"],
         k_fw        = 2,                 # 2 forward causal states, any (p, q)
         k_bw        = 3,                 # 3 backward causal states
+        # K for a discrete-bottleneck model.  Same numbers as k_fw/k_bw here,
+        # but kept separate: k_* is the assumed cluster count for the k-means
+        # S_emp estimator, n_states_* is a model hyperparameter.  Coupling them
+        # would mean a change to one silently changed the other.
+        n_states_fw = causal_state_count("coin", "forward"),
+        n_states_bw = causal_state_count("coin", "backward"),
         C_plus      = statistical_complexity(p, q, "forward"),
         C_minus     = statistical_complexity(p, q, "backward"),
         theory      = entropy_rate_coin(p, q),      # H_inf, both directions
@@ -221,6 +251,13 @@ def flower_spec(cfg: dict, n: int, m: int,
         seq_len     = cfg["flower_seq_len"],     # CYCLES; tokens = 2 x this
         max_epochs  = cfg["flower_max_epochs"],
         batch       = cfg["flower_batch"],
+        # The EXACT counts for a discrete bottleneck.  Note n_states_bw is not
+        # m+1 in general -- outcomes whose posteriors coincide are one backward
+        # state, and at n=1 they all are -- so it is computed from the dice that
+        # were actually drawn, under the same merge rule as C-.
+        n_states_fw = causal_state_count("flower", "forward", n=n, m=m),
+        n_states_bw = causal_state_count("flower", "backward", n=n, m=m,
+                                         dice_probs=dice_probs),
         k_fw        = n + 1,
         k_bw        = m + 1,                     # an upper bound: outcomes that
                                                  # induce the same posterior over
@@ -285,6 +322,9 @@ def one_repeat(spec: dict, cfg: dict, seed: int, khat: bool = False) -> dict:
     out = {"seed": seed}
     for arm, mode, use_t, k in (("fw", "forward",  "last",  spec["k_fw"]),
                                 ("bw", "backward", "first", spec["k_bw"])):
+        # K for this arm.  Only used by embed_type="discrete"; train_model
+        # ignores it for "onehot", which is what keeps that path unchanged.
+        n_states = spec.get(f"n_states_{arm}")
         # Rebuilt per arm rather than shared: the split is a pure function of
         # (N, seed) so both arms get the same one, while the training loader's
         # shuffle generator is freshly seeded instead of carrying the state the
@@ -303,6 +343,10 @@ def one_repeat(spec: dict, cfg: dict, seed: int, khat: bool = False) -> dict:
             accelerator=cfg["accelerator"],
             val_every_n_steps=cfg["val_every_n_steps"],
             weight_decay=cfg.get("weight_decay", 0.0),
+            n_states=n_states,
+            state_dim=cfg.get("state_dim"),
+            tau=cfg.get("tau", 1.0),
+            usage_beta=cfg.get("usage_beta", 0.0),
         )
         to_cpu_for_analysis(rec.model)
 
@@ -341,6 +385,22 @@ def one_repeat(spec: dict, cfg: dict, seed: int, khat: bool = False) -> dict:
             except Exception as e:
                 print(f"  k-hat failed ({arm}, seed {seed}): {e}")
                 arm_res.update(k_hat=None, S_hat=float("nan"), k_plateau=None)
+
+        # Explicit causal states, when the architecture has them.  Returns None
+        # for OneHotDecoder, so this is unconditional rather than an
+        # embed_type branch -- MODULAR_MODELS_PLAN.md 3.
+        csr = causal_state_report(rec.model, loader_ana, min_pos=cfg.get("state_min_pos", 5))
+        if csr is not None:
+            # Stored as plain lists rather than the live report: they are only
+            # K x V and K x S, they make the figure reproducible from the pickle
+            # alone (so --plots-only works), and they keep no tensors alive.
+            arm_res["S_emp_states"]  = csr["S_emp"]
+            arm_res["n_states"]      = csr["n_states"]
+            arm_res["n_states_used"] = len(csr["occupied"])
+            arm_res["state_counts"]  = csr["counts"].tolist()
+            arm_res["emission_table"] = csr["emissions"].tolist()
+            arm_res["state_vectors"]  = csr["vectors"].tolist()
+            arm_res["usage_beta"]     = csr["usage_beta"]
 
         out[arm] = arm_res
         del rec
@@ -918,6 +978,35 @@ def plot_grid_summary(records: dict, out_root: str,
     savefig(fig, os.path.join(out_root, fname))
 
 
+def _report_from_run(rec: dict, arm: str, mode: str):
+    """
+    Rebuild a causal-state report from the LAST repeat's stored arrays.
+
+    Returns None when the architecture has no explicit states, which is what
+    makes the plotting call site free of embed_type branches.  Reading it back
+    from the pickle rather than holding the live report is what lets
+    --plots-only redraw these figures without retraining.
+    """
+    runs = rec.get("runs") or []
+    for r in reversed(runs):
+        a = (r.get(arm) or {})
+        if "emission_table" not in a:
+            continue
+        counts = np.asarray(a["state_counts"], dtype=float)
+        return {
+            "counts":    counts.astype(int),
+            "occupancy": counts / counts.sum() if counts.sum() else counts,
+            "vectors":   np.asarray(a["state_vectors"], dtype=float),
+            "emissions": np.asarray(a["emission_table"], dtype=float),
+            "occupied":  [k for k in range(len(counts)) if counts[k] > 0],
+            "n_states":  int(a.get("n_states", len(counts))),
+            "S_emp":     float(a.get("S_emp_states", float("nan"))),
+            "mode":      mode,
+            "usage_beta": float(a.get("usage_beta", 0.0)),
+        }
+    return None
+
+
 def print_summary(records: dict, out_root: str):
     """The runner's asymmetry table, over repeats instead of folds."""
     print(f"\n{'='*104}\n  ASYMMETRY SUMMARY over repeats  ({out_root})\n{'='*104}")
@@ -958,7 +1047,17 @@ def parse_args(argv=None):
     ap.add_argument("--seed", type=int, default=None,
                     help="base seed; repeat i uses base + i for BOTH arms "
                          "(default cfg['seed'])")
-    ap.add_argument("--out-root", default=OUT_ROOT_DEFAULT)
+    ap.add_argument("--out-root", default=None,
+                    help="default: All_Results/<model>/trajectories")
+    ap.add_argument("--model", default=None, choices=("onehot", "discrete"),
+                    help="architecture; default from the config (onehot). "
+                         "'discrete' forces the prediction through a hard "
+                         "one-hot over the process's theoretical number of "
+                         "causal states.")
+    ap.add_argument("--usage-beta", type=float, default=None,
+                    help="anti-collapse penalty for --model discrete. The "
+                         "config default is 0.01; pass 0 to measure S_emp "
+                         "without the penalty's bias.")
     ap.add_argument("--only", nargs="+", default=None, metavar="TAG",
                     help="run a subset; matches a full tag or any substring of "
                          "one, e.g. --only coin_p030 flower_n2_m6")
@@ -1060,12 +1159,18 @@ def main(argv=None):
         cfg["seed"] = args.seed
     if args.accelerator is not None:
         cfg["accelerator"] = args.accelerator
+    if args.model is not None:
+        cfg["embed_type"] = args.model
+    if args.usage_beta is not None:
+        cfg["usage_beta"] = args.usage_beta
     # REORGANISATION_FIX_PLAN.md 4.2.  repo_path so a relative --out-root is
     # resolved against the repo root, not the cwd.  mkdir below is
     # exist_ok=True and load_combined treats a missing pickle as 'nothing done
     # yet', so a stale path silently re-runs the whole experiment instead of
     # failing.
-    out_root = repo_path(args.out_root)
+    # Resolved AFTER cfg["embed_type"] is set from --model, so the default tree
+    # follows the architecture.  Printed below before any training starts.
+    out_root = repo_path(args.out_root or _default_out_root(cfg["embed_type"]))
     mkdir(out_root)
 
     specs = select_specs(process_specs(cfg), args.only)
@@ -1191,6 +1296,27 @@ def main(argv=None):
         plot_complexity(rec, odir)
         plot_final_loss(rec, rec["paired"], odir)
         plot_trajectories(rec, odir)
+
+        # The causal-state figure, one per arm.  Drawn from the LAST repeat's
+        # report; draws nothing when the architecture has no explicit states.
+        reports, theories = {}, {}
+        for arm, mode in (("fw", "forward"), ("bw", "backward")):
+            csr = _report_from_run(rec, arm, mode)
+            if csr is None:
+                continue
+            th = None
+            if spec["kind"] == "coin":
+                th = coin_true_conditional(spec["p"], spec["q"])[0 if arm == "fw" else 1]
+            reports[arm], theories[arm] = csr, th
+            plot_causal_states(csr, odir, tag, theory=th)          # per-arm detail
+            print_state_summary(csr, theory=th, label="  ")
+        # The paired view -- occupancy, state vectors and transition
+        # probabilities with the two arms side by side, as the notebook draws
+        # them.  The comparison is the point: the coin needs 2 forward states
+        # and 3 backward ones, which is why C- > C+.
+        plot_causal_states_pair(reports.get("fw"), reports.get("bw"), odir, tag,
+                                theory_fw=theories.get("fw"),
+                                theory_bw=theories.get("bw"))
         cleanup()
 
     save_pkl(combined, combined_path)

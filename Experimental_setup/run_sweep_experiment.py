@@ -177,7 +177,16 @@ from utils import (coin_tag, flower_tag, mkdir, repo_path, save_pkl,
 COIN_GRID_DEFAULT   = [0.05, 0.15, 0.25, 0.35, 0.45, 0.55, 0.65, 0.75, 0.85, 0.95]
 FLOWER_GRID_DEFAULT = [2, 4, 6, 8, 10]
 
-OUT_ROOT_DEFAULT = "All_Results/results_sweep"
+# Historical location, reachable with an explicit --out-root.  NEW runs go to
+# All_Results/<model>/sweep so the two architectures cannot overwrite each
+# other -- `combined` is keyed by tag, and the tags do not encode the model.
+OUT_ROOT_LEGACY  = "All_Results/results_sweep"
+OUT_ROOT_DEFAULT = OUT_ROOT_LEGACY
+
+
+def _default_out_root(model: str) -> str:
+    """All_Results/<model>/sweep.  See run_statistical_trj._default_out_root."""
+    return f"All_Results/{model}/sweep"
 
 COIN_COLOUR, FLOWER_COLOUR = "#4c72b0", "#dd8452"
 
@@ -1156,7 +1165,12 @@ def parse_args(argv=None):
                          "REMAINING_WORK_PLAN.md S5.  Give each capacity its "
                          "OWN --out-root: tags do not encode d_model, so two "
                          "capacities in one folder overwrite each other.")
-    ap.add_argument("--out-root", default=OUT_ROOT_DEFAULT)
+    ap.add_argument("--out-root", default=None,
+                    help="default: All_Results/<model>/sweep")
+    ap.add_argument("--model", default=None, choices=("onehot", "discrete"),
+                    help="architecture; default from the config")
+    ap.add_argument("--usage-beta", type=float, default=None,
+                    help="anti-collapse penalty for --model discrete")
     ap.add_argument("--sweep-coin", nargs="*", default=None, metavar="P",
                     help="coin grid; bare flag uses the default 10-point grid")
     ap.add_argument("--sweep-flower", nargs="*", default=None, metavar="N",
@@ -1222,7 +1236,11 @@ def main(argv=None):
     # REORGANISATION_FIX_PLAN.md 4.2.  Root-anchored: mkdir is exist_ok=True and
     # load_combined returns {} for a missing pickle, so a stale relative path
     # would silently discard every completed repeat and re-run the full grid.
-    out_root = mkdir(repo_path(args.out_root))
+    if args.model is not None:
+        cfg["embed_type"] = args.model
+    if args.usage_beta is not None:
+        cfg["usage_beta"] = args.usage_beta
+    out_root = mkdir(repo_path(args.out_root or _default_out_root(cfg["embed_type"])))
     # REMAINING_WORK_PLAN.md S5.  Tags are a function of the process, not of
     # d_model, and the store is keyed by tag -- so mixing capacities in one
     # out_root silently overwrites.  Refuse rather than corrupt.

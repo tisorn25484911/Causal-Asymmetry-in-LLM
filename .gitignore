@@ -22,6 +22,14 @@ sanity_check_flower_process/
 results_sweep/
 results_sweep_wd/
 
+# MODULAR_MODELS_PLAN.md 6.  New runs are scoped by architecture --
+# All_Results/<model>/<experiment> -- so these are results trees like every
+# other one above, and are excluded on the same standard: the pickles are
+# regenerable by re-running, the figures by --plots-only.  The historical
+# results_* trees stay where they are as the onehot baseline.
+All_Results/onehot/
+All_Results/discrete/
+
 # Model weights, Lightning checkpoints, pickled result bundles
 *.pt
 *.ckpt
@@ -49,3 +57,5 @@ env/
 *.code-workspace
 # Run logs from the Phase 1.9 re-runs
 run_*.log
+# ... and from the model-comparison launcher, which names its logs per step
+Run_logs/*.log
