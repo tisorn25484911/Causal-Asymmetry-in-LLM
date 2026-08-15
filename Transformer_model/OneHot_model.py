@@ -321,6 +321,20 @@ class OneHotDecoder(L.LightningModule):
 
         return loss
 
+    # ---- analysis surface (MODULAR_MODELS_PLAN.md 3) --------------------
+    # This model has no explicit states -- they have to be clustered out of the
+    # latents by Model_analysis.recover_causal_states.  Returning None rather
+    # than raising is what lets the analysis layer hold the only branch between
+    # the two architectures, instead of every runner testing embed_type.
+
+    def state_assignment(self, tokens=None):
+        """No explicit causal states; see DiscreteCausalDecoder."""
+        return None
+
+    def emission_table(self):
+        """No explicit per-state emission table; see DiscreteCausalDecoder."""
+        return None
+
     def configure_optimizers(self):
         """
         AdamW, whose weight_decay defaults to 0.0 here.
