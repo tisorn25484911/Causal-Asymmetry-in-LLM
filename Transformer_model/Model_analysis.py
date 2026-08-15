@@ -899,37 +899,88 @@ def flower_complexity(n: int, m: int, dice_probs,
     pi_outcome = dp.mean(axis=0)                       # (1/n) sum_i dp[i, j]
     col_mass   = dp.sum(axis=0)
 
+    mass = _merged_outcome_mass(dp, merge_tol)
+
+    C_minus = 1.0 + 0.5 * entropy_bits(mass)
+    return float(C_plus), float(C_minus)
+
+
+def _merged_outcome_mass(dp, merge_tol: float | None = None) -> list:
+    """
+    Mass of each *distinguishable* backward outcome state.
+
+    Factored out of flower_complexity so `causal_state_count` counts states
+    under exactly the rule that produced the C- it is paired with.  Two
+    definitions of "the same backward state" in one repository would drift, and
+    a K that disagreed with its own theory is worse than no K at all.
+    """
+    dp = np.asarray(dp, dtype=float)
+    pi_outcome = dp.mean(axis=0)
+    col_mass = dp.sum(axis=0)
+    m = dp.shape[1]
+
     if merge_tol is None:
-        # ── the original rule, and the default ────────────────────────────
-        # Round the posterior to MERGE_ROUND_DP decimals and require exact
-        # equality.  Every C- this repo has reported uses this, so it stays the
-        # default; see the docstring for the one regime where it matters.
         merged: dict[tuple, float] = {}
         for j in range(m):
             if col_mass[j] <= 0:                       # outcome never occurs
                 continue
             key = tuple(np.round(dp[:, j] / col_mass[j], MERGE_ROUND_DP))
             merged[key] = merged.get(key, 0.0) + pi_outcome[j]
-        mass = list(merged.values())
-    else:
-        # ── the operational rule, opt-in ──────────────────────────────────
-        # Group outcomes whose posteriors agree to within merge_tol in max-norm.
-        reps: list[np.ndarray] = []
-        mass = []
-        for j in range(m):
-            if col_mass[j] <= 0:
-                continue
-            posterior = dp[:, j] / col_mass[j]
-            for k, r in enumerate(reps):
-                if np.max(np.abs(posterior - r)) <= merge_tol:
-                    mass[k] += float(pi_outcome[j])
-                    break
-            else:
-                reps.append(posterior)
-                mass.append(float(pi_outcome[j]))
+        return list(merged.values())
 
-    C_minus = 1.0 + 0.5 * entropy_bits(mass)
-    return float(C_plus), float(C_minus)
+    reps: list = []
+    mass: list = []
+    for j in range(m):
+        if col_mass[j] <= 0:
+            continue
+        posterior = dp[:, j] / col_mass[j]
+        for k, r in enumerate(reps):
+            if np.max(np.abs(posterior - r)) <= merge_tol:
+                mass[k] += float(pi_outcome[j])
+                break
+        else:
+            reps.append(posterior)
+            mass.append(float(pi_outcome[j]))
+    return mass
+
+
+def causal_state_count(process: str, mode: str, n: int | None = None,
+                       m: int | None = None, dice_probs=None,
+                       merge_tol: float | None = None) -> int:
+    """
+    Number of causal states the process has in this direction -- the K a
+    discrete-bottleneck model should be given.
+
+        coin     forward   2      the forward conditional has 2 distinct rows
+                 backward  3      the backward conditional has 3
+        flower   forward   n + 1  "a roll just happened", plus one per die
+                 backward  1 + #distinguishable outcomes
+
+    The flower backward count is NOT m + 1 in general.  Generic Dirichlet dice
+    do give m + 1, but dice whose posterior columns are proportional merge, and
+    at n = 1 every outcome merges -- the n=1,m=2 null control has 2 backward
+    states, not 3, and C- = C+ = 1.
+
+    Pairs with flower_complexity: same merge rule, same `merge_tol`.
+    """
+    if mode not in ("forward", "backward"):
+        raise ValueError(f"mode must be 'forward' or 'backward', got {mode!r}")
+    if process == "coin":
+        return 2 if mode == "forward" else 3
+    if process == "flower":
+        if n is None:
+            raise ValueError("flower needs n")
+        if mode == "forward":
+            return int(n) + 1
+        if dice_probs is None:
+            raise ValueError(
+                "flower backward needs dice_probs -- the count depends on the "
+                "dice realisation and cannot be inferred from (n, m)")
+        dp = np.asarray(dice_probs, dtype=float)
+        if m is not None and dp.shape != (n, m):
+            raise ValueError(f"dice_probs must have shape ({n}, {m}), got {dp.shape}")
+        return 1 + len(_merged_outcome_mass(dp, merge_tol))
+    raise ValueError(f"unknown process {process!r}; expected 'coin' or 'flower'")
 
 
 def flower_entropy_rate(n: int, m: int, dice_probs) -> float:
