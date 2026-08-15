@@ -228,8 +228,10 @@ which is what every run uses, so these are the actual processes trained on.
 
 ## 3. Model architecture
 
-One class, `OneHot_model.OneHotDecoder`, with a single flag selecting the causal
-direction.
+Two architectures share one transformer stack; `embed_type` selects between them
+and `mode` selects the causal direction. `OneHotDecoder` is the continuous
+decoder every result below was produced with; `DiscreteCausalDecoder` (§3.6)
+adds a discrete causal-state bottleneck.
 
 ```python
 model_fw = OneHotDecoder(token_size=3, d_model=32, max_len=1999, mode="forward")
@@ -342,6 +344,55 @@ of the null result.
 `n_layers` is 2 in every configuration and is deliberately never varied, because
 depth is part of the same capacity budget as `d_model`; varying both would make a
 change in ΔCE attributable to neither.
+
+---
+
+### 3.6 The discrete causal-state decoder
+
+`DiscreteCausal_model.DiscreteCausalDecoder` forces the prediction through a
+**hard one-hot over a bounded set of causal states**:
+
+```
+x          (B,T,D)   the same transformer stack as OneHotDecoder
+state_lgt  (B,T,K)   state_head    D → K        the state code
+onehot     (B,T,K)   argmax, straight-through
+rep        (B,T,S)   onehot @ state_matrix      the state vector
+out        (B,T,V)   emission      S → V        ← the cross-entropy is here
+```
+
+The point is that `S_emp` stops being an estimate. `OneHotDecoder`'s causal
+states have to be clustered out of the latents, with a silhouette-selected `k̂`
+and a `state_tol`; here the state of a position *is* `argmax(state_lgt)`, so
+`S_emp` is the entropy of the occupancy distribution — no clustering, no
+hyperparameters. On the coin it lands within ~0.001 bits of the closed-form
+`C⁺` and `C⁻`.
+
+**K is the theoretical state count, not a free parameter.** The runner computes
+it per process and arm: coin 2/3, flower `n+1` forward and
+`1 + #distinguishable outcomes` backward. Taking the argmax over the
+`V`-dimensional logits instead would pin the state budget to the vocabulary —
+and `V` is a property of the process, not something choosable per arm. Measured
+on the coin, where `H∞` is time-reversal invariant and therefore identical for
+both arms, that pinning left the backward arm **+0.237 bits** above `H∞` while
+the forward arm reached it: ~100× the effect under study, pointing the way the
+hypothesis does.
+
+Three things are load-bearing and each was measured, not assumed. The
+straight-through estimator: without it `argmax` severs the graph and only 2 of
+33 parameter tensors train while the loss still falls plausibly. The emission
+layer: the loss softmaxes its input, and softmax of a one-hot caps confidence at
+`1/(1 + (V−1)/e)` — 0.576 at `V=3`, 0.198 at `V=12` — a cross-entropy floor that
+*grows with the vocabulary*, i.e. an artefact along the flower sweep's own axis.
+And `usage_beta`: at 0 the backward bottleneck collapsed on one seed in four.
+
+Two caveats travel with every discrete result. `state_matrix` and `emission`
+compose into one linear map, so the **state-vector geometry is identified only up
+to an invertible `K × K` transform** — the emission table is the identified view.
+And the architecture needs its own optimisation settings (`DISCRETE`: `lr=1e-3`,
+~23× the steps); at `QUICK`'s `lr=1e-2` it collapses outright. Comparing the two
+architectures therefore compares two working points, not one.
+
+See `HOW_TO_RUN.md` §14A for the flags, the output layout and the figure.
 
 ---
 
@@ -831,6 +882,10 @@ Transformer_model/                the primitives — no dependency on a runner
 ├── Data_generation.py            coin generator, CoinDataset, make_loader
 ├── Flower_process_generation.py  flower generator, FlowerDataset (single definition)
 ├── OneHot_model.py               OneHotDecoder, attention, PE, loss in bits
+├── DiscreteCausal_model.py       DiscreteCausalDecoder — the same stack behind a
+│                                 hard one-hot causal-state bottleneck (§3.6)
+├── DiscreteCausal_analysis.py    reading states off a trained model, and the
+│                                 three-panel causal-state figure
 ├── Training_model.py             chunking, loaders, CV pipeline, recorder, divergence
 ├── Model_analysis.py             CE/PPL, complexity (both estimators), distances,
 │                                 UMAP, attention, paired ΔCE, result slimming
@@ -915,6 +970,11 @@ python Experimental_setup/run_experiments.py --config SMOKE      # ~2 min, exerc
 python Experimental_setup/run_experiments.py --config QUICK      # ~9 min  ← the reportable run
 python Experimental_setup/sanity_check.py                        # ~7 min, the controls
 python Transformer_model/plot_state_clusters.py                 # causal-state figures
+
+# The discrete architecture (§3.6) — its own config, its own output tree
+python Experimental_setup/run_statistical_trj.py --config DISCRETE --repeats 30
+python Experimental_setup/run_experiments.py     --config QUICK --model onehot
+bash Run_logs/launch_model_comparison.sh                        # both, in sequence
 python Experimental_setup/run_statistical_trj.py --khat          # ~2.3 h, repeat statistics (done)
 python Experimental_setup/run_statistical_trj.py --plots-only    # redraw its figures, no training
 

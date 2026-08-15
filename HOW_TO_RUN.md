@@ -1537,6 +1537,133 @@ end-to-end regression check without leaving a trace.
 
 ---
 
+## 14A. The two model architectures
+
+Every runner takes `--model {onehot,discrete}`. The default comes from the
+config, so nothing changes unless you ask for it.
+
+### 14A.1 What differs
+
+| | `onehot` | `discrete` |
+|---|---|---|
+| class | `OneHotDecoder` | `DiscreteCausalDecoder` |
+| head | `D → V` logits | `D → K` state code, hard one-hot, `K → V` emission |
+| causal states | clustered out of the latents (`k̂`, silhouette, `state_tol`) | **read off directly** |
+| `S_emp` | k-means on the predictive distribution | entropy of the state occupancy |
+| config | `QUICK` | `DISCRETE` |
+
+The transformer stack is shared — same fixed random projection, same positional
+encoding, same masks, same blocks, imported rather than copied. Only the head
+differs, which is what makes a model-to-model comparison mean anything.
+
+### 14A.2 K is the process's theoretical state count
+
+`n_states` is **not** a free hyperparameter and **not** the vocabulary size. The
+runner computes it per process and per arm with
+`Model_analysis.causal_state_count`:
+
+```
+coin     forward  2                backward  3
+flower   forward  n + 1            backward  1 + #distinguishable outcomes
+```
+
+The flower backward count is **not** `m + 1` in general. Generic dice give
+`m + 1`, but dice whose posterior columns are proportional merge into one
+backward state, and at `n = 1` every outcome merges — the `n=1, m=2` null
+control has **2** backward states, not 3, and `C⁻ = C⁺ = 1`. It is computed from
+the dice actually drawn, under the same merge rule as `C⁻`.
+
+`train_model` **refuses** `--model discrete` without `n_states` rather than
+falling back to `V`. That fallback is the artefact the architecture exists to
+remove: with the argmax over the `V`-dim logits the state budget is pinned to
+the vocabulary, and measured on the coin the backward arm then sat **+0.237
+bits** above `H∞` while the forward arm reached it — roughly 100× the effect
+under study, pointing the way the hypothesis does.
+
+### 14A.3 Why `discrete` needs its own config
+
+`QUICK` is `lr=1e-2` over ~130 gradient steps. The discrete bottleneck does not
+converge there. Measured on the coin at `d_model=32`:
+
+| lr | steps | forward CE−H∞ | states | backward CE−H∞ | states |
+|---|---|---|---|---|---|
+| 1e-2 | 1500 | +0.573 | **1/2** | +0.120 | **2/3** |
+| 3e-3 | 3000 | +0.197 | 2/2 | +0.084 | 3/3 |
+| **1e-3** | **3000** | **+0.087** | 2/2 | **+0.088** | 3/3 |
+
+So `DISCRETE` is `QUICK`'s processes and data at `lr=1e-3` and 230 epochs
+(~23× the steps). The two architectures are each run at a working point rather
+than at a shared one where one of them fails — **that difference is a real
+caveat on any model-to-model comparison and belongs beside the results.**
+
+Measured cost per process-repeat (2 arms × 5 folds): `onehot` ~15 s,
+`discrete` ~320 s.
+
+### 14A.4 `usage_beta`, and the bias it buys
+
+`usage_beta` penalises collapse of the bottleneck onto a subset of the states.
+It defaults to **0.01**, not 0 — unlike `weight_decay` — because 0 is measurably
+unsafe: on the coin backward arm at `K=3` over 4 seeds, `β=0` collapsed one seed
+in four to 2 of 3 states and `CE−H∞` ranged over 15×, while `β=0.01` found all
+three every time at `+0.036 ± 0.003`.
+
+It is not free — it biases `S_emp` upward, and the size of that bias is
+configuration-dependent (measured between ~0.000 and ~+0.03 on the backward
+arm). Re-run with `--usage-beta 0` to see the unpenalised number, and quote both.
+
+### 14A.5 Where the output goes
+
+New runs go to `All_Results/<model>/<experiment>/`:
+
+```
+All_Results/
+  results_quick/  results_sweep/  results_dice/  results_trajectories/
+        ^ the existing onehot baseline — untouched
+  onehot/    quick/  trajectories/  sweep/
+  discrete/  quick/  trajectories/  sweep/
+```
+
+**Replotting or resuming the historical results needs an explicit `--out-root`**,
+e.g. `--out-root All_Results/results_sweep`. Without it a run against the new
+default finds an empty directory, and `load_combined` reads a missing pickle as
+"nothing done yet" and silently retrains everything. That failure cost a 23-hour
+sweep once already. Every runner now prints the resolved `out_root` and the
+resume plan before training starts — read that line.
+
+### 14A.6 The causal-state figure
+
+`--model discrete` adds one figure per arm to every experiment, on top of
+everything the `onehot` runs already produce:
+
+```
+<tag>_causal_states_forward.png
+<tag>_causal_states_backward.png
+```
+
+Three panels, in the style of `Jupyter_notebooks/test_new training method.ipynb`:
+
+1. **occupancy** — token positions per state, the count written on each bar,
+   unused states greyed;
+2. **state vectors** — one point per state, PCA to 2-D, size and colour by
+   occupancy, the count written on each point, hollow if unused. Its
+   **geometry is not identified** — `state_matrix @ Q` with `Q⁻¹·emission` is an
+   identical model for any invertible `Q` — which the figure states;
+3. **transition probabilities** — `P(next | state)`, or `P(previous | state)`
+   for the backward arm, with the value printed in each cell and the
+   total-variation distance to the nearest closed-form row.
+
+`S_emp` is printed in the title. On the coin it lands within ~0.001 bits of the
+closed-form `C⁺`/`C⁻` with no clustering hyperparameters at all.
+
+### 14A.7 The caveat to check before quoting ΔCE
+
+At the DISCRETE budget the forward arm reaches `H∞` (+0.004…+0.013 measured)
+but **the backward arm does not** (+0.14…+0.17). A ΔCE from that pair is
+dominated by the backward arm's non-convergence, not by causal asymmetry. Check
+the per-arm `CE − H∞` in the summary before reading anything into ΔCE.
+
+---
+
 ## 15. Command reference
 
 ```bash
@@ -1584,6 +1711,20 @@ python Experimental_setup/analyse_lambda_sweep.py --like-for-like
 # Reproducibility: 'cpu' is the only bit-reproducible accelerator (Section 1.3)
 python Experimental_setup/run_statistical_trj.py --repeats 4 --accelerator cpu \
        --out-root /tmp/traj_check
+
+# The two architectures (Section 14A)
+python Experimental_setup/run_experiments.py     --config QUICK    --model onehot
+python Experimental_setup/run_experiments.py     --config DISCRETE                  # ~8 h
+python Experimental_setup/run_statistical_trj.py --config QUICK    --model onehot --repeats 30
+python Experimental_setup/run_statistical_trj.py --config DISCRETE --repeats 30     # ~19-24 h
+python Experimental_setup/run_sweep_experiment.py --config DISCRETE \
+    --sweep-coin 0.15 0.35 0.55 0.75 0.95 --sweep-flower 2 4 6 8 10 --repeats 5   # ~22 h
+python Experimental_setup/run_statistical_trj.py --config DISCRETE --usage-beta 0 \
+    --out-root All_Results/discrete/trajectories_beta0     # the unpenalised S_emp
+bash Run_logs/launch_model_comparison.sh          # all of the above, in sequence
+
+# Reaching the HISTORICAL results needs an explicit --out-root (Section 14A.5)
+python Experimental_setup/run_sweep_experiment.py --plots-only --out-root All_Results/results_sweep
 
 # Repeat statistics (Section 7)
 python Experimental_setup/run_statistical_trj.py                       # ~2.25 h, 7 x 100  ← done
