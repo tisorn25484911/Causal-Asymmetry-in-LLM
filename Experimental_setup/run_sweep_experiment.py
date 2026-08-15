@@ -315,7 +315,12 @@ def settled_from(mu, tol: float = CONV_STEP_TOL) -> int:
     mu = _smooth(np.asarray(mu, dtype=float))
     if mu.size == 0:
         return 0
-    tail = mu[max(int(0.9 * mu.size), mu.size - 1):]
+    # min, not max: the slice must START at the last tenth, and `mu.size - 1`
+    # is only a floor guaranteeing at least one element.  With max() the start
+    # is always mu.size - 1, so `tail` is a single point -- `level` becomes the
+    # noisy final value this function exists to avoid, and `tail.std()` is 0, so
+    # the adaptive tolerance below can never fire.  Both are silent.
+    tail = mu[min(int(0.9 * mu.size), mu.size - 1):]
     level = float(tail.mean())
     tol_eff = max(float(tol), 3.0 * float(tail.std()))
     bad = np.where(np.abs(mu - level) > tol_eff)[0]
@@ -363,10 +368,16 @@ def trajectory_metrics(rec: dict, global_burn=None) -> dict:
     burn_fixed   = int(L / BURN_FRACTION_DENOM)
 
     # Per-repeat convergence step, from each run's own smoothed curve.
+    #
+    # settled_from already smooths its input (SMOOTH_WIN), so smoothing here as
+    # well applied the 5-point box twice -- which convolves into a 9-point
+    # triangular kernel and shifts the convergence step this measures.  The
+    # curve is still smoothed exactly once, inside settled_from, which is what
+    # SMOOTH_WIN's "per-repeat convergence only" note asks for.
     d_step = []
     for i in range(D.shape[0]):
-        f = settled_from(_smooth(M_fw[i]))
-        b = settled_from(_smooth(M_bw[i]))
+        f = settled_from(M_fw[i])
+        b = settled_from(M_bw[i])
         d_step.append(float(b - f))
 
     # The window the PRIMARY area uses: the sweep-wide one when supplied,
