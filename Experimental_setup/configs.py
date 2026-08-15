@@ -25,7 +25,33 @@ BASE = dict(
     # ── reproducibility (A2) ───────────────────────────────────────────
     seed             = 0,
     # ── model ──────────────────────────────────────────────────────────
+    # Which architecture.  "onehot" is the continuous decoder every existing
+    # result used; "discrete" forces the prediction through a hard one-hot over
+    # a bounded causal-state set (MODULAR_MODELS_PLAN.md).  The four settings
+    # below apply only to "discrete" and are ignored by "onehot".
     embed_type       = "onehot",
+    # K -- the number of causal states.  None means "the runner has not supplied
+    # it", which train_model REFUSES for embed_type="discrete" rather than
+    # falling back to the vocabulary size.  Runners use
+    # Model_analysis.causal_state_count(process, mode, ...):
+    #     coin    forward 2       backward 3
+    #     flower  forward n+1     backward 1 + #distinguishable outcomes
+    n_states         = None,
+    # Dimension of a state VECTOR.  None -> n_states.  No expressive power; it
+    # exists to give the state-vector scatter something to draw.
+    state_dim        = None,
+    # Straight-through surrogate temperature.  Never changes the forward value.
+    # Measured: tau <= 0.2 collapses the bottleneck.  1.0 is plain softmax.
+    tau              = 1.0,
+    # Anti-collapse penalty on batch-marginal state usage.  NOT zero by default,
+    # unlike weight_decay, because zero is measurably unsafe: coin backward at
+    # K=3 over 4 seeds, beta=0 collapsed 1 seed in 4 and CE-H_inf ranged over
+    # 15x; beta=0.01 found all 3 states every time at +0.036 +/- 0.003.
+    #
+    # It is not free.  It biases S_emp upward and ARM-DEPENDENTLY: forward
+    # -0.001, backward +0.024, ~6% of the true C- - C+ gap and in the direction
+    # the hypothesis predicts.  Runners also report S_emp at beta=0.
+    usage_beta       = 0.01,
     n_folds          = 5,
     n_layers         = 2,
     # ── optimiser ──────────────────────────────────────────────────────
@@ -224,5 +250,42 @@ QUICK_LARGE_HMM.update(
 )
 
 
+# ─────────────────────────────────────────────────────────────────────────────
+# DISCRETE — QUICK's processes and data, at the settings the discrete
+# causal-state bottleneck actually converges under.
+#
+# QUICK is lr=1e-2 over ~130 gradient steps, which the continuous decoder
+# reaches H_inf under.  The discrete decoder does NOT: measured on the coin at
+# d_model=32, lr=1e-2 leaves the forward arm collapsed onto 1 of its 2 states
+# even after 1500 steps, sitting 0.57 bits above H_inf.
+#
+#     lr      steps    forward CE-H_inf  states    backward CE-H_inf  states
+#     1e-2     1500          +0.573       1/2           +0.120         2/3
+#     3e-3     3000          +0.197       2/2           +0.084         3/3
+#     1e-3     3000          +0.087       2/2           +0.088         3/3
+#
+# At lr=1e-3 the two arms converge TOGETHER -- +0.087 against +0.088, an arm
+# difference of ~0.001 bits, which is the order of the effect under study.  So
+# the two architectures are each run at a working point, rather than at a
+# shared one where one of them fails.  That difference is a real caveat on any
+# model-to-model comparison and must be stated with the results, not buried.
+#
+# The step budget is raised by increasing epochs, not by shrinking the data:
+# shrinking it would change the process being learned as well as the budget.
+DISCRETE = _cfg(
+    **{k: v for k, v in QUICK.items()
+       if k not in ("out_root", "lr", "embed_type",
+                    "coin_max_epochs", "flower_max_epochs", "pq_epochs")},
+    out_root            = "All_Results/discrete/quick",
+    embed_type          = "discrete",
+    lr                  = 1e-3,
+    # ~23x QUICK's 10 epochs.  Measured requirement, not a guess.
+    coin_max_epochs     = 230,
+    flower_max_epochs   = 230,
+    pq_epochs           = 115,
+)
+
+
 CONFIGS = {"SMOKE": SMOKE, "QUICK": QUICK, "LARGE": LARGE,
-           "QUICK_LARGE_HMM": QUICK_LARGE_HMM}
+           "QUICK_LARGE_HMM": QUICK_LARGE_HMM,
+           "DISCRETE": DISCRETE}

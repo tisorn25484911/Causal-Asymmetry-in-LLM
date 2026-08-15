@@ -2,6 +2,7 @@ import random
 
 import lightning as L
 from OneHot_model import OneHotDecoder, cross_ent_onehot
+from DiscreteCausal_model import DiscreteCausalDecoder
 import torch
 import torch.utils.data as tud
 import numpy as np
@@ -431,9 +432,17 @@ def train_model(
     accelerator: str = "auto",
     val_every_n_steps: int = 25,
     weight_decay: float = 0.0,
+    n_states:  int | None = None,
+    state_dim: int | None = None,
+    tau:       float = 1.0,
+    usage_beta: float = 0.0,
 ):
     """
-    Trains a OneHotDecoder and returns a Record_training object.
+    Trains a decoder and returns a Record_training object.
+
+    `embed_type` selects the architecture.  The four parameters after
+    `weight_decay` apply only to "discrete" and are ignored by "onehot", which
+    keeps every existing call byte-identical.
 
     `weight_decay` defaults to 0.0, at which AdamW is bit-identical to the Adam
     every earlier result used.  It is threaded rather than read from a global so
@@ -456,14 +465,36 @@ def train_model(
     recorder.step_val_ppl   - validation perplexity per gradient step (if val_loader given)
     recorder.epoch_loss     - epoch-averaged training loss
     """
-    # C5: WordEmbDecoder is gone — no runner ever set embed_type="wordemb".
-    if embed_type != "onehot":
-        raise ValueError(f"Invalid embed_type: {embed_type!r}. Only 'onehot' "
-                         "remains; WordEmbDecoder was deleted (C5).")
-    model = OneHotDecoder(
-        token_size=num_token, d_model=d_model, max_len=max_len, lr=lr, mode=mode,
-        n_layers=n_layers, weight_decay=weight_decay,
-    )
+    # MODULAR_MODELS_PLAN.md 1.  The ONLY place that decides which architecture
+    # is built.  Narrowed to a single value when WordEmbDecoder was deleted (C5);
+    # widening it here rather than adding a parallel --model path is what keeps
+    # every runner's signature unchanged.
+    if embed_type == "onehot":
+        model = OneHotDecoder(
+            token_size=num_token, d_model=d_model, max_len=max_len, lr=lr, mode=mode,
+            n_layers=n_layers, weight_decay=weight_decay,
+        )
+    elif embed_type == "discrete":
+        # The RUNNER computes n_states from theory -- causal_state_count -- because
+        # it depends on the process, the arm, and for the flower backward arm on
+        # the dice realisation.  Falling back to num_token here would silently pin
+        # the state budget to the vocabulary, which is the artefact this
+        # architecture exists to avoid.
+        if n_states is None:
+            raise ValueError(
+                "embed_type='discrete' requires n_states.  Compute it with "
+                "Model_analysis.causal_state_count(process, mode, ...) and pass "
+                "it through; defaulting to the vocabulary size reintroduces the "
+                "arm-dependent bottleneck this model was built to remove.")
+        model = DiscreteCausalDecoder(
+            token_size=num_token, d_model=d_model, max_len=max_len, lr=lr, mode=mode,
+            n_layers=n_layers, weight_decay=weight_decay,
+            n_states=n_states, state_dim=state_dim, tau=tau, usage_beta=usage_beta,
+        )
+    else:
+        raise ValueError(
+            f"Invalid embed_type: {embed_type!r}. Expected 'onehot' or 'discrete'. "
+            "(WordEmbDecoder was deleted -- C5.)")
 
     recorder = Record_training(
         record_every_n_steps=1,
@@ -569,6 +600,10 @@ def train_test_val_pipeline(
     accelerator: str   = "auto",
     val_every_n_steps: int = 25,
     weight_decay: float = 0.0,
+    n_states:  int | None = None,
+    state_dim: int | None = None,
+    tau:       float = 1.0,
+    usage_beta: float = 0.0,
 ):
     """
     Full cross-validation pipeline with step-level training + validation curves.
@@ -678,6 +713,10 @@ def train_test_val_pipeline(
             accelerator=accelerator,
             val_every_n_steps=val_every_n_steps,   # D1
             weight_decay=weight_decay,
+            n_states=n_states,
+            state_dim=state_dim,
+            tau=tau,
+            usage_beta=usage_beta,
         )
         all_recorders.append(recorder)
 
