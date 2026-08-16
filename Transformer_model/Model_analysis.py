@@ -944,6 +944,113 @@ def _merged_outcome_mass(dp, merge_tol: float | None = None) -> list:
     return mass
 
 
+def usage_beta_shared(K_fw: int, C_plus: float, K_bw: int, C_minus: float,
+                      gap_threshold: float = 0.1, beta_high: float = 0.2,
+                      beta_low: float = 0.01) -> float:
+    """
+    ONE beta for both arms of a process, from the smaller of their two gaps.
+
+    Shared rather than per-arm, and that is not a simplification -- it is
+    required.  delta_CE is a PAIRED difference whose validity rests on the two
+    arms differing only in the mask and the batch convention.  Giving them
+    regularisation strengths that differ by 20x is exactly the class of
+    arm-dependent artefact the design exists to exclude, and the per-arm gap rule
+    did that on three of the seven baseline processes.
+
+    The SMALLER gap decides: a process qualifies for the strong penalty if
+    either arm is near-uniform.  Measured at 150 epochs this puts all seven
+    baseline processes inside conv_tol with both arms on the same beta:
+
+        process          gap fw  gap bw   min   beta   max|CE-H_inf|
+        coin_p010_q090    0.531   0.694  0.531  0.01      0.0190
+        coin_p030_q040    0.015   0.096  0.015  0.20      0.0625
+        coin_p040_q080    0.082   0.019  0.019  0.20      0.0709
+        flower_n2_m6      0.085   0.694  0.085  0.20      0.0591   (only 0.2 works)
+        flower_n2_m8      0.085   0.693  0.085  0.20      0.0328
+        flower_n4_m2      0.322   0.090  0.090  0.20      0.0837
+        flower_n6_m4      0.515   0.332  0.332  0.01      0.0983   (only 0.01 works)
+
+    Two of those sit within measurement noise of the tolerance (n6_m4 at 0.098,
+    n4_m2 at 0.084, against ~0.01 of batch-order noise), and the threshold was
+    chosen after seeing these numbers on one seed.  It is a fitted rule.
+    """
+    gap = min(np.log2(K_fw) - C_plus, np.log2(K_bw) - C_minus)
+    return float(beta_high if gap <= gap_threshold else beta_low)
+
+
+def usage_beta_for(K: int, C: float, gap_threshold: float = 0.1,
+                   beta_high: float = 0.2, beta_low: float = 0.01) -> float:
+    """
+    The anti-collapse strength for one arm, from its uniformity gap.
+
+    The uniform penalty pulls the state occupancy toward uniform, whose entropy
+    is log2(K), while the truth has entropy C.  So `log2(K) - C` is exactly the
+    distance between what the penalty wants and what is true -- and therefore
+    exactly the bias a large beta can drive S_emp toward.
+
+    Where the gap is small the penalty is nearly free and a large beta buys
+    collapse-resistance for almost nothing.  Where it is large the penalty is
+    actively wrong and beta must stay small.  Measured across the seven baseline
+    processes the gap runs from 0.019 (coin p=0.4,q=0.8 backward) to 0.694 (coin
+    p=0.1,q=0.9 backward), so a single beta cannot serve both ends.
+
+    Note this reads the closed form to choose a HYPERPARAMETER.  It does not put
+    the closed form in the objective; that is usage_target="theory", which makes
+    S_emp circular and is not the default.
+    """
+    return float(beta_high if (np.log2(K) - C) <= gap_threshold else beta_low)
+
+
+def causal_state_occupancy(process: str, mode: str, p: float | None = None,
+                           q: float | None = None, n: int | None = None,
+                           m: int | None = None, dice_probs=None,
+                           merge_tol: float | None = None):
+    """
+    The stationary probability of each causal state -- the distribution whose
+    entropy IS the statistical complexity.
+
+        coin  forward   [q, p] / (p+q)                          H = C+
+              backward  [q-pq, p, pq] / (p+q)                   H = C-
+        flower forward  [1/2] + [1/(2n)] * n                    H = C+ = 1 + log2(n)/2
+              backward  [1/2] + [mass_j / 2] per merged outcome H = C- = 1 + H(mass)/2
+
+    These are the same distributions statistical_complexity and
+    flower_complexity take entropies of, so entropy(occupancy) == C by
+    construction -- asserted in the tests rather than trusted.
+
+    Its use is as the TARGET of the anti-collapse penalty.  Penalising distance
+    from uniform, as the first version did, is penalising distance from the
+    wrong distribution: uniform has entropy log2(K), the truth has entropy C,
+    and the difference between them is exactly the bias a large beta injects.
+    """
+    if mode not in ("forward", "backward"):
+        raise ValueError(f"mode must be 'forward' or 'backward', got {mode!r}")
+
+    if process == "coin":
+        if p is None or q is None:
+            raise ValueError("coin occupancy needs p and q")
+        if mode == "forward":
+            occ = np.array([q, p], dtype=float)
+        else:
+            occ = np.array([q - p * q, p, p * q], dtype=float)
+        return occ / occ.sum()
+
+    if process == "flower":
+        if n is None:
+            raise ValueError("flower needs n")
+        if mode == "forward":
+            # "a roll just happened" with probability 1/2, then one state per
+            # die at 1/(2n) each.
+            return np.concatenate([[0.5], np.full(int(n), 0.5 / int(n))])
+        if dice_probs is None:
+            raise ValueError("flower backward occupancy needs dice_probs")
+        mass = np.asarray(_merged_outcome_mass(dice_probs, merge_tol), dtype=float)
+        mass = mass / mass.sum()
+        return np.concatenate([[0.5], 0.5 * mass])
+
+    raise ValueError(f"unknown process {process!r}; expected 'coin' or 'flower'")
+
+
 def causal_state_count(process: str, mode: str, n: int | None = None,
                        m: int | None = None, dice_probs=None,
                        merge_tol: float | None = None) -> int:

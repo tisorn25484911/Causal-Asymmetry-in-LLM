@@ -78,6 +78,7 @@ class DiscreteCausalDecoder(L.LightningModule):
         state_dim: int | None = None,
         tau: float = 1.0,
         usage_beta: float = 0.0,
+        target_occupancy=None,
     ):
         super().__init__()
         self.mode = mode
@@ -112,6 +113,26 @@ class DiscreteCausalDecoder(L.LightningModule):
         # and K is the state BUDGET, not necessarily the count the process
         # needs.
         self.usage_beta = usage_beta
+
+        # The TARGET of the anti-collapse penalty: the stationary probability of
+        # each causal state, from the closed form (causal_state_occupancy).  Its
+        # entropy is exactly C+ / C-.
+        #
+        # None falls back to penalising distance from UNIFORM, which is what the
+        # first version did and which is biased by construction: uniform has
+        # entropy log2(K), the truth has entropy C, and log2(K) - C is exactly
+        # the error a large beta drives S_emp toward.  Measured, that gap ranges
+        # from 0.019 to 0.694 bits across the seven baseline processes, so the
+        # bias is not small and not constant.
+        if target_occupancy is None:
+            self.register_buffer("target_occupancy", None)
+        else:
+            t = torch.as_tensor(target_occupancy, dtype=torch.float32).flatten()
+            if t.numel() != self.n_states:
+                raise ValueError(
+                    f"target_occupancy has {t.numel()} entries but n_states is "
+                    f"{self.n_states}; they describe the same state set")
+            self.register_buffer("target_occupancy", t / t.sum())
 
         # Same fixed random projection as OneHotDecoder -- a buffer, not a
         # parameter, so "onehot" input coding really is fixed and a d_model
@@ -325,28 +346,41 @@ class DiscreteCausalDecoder(L.LightningModule):
 
     def usage_penalty(self, probs):
         """
-        Penalise collapse of the bottleneck onto a subset of the K states.
+        Penalise the bottleneck for not using its states as the process does.
 
-        With p_bar[k] the state distribution marginalised over batch and
-        positions, the penalty is
+        With p_bar[k] the state occupancy marginalised over batch and positions:
 
-            beta * (log2(K) - H(p_bar))          >= 0, zero at uniform usage.
+          * target_occupancy given -- beta * KL(pi_theory || p_bar), which is 0
+            exactly when the model's occupancy equals the process's stationary
+            distribution.  UNBIASED by construction: the minimiser of the
+            penalty is the truth, so adding it does not move the optimum.
+          * target_occupancy None -- beta * (log2(K) - H(p_bar)), the older
+            uniform version, whose minimiser is uniform and therefore NOT the
+            truth unless the process happens to be uniform.
 
-        It is the entropy of the MARGINAL, not the mean of the per-position
-        entropies.  Those pull opposite ways and the distinction is the point:
-        a flat marginal says every state is used somewhere in the data, while
-        each individual position stays free to commit hard to one.
+        Both are compared on SORTED distributions.  The state labels are
+        arbitrary -- nothing ties the model's state 0 to the theory's state 0 --
+        so an unsorted KL would additionally penalise the model for choosing a
+        different permutation, which is not a defect.  Sorting is a permutation,
+        so gradients still reach every entry.
 
-        It is not free.  Uniform usage over K is not the target -- K is the
-        budget, and a process may genuinely need fewer.  Use a small beta to
-        escape a collapsed run, then anneal to zero and report the unpenalised
-        model.  Any state count quoted from a run with beta > 0 is a count of
-        the states the penalty kept alive.
+        Returns (H(p_bar), penalty).  H is reported rather than the KL because
+        it is the quantity comparable to C.
         """
-        p_bar   = probs.reshape(-1, self.n_states).mean(dim=0)
+        p_bar = probs.reshape(-1, self.n_states).mean(dim=0)
         H_usage = -(p_bar * torch.log2(p_bar + 1e-12)).sum()
-        H_max   = math.log2(self.n_states) if self.n_states > 1 else 0.0
-        return H_usage, self.usage_beta * (H_max - H_usage)
+
+        if self.usage_beta == 0.0:
+            return H_usage, p_bar.sum() * 0.0          # keeps the graph, costs nothing
+
+        if self.target_occupancy is None:
+            H_max = math.log2(self.n_states) if self.n_states > 1 else 0.0
+            return H_usage, self.usage_beta * (H_max - H_usage)
+
+        pi = torch.sort(self.target_occupancy, descending=True).values
+        pb = torch.sort(p_bar, descending=True).values
+        kl = (pi * (torch.log2(pi + 1e-12) - torch.log2(pb + 1e-12))).sum()
+        return H_usage, self.usage_beta * kl
 
     def training_step(self, batch, batch_idx):
         # Backward mode swaps the batch, matching OneHot_model.training_step.

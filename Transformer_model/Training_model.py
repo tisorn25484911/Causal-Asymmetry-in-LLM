@@ -436,6 +436,7 @@ def train_model(
     state_dim: int | None = None,
     tau:       float = 1.0,
     usage_beta: float = 0.0,
+    target_occupancy = None,
 ):
     """
     Trains a decoder and returns a Record_training object.
@@ -490,6 +491,7 @@ def train_model(
             token_size=num_token, d_model=d_model, max_len=max_len, lr=lr, mode=mode,
             n_layers=n_layers, weight_decay=weight_decay,
             n_states=n_states, state_dim=state_dim, tau=tau, usage_beta=usage_beta,
+            target_occupancy=target_occupancy,
         )
     else:
         raise ValueError(
@@ -604,6 +606,7 @@ def train_test_val_pipeline(
     state_dim: int | None = None,
     tau:       float = 1.0,
     usage_beta: float = 0.0,
+    target_occupancy = None,
 ):
     """
     Full cross-validation pipeline with step-level training + validation curves.
@@ -717,6 +720,7 @@ def train_test_val_pipeline(
             state_dim=state_dim,
             tau=tau,
             usage_beta=usage_beta,
+            target_occupancy=target_occupancy,
         )
         all_recorders.append(recorder)
 
