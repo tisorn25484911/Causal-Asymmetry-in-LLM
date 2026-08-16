@@ -809,7 +809,20 @@ def test_weight_decay_defaults_to_zero():
     from configs import BASE, CONFIGS
     from OneHot_model import OneHotDecoder
     assert BASE["weight_decay"] == 0.0
+
+    # DISCRETE is the one deliberate exception, and it is exempt by NAME so that
+    # a nonzero value appearing anywhere else still fails.  It sets 0.01 because
+    # the discrete bottleneck diverges without it: cross-entropy on the backward
+    # coin's point-mass row has no finite minimiser, and held-out CE climbs again
+    # past ~150 epochs.  It has no historical results to invalidate -- the guard
+    # exists to stop a SILENT 0.01 changing numbers that already exist.
+    EXEMPT = {"DISCRETE"}
     for name, cfg in CONFIGS.items():
+        if name in EXEMPT:
+            assert cfg["weight_decay"] != 0.0, (
+                f"{name} is exempt because its nonzero decay is deliberate; "
+                "if it is now 0.0, remove it from EXEMPT")
+            continue
         assert cfg["weight_decay"] == 0.0, f"{name} ships a nonzero default"
     assert OneHotDecoder(token_size=3, d_model=8, max_len=16).weight_decay == 0.0
 

@@ -136,6 +136,8 @@ from DiscreteCausal_analysis import (
 )
 from Model_analysis import (
     causal_state_count,
+    causal_state_occupancy,
+    usage_beta_shared,
     coin_true_conditional,
     flower_complexity,
     flower_entropy_rate,
@@ -210,6 +212,19 @@ def coin_spec(cfg: dict, p: float, q: float) -> dict:
         # would mean a change to one silently changed the other.
         n_states_fw = causal_state_count("coin", "forward"),
         n_states_bw = causal_state_count("coin", "backward"),
+        # Stationary probability of each causal state; its entropy IS C+/C-.
+        # Used as the target of the anti-collapse penalty, which is unbiased
+        # against it and biased against uniform.
+        occupancy_fw = causal_state_occupancy("coin", "forward", p=p, q=q),
+        occupancy_bw = causal_state_occupancy("coin", "backward", p=p, q=q),
+        # ONE anti-collapse strength for BOTH arms -- see usage_beta_shared.
+        usage_beta = usage_beta_shared(
+            causal_state_count("coin", "forward"),
+            statistical_complexity(p, q, "forward"),
+            causal_state_count("coin", "backward"),
+            statistical_complexity(p, q, "backward"),
+            cfg.get("usage_beta_gap", 0.1), cfg.get("usage_beta_high", 0.2),
+            cfg.get("usage_beta_low", 0.01)),
         C_plus      = statistical_complexity(p, q, "forward"),
         C_minus     = statistical_complexity(p, q, "backward"),
         theory      = entropy_rate_coin(p, q),      # H_inf, both directions
@@ -258,6 +273,15 @@ def flower_spec(cfg: dict, n: int, m: int,
         n_states_fw = causal_state_count("flower", "forward", n=n, m=m),
         n_states_bw = causal_state_count("flower", "backward", n=n, m=m,
                                          dice_probs=dice_probs),
+        occupancy_fw = causal_state_occupancy("flower", "forward", n=n, m=m),
+        occupancy_bw = causal_state_occupancy("flower", "backward", n=n, m=m,
+                                              dice_probs=dice_probs),
+        usage_beta = usage_beta_shared(
+            causal_state_count("flower", "forward", n=n, m=m), C_plus,
+            causal_state_count("flower", "backward", n=n, m=m, dice_probs=dice_probs),
+            C_minus,
+            cfg.get("usage_beta_gap", 0.1), cfg.get("usage_beta_high", 0.2),
+            cfg.get("usage_beta_low", 0.01)),
         k_fw        = n + 1,
         k_bw        = m + 1,                     # an upper bound: outcomes that
                                                  # induce the same posterior over
@@ -325,6 +349,17 @@ def one_repeat(spec: dict, cfg: dict, seed: int, khat: bool = False) -> dict:
         # K for this arm.  Only used by embed_type="discrete"; train_model
         # ignores it for "onehot", which is what keeps that path unchanged.
         n_states = spec.get(f"n_states_{arm}")
+        # Only when the config asks for the theory target; "uniform" (the
+        # default) passes None and the model falls back to the uniform penalty.
+        target_occ = (spec.get(f"occupancy_{arm}")
+                      if cfg.get("usage_target") == "theory" else None)
+        # One beta for BOTH arms.  cfg["usage_beta_fixed"] is the --usage-beta
+        # override: a single value for every process, which is what the two
+        # fixed-beta sweep arms use.  Otherwise the spec's per-process value from
+        # usage_beta_shared applies.
+        beta_arm = (cfg["usage_beta_fixed"]
+                    if cfg.get("usage_beta_fixed") is not None
+                    else spec.get("usage_beta", cfg.get("usage_beta", 0.0)))
         # Rebuilt per arm rather than shared: the split is a pure function of
         # (N, seed) so both arms get the same one, while the training loader's
         # shuffle generator is freshly seeded instead of carrying the state the
@@ -346,7 +381,8 @@ def one_repeat(spec: dict, cfg: dict, seed: int, khat: bool = False) -> dict:
             n_states=n_states,
             state_dim=cfg.get("state_dim"),
             tau=cfg.get("tau", 1.0),
-            usage_beta=cfg.get("usage_beta", 0.0),
+            usage_beta=beta_arm,
+            target_occupancy=target_occ,
         )
         to_cpu_for_analysis(rec.model)
 
@@ -489,6 +525,39 @@ def converged_mask(rec: dict, paired: dict) -> np.ndarray:
     return np.ones(n, dtype=bool)
 
 
+def converged_view(rec: dict, paired: dict):
+    """
+    `rec` restricted to repeats where BOTH arms converged, plus a label saying
+    how many survived.
+
+    Every per-process figure is drawn from this rather than from all repeats.  A
+    diverged repeat is an optimisation failure, not a measurement: its |delta|
+    is large and arbitrarily signed, and one of them can dominate a mean.  Mixing
+    the two is how a figure ends up disagreeing with the statistic printed beside
+    it -- `paired["mean"]` has always been the converged-only number while the
+    plots showed all repeats.
+
+    The count is returned so it can go ON the figure.  It is not a footnote: at
+    the discrete architecture's budget only 8 of 30 repeats converged on some
+    coin processes, and a reader who cannot see that will over-read the bar.
+
+    Falls back to all repeats when NOTHING converged, and says so in the label,
+    because an empty figure hides the problem instead of showing it.
+    """
+    conv = converged_mask(rec, paired)
+    runs = [r for r, ok in zip(rec["runs"], conv) if ok]
+    n_c, n_t = int(conv.sum()), int(conv.size)
+    if not runs:
+        return rec, paired, (f"NO repeat converged (0/{n_t}); showing ALL repeats "
+                             f"— these are optimisation failures, not measurements")
+    rec_c = dict(rec)
+    rec_c["runs"] = runs
+    p_c = dict(paired or {})
+    p_c["converged"] = [True] * len(runs)
+    return rec_c, p_c, (f"converged repeats only: {n_c} of {n_t}"
+                        f"   (|CE−H∞| ≤ {CONV_TOL} in BOTH arms)")
+
+
 # ══════════════════════════════════════════════════════════════════════════
 # PLOTS
 # ══════════════════════════════════════════════════════════════════════════
@@ -570,10 +639,12 @@ def _draw_complexity(ax, rec: dict, compact: bool = False, legend: bool = True):
             fontsize=8, color="0.25")
 
 
-def plot_complexity(rec: dict, out_dir: str):
+def plot_complexity(rec: dict, out_dir: str, note: str = ""):
     """One complexity figure for one process."""
     fig, ax = plt.subplots(figsize=(9, 5.5))
     _draw_complexity(ax, rec)
+    if note:
+        fig.text(0.5, -0.02, note, ha="center", fontsize=9, color="#3C4653")
     fig.tight_layout()
     savefig(fig, os.path.join(out_dir, f"{rec['spec']['tag']}_complexity.png"))
 
@@ -597,7 +668,7 @@ def _draw_final_loss(ax, rec: dict, paired: dict, compact: bool = False,
     conv = converged_mask(rec, paired)
     fs, fsl = (6, 6) if compact else (9, 8)
 
-    groups = [("all runs", np.ones(len(fw), dtype=bool), 0.85, None)]
+    groups = [("repeats shown", np.ones(len(fw), dtype=bool), 0.85, None)]
     if conv.sum() and conv.sum() < len(fw):
         groups.append((f"converged only (|CE−H∞| ≤ {CONV_TOL} both arms)",
                        conv, 0.45, "//"))
@@ -658,15 +729,17 @@ def _draw_final_loss(ax, rec: dict, paired: dict, compact: bool = False,
     ax.grid(True, alpha=0.3, axis="y")
 
 
-def plot_final_loss(rec: dict, paired: dict, out_dir: str):
+def plot_final_loss(rec: dict, paired: dict, out_dir: str, note: str = ""):
     """One final-loss figure for one process."""
     fig, ax = plt.subplots(figsize=(10, 5.5))
     _draw_final_loss(ax, rec, paired)
     fig.tight_layout()
+    if note:
+        fig.text(0.5, -0.02, note, ha="center", fontsize=9, color="#3C4653")
     savefig(fig, os.path.join(out_dir, f"{rec['spec']['tag']}_final_loss.png"))
 
 
-def plot_trajectories(rec: dict, out_dir: str):
+def plot_trajectories(rec: dict, out_dir: str, note: str = ""):
     """
     Every run's training-loss trajectory at alpha 0.3, both mean curves in bold,
     with a shaded ±1 sd interval — and, beside it, the same treatment of the
@@ -685,6 +758,8 @@ def plot_trajectories(rec: dict, out_dir: str):
     _draw_loss_trajectories(axes[0], rec)
     _draw_paired_diff(axes[1], rec)
     fig.tight_layout()
+    if note:
+        fig.text(0.5, -0.02, note, ha="center", fontsize=9, color="#3C4653")
     savefig(fig, os.path.join(out_dir, f"{spec['tag']}_trajectories.png"))
 
 
@@ -845,9 +920,9 @@ def plot_summary(records: dict, out_root: str):
                         for t, n, g in zip(tags, ns, gaps)], fontsize=8)
     ax.set_xlabel("delta_CE = CE_BW − CE_FW (bits),  error bars = ±2 sem")
     ax.set_title("Paired delta_CE per process\n"
-                 "grey = not distinguishable from zero (|delta_CE| < 2 sem);  "
-                 "blue = sign agrees with C− − C+, red = disagrees",
-                 fontsize=11, fontweight="bold")
+                 "grey = not distinguishable from zero (|delta_CE| < 2 sem)\n"
+                 "blue = sign agrees with C− − C+,  red = disagrees",
+                 fontsize=10, fontweight="bold")
     ax.grid(True, alpha=0.3, axis="x")
 
     ax = axes[1]
@@ -861,12 +936,22 @@ def plot_summary(records: dict, out_root: str):
     ax.set_xlabel("C− − C+ (bits, closed form)")
     ax.set_ylabel("delta_CE (bits, mean over repeats)")
     ax.set_title("Does delta_CE track the theoretical asymmetry?\n"
-                 "the hypothesis predicts points in the lower-left and "
-                 "upper-right quadrants only",
-                 fontsize=11, fontweight="bold")
+                 "the hypothesis predicts points in the\n"
+                 "lower-left and upper-right quadrants only",
+                 fontsize=10, fontweight="bold")
     ax.grid(True, alpha=0.3)
 
     fig.tight_layout()
+    # Stated once, at the figure level.  Both panels plot the CONVERGED-only
+    # paired statistic, which is what `paired["mean"]` has always been; without
+    # this line a reader compares the bar against the per-repeat delta printed
+    # during the run and finds them disagreeing, including in sign on a process
+    # whose delta is n.s. anyway.
+    fig.text(0.5, -0.015,
+             f"Both panels: CONVERGED repeats only  —  n is how many of the "
+             f"attempted repeats that was  (|CE−H∞| ≤ {CONV_TOL} in BOTH arms). "
+             f"A diverged repeat is an optimisation failure, not a measurement.",
+             ha="center", fontsize=9, color="#3C4653")
     savefig(fig, os.path.join(out_root, "summary_delta_ce.png"))
 
 
@@ -988,7 +1073,12 @@ def _report_from_run(rec: dict, arm: str, mode: str):
     --plots-only redraw these figures without retraining.
     """
     runs = rec.get("runs") or []
-    for r in reversed(runs):
+    # Prefer a converged repeat: the states of a diverged run describe a model
+    # that never settled.  Falls back to any repeat with data if none converged,
+    # so the figure still appears rather than silently vanishing.
+    conv = converged_mask(rec, rec.get("paired") or {})
+    ordered = [r for r, ok in zip(runs, conv) if ok] or list(runs)
+    for r in reversed(ordered):
         a = (r.get(arm) or {})
         if "emission_table" not in a:
             continue
@@ -1162,7 +1252,10 @@ def main(argv=None):
     if args.model is not None:
         cfg["embed_type"] = args.model
     if args.usage_beta is not None:
+        # A FIXED beta for every process, overriding the per-process rule.
+        # This is how the two fixed-beta arms of the three-way sweep are run.
         cfg["usage_beta"] = args.usage_beta
+        cfg["usage_beta_fixed"] = args.usage_beta
     # REORGANISATION_FIX_PLAN.md 4.2.  repo_path so a relative --out-root is
     # resolved against the repo root, not the cwd.  mkdir below is
     # exist_ok=True and load_combined treats a missing pickle as 'nothing done
@@ -1293,9 +1386,16 @@ def main(argv=None):
         combined[tag] = rec
         save_pkl(rec, os.path.join(odir, "results.pkl"))
 
-        plot_complexity(rec, odir)
-        plot_final_loss(rec, rec["paired"], odir)
-        plot_trajectories(rec, odir)
+        # Every per-process figure is drawn from the CONVERGED repeats only,
+        # and says how many that was.  A diverged repeat is an optimisation
+        # failure, not a measurement -- and `paired["mean"]` was already the
+        # converged-only number, so drawing all repeats made the figures
+        # disagree with the statistic beside them.
+        rec_c, paired_c, conv_note = converged_view(rec, rec["paired"])
+        plot_complexity(rec_c, odir, note=conv_note)
+        plot_final_loss(rec_c, paired_c, odir, note=conv_note)
+        plot_trajectories(rec_c, odir, note=conv_note)
+        print(f"  {conv_note}")
 
         # The causal-state figure, one per arm.  Drawn from the LAST repeat's
         # report; draws nothing when the architecture has no explicit states.

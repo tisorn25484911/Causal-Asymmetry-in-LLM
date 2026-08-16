@@ -112,6 +112,7 @@ from DiscreteCausal_analysis import (
 )
 from Model_analysis import (
     causal_state_count,
+    causal_state_occupancy,
     coin_true_conditional,
     warm_up_umap,
     recover_causal_states,
@@ -503,6 +504,8 @@ def _discrete_kwargs(cfg, process, mode, **kw) -> dict:
         return {}
     return dict(
         n_states=causal_state_count(process, mode, **kw),
+        target_occupancy=(causal_state_occupancy(process, mode, **kw)
+                          if cfg.get("usage_target") == "theory" else None),
         state_dim=cfg.get("state_dim"),
         tau=cfg.get("tau", 1.0),
         usage_beta=cfg.get("usage_beta", 0.0),

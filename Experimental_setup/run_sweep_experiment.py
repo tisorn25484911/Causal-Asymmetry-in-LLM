@@ -128,6 +128,7 @@ import time
 import matplotlib
 matplotlib.use("Agg")
 import matplotlib.pyplot as plt
+import matplotlib.colors as mcolors
 import numpy as np
 from matplotlib.colors import TwoSlopeNorm
 from scipy import stats as sstats
@@ -189,6 +190,11 @@ def _default_out_root(model: str) -> str:
     return f"All_Results/{model}/sweep"
 
 COIN_COLOUR, FLOWER_COLOUR = "#4c72b0", "#dd8452"
+# Cells whose repeats mostly failed to converge.  A distinct hue, not a shade of
+# the family colour: these are not "the same measurement, noisier" -- a point
+# computed from 2 of 30 repeats is a different quantity from one computed from
+# 30, and a cell where nothing converged is not a measurement at all.
+UNSTABLE_COLOUR = "#C1443B"
 
 # A step counts as settled when the mean curve stays within this many bits of its
 # final value for the rest of training.  0.01 bits is an order of magnitude below
@@ -738,18 +744,68 @@ def _scatter_panel(ax, rows, key, sem_key, ylabel, title, corrs):
     dropped = [r["tag"].replace("sweep_flower_", "").replace("sweep_coin_", "")
                for r, b in zip(rows, bad) if b]
     rows = [r for r, b in zip(rows, bad) if not b]
+
+    # How much of each cell survived the convergence filter, drawn rather than
+    # tabulated.  A point computed from 2 of 30 repeats is not the same
+    # measurement as one computed from 30, and at the discrete architecture's
+    # budget that difference is large and varies cell to cell.
+    #
+    # Encoding: SHAPE carries the family, as before.  Cells where every repeat
+    # converged keep the family colour.  Cells that lost repeats are drawn on a
+    # red scale, darker the fewer survived, with a colourbar giving the
+    # percentage.  Cells where NOTHING converged have no measurement at all and
+    # are marked at y=0 rather than being silently dropped.
+    def _frac(r):
+        n = r.get("n_repeats") or 0
+        return (r.get("n_conv", n) / n) if n else 0.0
+
+    part_cmap = plt.get_cmap("Reds")
+    part_norm = mcolors.Normalize(vmin=0.0, vmax=1.0)
+    any_partial = False
+
     for kind, colour, marker in (("coin", COIN_COLOUR, "o"),
                                  ("flower", FLOWER_COLOUR, "s")):
         sub = [r for r in rows if r["kind"] == kind]
         if not sub:
             continue
-        x = np.array([r["gap"] for r in sub])
-        y = np.array([r[key] for r in sub], dtype=float)
-        e = np.array([r.get(sem_key, np.nan) for r in sub], dtype=float)
-        ax.errorbar(x, y, yerr=np.nan_to_num(e), fmt=marker, ms=4.5,
-                    color=colour, ecolor=colour, elinewidth=0.7, capsize=1.5,
-                    alpha=0.75, linestyle="none",
-                    label=f"{kind} ({len(sub)})")
+        full = [r for r in sub if _frac(r) >= 1.0]
+        part = [r for r in sub if 0.0 < _frac(r) < 1.0]
+        none = [r for r in sub if _frac(r) == 0.0]
+
+        if full:
+            x = np.array([r["gap"] for r in full])
+            y = np.array([r[key] for r in full], dtype=float)
+            e = np.array([r.get(sem_key, np.nan) for r in full], dtype=float)
+            ax.errorbar(x, y, yerr=np.nan_to_num(e), fmt=marker, ms=4.5,
+                        color=colour, ecolor=colour, elinewidth=0.7, capsize=1.5,
+                        alpha=0.75, linestyle="none",
+                        label=f"{kind}, all converged ({len(full)})")
+        if part:
+            any_partial = True
+            x = np.array([r["gap"] for r in part])
+            y = np.array([r[key] for r in part], dtype=float)
+            e = np.array([r.get(sem_key, np.nan) for r in part], dtype=float)
+            f = np.array([_frac(r) for r in part])
+            # error bars first, in grey, so the face colour stays readable
+            ax.errorbar(x, y, yerr=np.nan_to_num(e), fmt="none", ecolor="0.55",
+                        elinewidth=0.7, capsize=1.5)
+            ax.scatter(x, y, marker=marker, s=46,
+                       c=1.0 - f, cmap=part_cmap, norm=part_norm,
+                       edgecolors="0.25", linewidths=0.7, zorder=3,
+                       label=f"{kind}, some repeats lost ({len(part)})")
+        if none:
+            ax.plot([r["gap"] for r in none], np.zeros(len(none)), "x",
+                    ms=7, mew=1.8, color=UNSTABLE_COLOUR, linestyle="none",
+                    label=f"{kind}, NONE converged ({len(none)})")
+
+    if any_partial:
+        sm = plt.cm.ScalarMappable(cmap=part_cmap, norm=part_norm)
+        cb = ax.figure.colorbar(sm, ax=ax, pad=0.015, fraction=0.045)
+        cb.set_label("repeats LOST to divergence", fontsize=8)
+        cb.set_ticks([0.0, 0.25, 0.5, 0.75, 1.0])
+        cb.set_ticklabels(["0%", "25%", "50%", "75%", "100%"])
+        cb.ax.tick_params(labelsize=7)
+        cb.outline.set_visible(False)
     ax.axhline(0.0, color="k", ls="--", lw=0.9)
     ax.axvline(0.0, color="k", ls="--", lw=0.9)
 
@@ -805,10 +861,12 @@ def plot_sweep_scatter(rows: list, out_root: str):
         return
     fig, axes = plt.subplots(2, 2, figsize=(15, 11))
 
-    _scatter_panel(axes[0][0], rows, "dce", "dce_sem",
+    _scatter_panel(axes[0][0], rows, "dce_conv", "dce_conv_sem",
                    "delta_CE = CE_BW − CE_FW (bits)",
-                   "PRIMARY — final held-out delta_CE, ±1 sem over repeats",
-                   correlations(rows, "dce"))
+                   "PRIMARY — final held-out delta_CE, CONVERGED repeats only, "
+                   "±1 sem\nred = repeats lost to divergence (darker = more lost); "
+                   "×  at y=0 = no repeat converged, so no measurement exists",
+                   correlations(rows, "dce_conv"))
     mixed = mixed_windows(rows)
     win = ",  ".join(f"{k}: {w}–{rows[0]['L']}" for k, w in sorted(
         {r["kind"]: r["burn_used"] for r in rows}.items()))
@@ -1239,7 +1297,10 @@ def main(argv=None):
     if args.model is not None:
         cfg["embed_type"] = args.model
     if args.usage_beta is not None:
+        # A FIXED beta for every process, overriding the per-process rule.
+        # This is how the two fixed-beta arms of the three-way sweep are run.
         cfg["usage_beta"] = args.usage_beta
+        cfg["usage_beta_fixed"] = args.usage_beta
     out_root = mkdir(repo_path(args.out_root or _default_out_root(cfg["embed_type"])))
     # REMAINING_WORK_PLAN.md S5.  Tags are a function of the process, not of
     # d_model, and the store is keyed by tag -- so mixing capacities in one

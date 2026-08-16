@@ -52,6 +52,40 @@ BASE = dict(
     # -0.001, backward +0.024, ~6% of the true C- - C+ gap and in the direction
     # the hypothesis predicts.  Runners also report S_emp at beta=0.
     usage_beta       = 0.01,
+    # Target of the anti-collapse penalty.
+    #
+    #   "uniform"  beta * (log2(K) - H(p_bar)).  Biased: its minimiser is
+    #              uniform while the truth has entropy C, and the gap
+    #              log2(K) - C runs from 0.019 to 0.694 bits across the seven
+    #              baseline processes.  The bias is at least QUANTIFIABLE, and
+    #              S_emp stays an independent measurement.
+    #
+    #   "theory"   beta * KL(pi_theory || p_bar) against causal_state_occupancy.
+    #              Statistically unbiased -- its minimiser IS the truth -- but it
+    #              makes S_emp CIRCULAR: penalising the model for not having the
+    #              occupancy whose entropy is C means S_emp ~ C is installed
+    #              rather than measured.  Measured, no single beta works even
+    #              within one process: flower_n2_m6 needs beta=1.0 forward and is
+    #              destroyed by it backward (S_emp 1.34 against C 2.11).
+    #
+    # "uniform" is the default because S_emp is the quantity this architecture
+    # exists to produce, and a quantifiable bias beats a circular one.
+    usage_target     = "uniform",
+    # beta is chosen PER ARM from the uniformity gap, log2(K) - C.  That gap is
+    # exactly how far the uniform target sits from the truth, so it is exactly
+    # how much a large beta can bias S_emp: use a large beta only where uniform
+    # is nearly right.
+    #
+    # Measured at 150 epochs, this puts all 14 arm-process combinations of the
+    # seven baseline processes inside conv_tol; a FIXED beta of either 0.01 or
+    # 0.2 puts 13 of 14 there, failing on different processes (flower_n2_m6
+    # collapses at 0.01, at +0.70; flower_n6_m4 misses at 0.2, at +0.107).
+    #
+    # It uses the closed form only to pick a hyperparameter, never as a training
+    # target -- unlike usage_target="theory", which makes S_emp circular.
+    usage_beta_gap   = 0.1,     # threshold on log2(K) - C
+    usage_beta_high  = 0.2,     # gap <= threshold: uniform is nearly the truth
+    usage_beta_low   = 0.01,    # gap >  threshold: uniform is wrong, tread lightly
     n_folds          = 5,
     n_layers         = 2,
     # ── optimiser ──────────────────────────────────────────────────────
@@ -274,15 +308,41 @@ QUICK_LARGE_HMM.update(
 # shrinking it would change the process being learned as well as the budget.
 DISCRETE = _cfg(
     **{k: v for k, v in QUICK.items()
-       if k not in ("out_root", "lr", "embed_type",
+       if k not in ("out_root", "lr", "embed_type", "weight_decay",
                     "coin_max_epochs", "flower_max_epochs", "pq_epochs")},
     out_root            = "All_Results/discrete/quick",
     embed_type          = "discrete",
     lr                  = 1e-3,
-    # ~23x QUICK's 10 epochs.  Measured requirement, not a guess.
-    coin_max_epochs     = 230,
-    flower_max_epochs   = 230,
-    pq_epochs           = 115,
+    # 150 epochs, and weight_decay ON -- both measured, and the epoch count is a
+    # CEILING rather than a floor.  The first version of this config used 230
+    # with no decay, on the reasoning that the backward arm had not converged at
+    # +0.13 above H_inf and therefore needed longer.  That was wrong: it had
+    # converged and then DIVERGED past it.  Held-out CE for the coin backward
+    # arm, lr=1e-3:
+    #
+    #   epochs      10      25      50      75     100     150     200     300
+    #   wd=0.0   +.2884  +.1719  +.0999  +.0231  +.0222  +.0621  +.1345  +.2006
+    #   wd=0.01  +.2889  +.1844  +.1208  +.0215  +.0238  +.0155  +.1213  +.1854
+    #
+    # Cross-entropy on a deterministic transition has no finite minimiser, and
+    # the backward coin conditional has a point-mass row, P(prev|2) = [0,1,0].
+    # So the backward arm overshoots and the held-out loss climbs again.  At 230
+    # it sat outside conv_tol, which is why the first discrete run converged on
+    # only 8-9 of 30 repeats for two coin processes.
+    #
+    # At 150 with wd=0.01 EVERY arm of both process families is inside
+    # conv_tol=0.1 -- coin fw +0.0087 bw +0.0223, flower(2,8) fw +0.0082
+    # bw +0.0856.  The forward arm would still improve at 230, but both arms must
+    # share a budget or delta_CE stops being paired, so the budget is set by the
+    # arm that fails first.
+    #
+    # weight_decay is 0.01 here and 0.0 everywhere else: AdamW restores a finite
+    # optimum on exactly the deterministic transitions that cause this, which is
+    # what the weight-decay work already established.
+    coin_max_epochs     = 150,
+    flower_max_epochs   = 150,
+    weight_decay        = 0.01,
+    pq_epochs           = 75,
 )
 
 
