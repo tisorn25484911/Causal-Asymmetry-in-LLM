@@ -385,12 +385,36 @@ layer: the loss softmaxes its input, and softmax of a one-hot caps confidence at
 *grows with the vocabulary*, i.e. an artefact along the flower sweep's own axis.
 And `usage_beta`: at 0 the backward bottleneck collapsed on one seed in four.
 
-Two caveats travel with every discrete result. `state_matrix` and `emission`
-compose into one linear map, so the **state-vector geometry is identified only up
-to an invertible `K × K` transform** — the emission table is the identified view.
-And the architecture needs its own optimisation settings (`DISCRETE`: `lr=1e-3`,
-~23× the steps); at `QUICK`'s `lr=1e-2` it collapses outright. Comparing the two
-architectures therefore compares two working points, not one.
+**The anti-collapse penalty is a real experimental choice, not a detail.**
+`usage_beta` pulls the state occupancy toward uniform, but uniform has entropy
+`log₂K` while the truth has entropy `C` — so the *uniformity gap* `log₂K − C` is
+exactly how far the penalty pulls away from the truth. That gap runs from 0.019
+to 0.694 bits across the seven baseline processes, and no single β serves all of
+them: at β=0.01 `flower_n2_m6` collapses 0.70 bits above `H∞`, and at β=0.20
+`flower_n6_m4` misses tolerance. One β per process, **shared by both arms** and
+selected from the smaller gap, puts all seven inside tolerance. Shared rather
+than per-arm because ΔCE is a *paired* difference — an arm-dependent
+hyperparameter is the very artefact the pairing exists to exclude.
+
+Because that rule is fitted to one seed, **the sweep is run three times**: fixed
+β=0.01, fixed β=0.20, and the per-process rule, into three disjoint trees. A
+trend that survives all three is not an artefact of the penalty. The sweep
+scatter draws each cell by how many of its repeats converged — family colour when
+all did, a red scale when some were lost, and `×` at zero when none did.
+
+Penalising toward the *theoretical* occupancy instead would be statistically
+unbiased, and it is implemented (`usage_target="theory"`), but it is not the
+default: it makes `S_emp` circular, since `S_emp` is the entropy of the very
+occupancy being prescribed.
+
+Three further caveats travel with every discrete result. `state_matrix` and
+`emission` compose into one linear map, so the **state-vector geometry is
+identified only up to an invertible `K × K` transform** — the emission table is
+the identified view. The architecture needs its own optimisation settings
+(`DISCRETE`: `lr=1e-3`, `weight_decay=0.01`, 150 epochs); at `QUICK`'s `lr=1e-2`
+it collapses outright, and past ~200 epochs the coin backward arm diverges again,
+so the budget is a ceiling and not a floor. And every statistic is computed from
+**converged repeats only**, with the count reported on every figure.
 
 See `HOW_TO_RUN.md` §14A for the flags, the output layout and the figure.
 
@@ -974,7 +998,9 @@ python Transformer_model/plot_state_clusters.py                 # causal-state f
 # The discrete architecture (§3.6) — its own config, its own output tree
 python Experimental_setup/run_statistical_trj.py --config DISCRETE --repeats 30
 python Experimental_setup/run_experiments.py     --config QUICK --model onehot
-bash Run_logs/launch_model_comparison.sh                        # both, in sequence
+
+# The full discrete suite: baseline plus the sweep at three betas, concurrently
+bash Run_logs/launch_discrete_3way.sh                           # ~20-25 h
 python Experimental_setup/run_statistical_trj.py --khat          # ~2.3 h, repeat statistics (done)
 python Experimental_setup/run_statistical_trj.py --plots-only    # redraw its figures, no training
 

@@ -1599,17 +1599,78 @@ caveat on any model-to-model comparison and belongs beside the results.**
 Measured cost per process-repeat (2 arms × 5 folds): `onehot` ~15 s,
 `discrete` ~320 s.
 
-### 14A.4 `usage_beta`, and the bias it buys
+### 14A.4 `usage_beta`, and how it is chosen
 
-`usage_beta` penalises collapse of the bottleneck onto a subset of the states.
-It defaults to **0.01**, not 0 — unlike `weight_decay` — because 0 is measurably
-unsafe: on the coin backward arm at `K=3` over 4 seeds, `β=0` collapsed one seed
-in four to 2 of 3 states and `CE−H∞` ranged over 15×, while `β=0.01` found all
-three every time at `+0.036 ± 0.003`.
+`usage_beta` penalises collapse of the bottleneck onto a subset of its states.
+With `p̄[k]` the state occupancy marginalised over batch and positions, the
+penalty is `β · (log₂K − H(p̄))` — the entropy of the **marginal**, not the mean
+of per-position entropies, so each position stays free to commit hard to one
+state while the marginal stays spread.
 
-It is not free — it biases `S_emp` upward, and the size of that bias is
-configuration-dependent (measured between ~0.000 and ~+0.03 on the backward
-arm). Re-run with `--usage-beta 0` to see the unpenalised number, and quote both.
+**Its target is wrong, and by a knowable amount.** Uniform occupancy has entropy
+`log₂K`; the truth has entropy `C`. So the **uniformity gap** `log₂K − C` is
+exactly how far the penalty pulls away from the truth, and therefore how much a
+large β can bias `S_emp`. Across the seven baseline processes that gap runs from
+0.019 to 0.694 bits, so no single β serves all of them:
+
+| β | at 150 epochs |
+|---|---|
+| 0.01 | `flower_n2_m6` collapses, +0.70 above `H∞`; the other six converge |
+| 0.20 | `n2_m6` rescued (+0.059); `flower_n6_m4` misses at +0.107 |
+| 0.05 | dominated everywhere — never the best for any process, fails two |
+
+**The rule.** One β per process, **shared by both arms**, from the smaller gap:
+
+```
+β = 0.20  if  min(log₂K_fw − C⁺,  log₂K_bw − C⁻) ≤ 0.1,  else 0.01
+```
+
+```
+process           gap fw  gap bw    min    β     max|CE−H∞|
+coin_p010_q090     0.531   0.694   0.531  0.01     0.0190
+coin_p030_q040     0.015   0.096   0.015  0.20     0.0625
+coin_p040_q080     0.082   0.019   0.019  0.20     0.0709
+flower_n2_m6       0.085   0.694   0.085  0.20     0.0591   (only 0.20 works)
+flower_n2_m8       0.085   0.693   0.085  0.20     0.0328
+flower_n4_m2       0.322   0.090   0.090  0.20     0.0837
+flower_n6_m4       0.515   0.332   0.332  0.01     0.0983   (only 0.01 works)
+```
+
+All seven inside `conv_tol`. **Shared and not per-arm**, and that is not a
+simplification: ΔCE is a *paired* difference whose validity rests on the two arms
+differing only in the mask and the batch convention. Training them at
+regularisation strengths 20× apart is precisely the arm-dependent artefact the
+pairing exists to exclude.
+
+**It is a fitted rule.** The threshold, the β menu and the min-versus-max choice
+were all chosen after seeing these numbers, on one seed and one fold. Two cells
+sit within measurement noise of the tolerance (`n6_m4` at 0.098, `n4_m2` at
+0.084, against ~0.01 of batch-order noise). This is why the sweep is run three
+times — see 14A.8.
+
+`--usage-beta X` overrides the rule with a fixed X for every process. `0`
+disables the penalty entirely.
+
+### 14A.4b Why not penalise toward the theoretical occupancy?
+
+`usage_target="theory"` replaces the uniform target with
+`β · KL(π_theory ‖ p̄)` against `Model_analysis.causal_state_occupancy`, compared
+on sorted distributions since state labels are arbitrary. It is statistically
+**unbiased** — its minimiser is the truth, and measured, where the model already
+matched the target β changed nothing at all.
+
+It is nevertheless **not** the default, for two measured reasons.
+
+1. **No single β works, even within one process.** `flower_n2_m6` needs β=1.0
+   forward (+0.0111, `S_emp` exactly 1.5000) and is destroyed by it backward
+   (`S_emp` 1.336 against C 2.114).
+2. **It makes `S_emp` circular.** `S_emp` *is* the entropy of the occupancy;
+   penalising the model for any occupancy other than the one whose entropy is C
+   installs the answer rather than measuring it. `S_emp` from occupancy is the
+   main reason to prefer this architecture over clustering `k̂`.
+
+The uniform target's bias is at least quantifiable — it is the gap, printed
+beside every `S_emp`.
 
 ### 14A.5 Where the output goes
 
@@ -1655,7 +1716,43 @@ Three panels, in the style of `Jupyter_notebooks/test_new training method.ipynb`
 `S_emp` is printed in the title. On the coin it lands within ~0.001 bits of the
 closed-form `C⁺`/`C⁻` with no clustering hyperparameters at all.
 
-### 14A.7 The caveat to check before quoting ΔCE
+### 14A.7 The sweep is run three times
+
+No single `usage_beta` serves every process (14A.4), and the rule that does is
+fitted to one seed. So the sweep is run three times over the same 50-cell grid,
+into three disjoint trees:
+
+| run | β | out_root |
+|---|---|---|
+| fixed low | 0.01 everywhere | `All_Results/discrete/sweep_beta001` |
+| fixed high | 0.20 everywhere | `All_Results/discrete/sweep_beta020` |
+| rule | per process, shared by both arms | `All_Results/discrete/sweep_betarule` |
+
+They are independent — separate pickles, separate figures — so they run
+**concurrently**. On an 11-core machine each is pinned to 3 threads, leaving 2
+for the baseline chain: ~20–25 h wall-clock against ~45 h sequential.
+
+Reading them together is the point. A trend that appears under all three is not
+an artefact of the anti-collapse penalty; one that appears under only one is.
+
+### 14A.8 Convergence is drawn on the sweep scatter, not tabulated
+
+Every panel plots the **converged-only** statistic (`dce_conv`), and each cell is
+drawn according to how much of it survived:
+
+| marker | meaning |
+|---|---|
+| family colour, filled | every repeat converged |
+| **red, darker = worse** | some repeats lost to divergence; the colourbar gives the percentage |
+| **red ×** at `y = 0` | no repeat converged — no measurement exists for that cell |
+
+Marker **shape** still carries the family (circle = coin, square = flower), and
+the legend counts each category. A point computed from 2 of 30 repeats is not
+the same measurement as one from 30, and at this architecture's budget that
+difference is large and varies cell to cell — so it is visible on the figure
+rather than buried in a table.
+
+### 14A.9 The caveat to check before quoting ΔCE
 
 At the DISCRETE budget the forward arm reaches `H∞` (+0.004…+0.013 measured)
 but **the backward arm does not** (+0.14…+0.17). A ΔCE from that pair is
@@ -1711,6 +1808,21 @@ python Experimental_setup/analyse_lambda_sweep.py --like-for-like
 # Reproducibility: 'cpu' is the only bit-reproducible accelerator (Section 1.3)
 python Experimental_setup/run_statistical_trj.py --repeats 4 --accelerator cpu \
        --out-root /tmp/traj_check
+
+# The three-way discrete sweep + baseline, all at once (Sections 14A.7-14A.8)
+bash Run_logs/launch_discrete_3way.sh        # ~20-25 h, 3 sweeps concurrent
+
+# ... or the three sweeps individually (they are independent; run them in parallel)
+OMP_NUM_THREADS=3 python Experimental_setup/run_sweep_experiment.py --config DISCRETE \
+    --sweep-coin 0.15 0.35 0.55 0.75 0.95 --sweep-flower 2 4 6 8 10 --repeats 5 \
+    --usage-beta 0.01 --out-root All_Results/discrete/sweep_beta001 &
+OMP_NUM_THREADS=3 python Experimental_setup/run_sweep_experiment.py --config DISCRETE \
+    --sweep-coin 0.15 0.35 0.55 0.75 0.95 --sweep-flower 2 4 6 8 10 --repeats 5 \
+    --usage-beta 0.20 --out-root All_Results/discrete/sweep_beta020 &
+OMP_NUM_THREADS=3 python Experimental_setup/run_sweep_experiment.py --config DISCRETE \
+    --sweep-coin 0.15 0.35 0.55 0.75 0.95 --sweep-flower 2 4 6 8 10 --repeats 5 \
+    --out-root All_Results/discrete/sweep_betarule &
+wait
 
 # The two architectures (Section 14A)
 python Experimental_setup/run_experiments.py     --config QUICK    --model onehot
