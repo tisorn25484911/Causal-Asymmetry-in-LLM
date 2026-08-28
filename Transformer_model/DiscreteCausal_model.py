@@ -16,8 +16,6 @@ have to be clustered out of the latents (Model_analysis.recover_causal_states,
 with a silhouette-selected k-hat and a state_tol); here the state of a position
 is just `argmax(state_lgt)`, so S_emp is the entropy of the occupancy
 distribution and needs no clustering hyperparameters at all.
-
-MODULAR_MODELS_PLAN.md sections 4 and 5.
 """
 import math
 
@@ -27,10 +25,6 @@ import torch.nn.functional as F
 import lightning as L
 from torch.optim import AdamW
 
-# Shared with OneHotDecoder on purpose.  IMPROVEMENT_PLAN C4 deleted a set of
-# duplicated definitions that had already drifted apart; re-importing keeps the
-# two architectures differing ONLY in the head, which is what makes a
-# model-to-model comparison mean anything.
 from OneHot_model import (
     PositionalEncoding,
     AttentionModel,
@@ -91,58 +85,29 @@ class DiscreteCausalDecoder(L.LightningModule):
         self.lr = lr
         self.weight_decay = weight_decay
 
-        # K -- how many causal states exist.  See the class docstring: this is
+        # K -- number of causal state.  See the class docstring: this is
         # an experimental setting and the runner is expected to supply it.
         self.n_states = token_size if n_states is None else int(n_states)
 
         # S -- the DIMENSION of a state vector.  Defaults to K, which makes
-        # state_matrix square.  It carries no expressive power (see below), so
-        # there is rarely a reason to change it.
         self.state_dim = self.n_states if state_dim is None else int(state_dim)
 
-        # Temperature of the straight-through SURROGATE only.  argmax is
-        # invariant to positive scaling, so tau never changes the forward
-        # value.  tau < 1 sharpens `probs` toward the hard one-hot, shrinking
-        # the estimator's bias at the cost of a flatter gradient; measured, tau
-        # <= 0.2 sharpens early enough to lock in whichever state happens to be
-        # winning and collapses the bottleneck.  1.0 is plain softmax.
+        # Temperature of the straight-through SURROGATE only: 1.0 is plain softmax.
         self.tau = tau
 
         # Strength of the anti-collapse penalty; see usage_penalty().  0.0 is
-        # the default because the penalty pushes usage toward uniform over K,
-        # and K is the state BUDGET, not necessarily the count the process
-        # needs.
+        # the default 
         self.usage_beta = usage_beta
 
-        # The TARGET of the anti-collapse penalty: the stationary probability of
-        # each causal state, from the closed form (causal_state_occupancy).  Its
-        # entropy is exactly C+ / C-.
-        #
-        # None falls back to penalising distance from UNIFORM, which is what the
-        # first version did and which is biased by construction: uniform has
-        # entropy log2(K), the truth has entropy C, and log2(K) - C is exactly
-        # the error a large beta drives S_emp toward.  Measured, that gap ranges
-        # from 0.019 to 0.694 bits across the seven baseline processes, so the
-        # bias is not small and not constant.
-        if target_occupancy is None:
-            self.register_buffer("target_occupancy", None)
-        else:
-            t = torch.as_tensor(target_occupancy, dtype=torch.float32).flatten()
-            if t.numel() != self.n_states:
-                raise ValueError(
-                    f"target_occupancy has {t.numel()} entries but n_states is "
-                    f"{self.n_states}; they describe the same state set")
-            self.register_buffer("target_occupancy", t / t.sum())
+        # ALways set as NONE
+        self.register_buffer("target_occupancy", None)
 
-        # Same fixed random projection as OneHotDecoder -- a buffer, not a
-        # parameter, so "onehot" input coding really is fixed and a d_model
-        # sweep varies representational capacity alone.
+
         rand_prj = torch.randn(token_size, d_model)
         rand_prj = F.normalize(rand_prj, dim=1)
         self.register_buffer("rand_prj", rand_prj)
 
         self.pe = PositionalEncoding(d_model=d_model, max_len=max_len)
-
         self.attn_layers = nn.ModuleList([
             AttentionModel(d_model=d_model) for _ in range(n_layers)
         ])
@@ -158,48 +123,11 @@ class DiscreteCausalDecoder(L.LightningModule):
         self.ln_attn = nn.ModuleList([nn.LayerNorm(d_model) for _ in range(n_layers)])
         self.ln_ffn  = nn.ModuleList([nn.LayerNorm(d_model) for _ in range(n_layers)])
 
-        # There is deliberately no `output_prj: D -> V` here.  OneHotDecoder has
-        # one, and the notebook prototype took its argmax over it -- but once the
-        # argmax moves to a dedicated state head the alphabet logits have no job:
-        # the loss flows x -> state_head -> state_matrix -> emission and never
-        # touches them.  Measured, output_prj received exactly ZERO gradient, so
-        # `last_logits` would be an untrained random projection and meaningless
-        # to plot.  The causal-state figures replace it.
-        #
-        # D -> K.  The state code.  The argmax is taken HERE and not over
-        # the alphabet logits, which is the whole reason n_states can be chosen: taking
-        # it over the V-dimensional logits would pin the state budget to the
-        # vocabulary, and V is a property of the process that cannot be set per
-        # arm.  Measured consequence of doing that on the coin, where H_inf is
-        # time-reversal invariant and therefore identical for both arms:
-        # forward reached H_inf (+0.0016) while backward sat +0.2371 above it,
-        # an artefact ~100x the effect being measured, pointing the same way as
-        # the hypothesis.  MODULAR_MODELS_PLAN.md 4.1.
-        self.state_head = nn.Linear(d_model, self.n_states)
 
-        # K -> S.  The learned state VECTORS, one row per state.  Held as a
-        # bare Parameter so `onehot @ state_matrix` is literally a row lookup
-        # and row k reads out as "the vector of state k".
-        #
-        # It carries no expressive power: state_matrix followed by emission
-        # composes into a single (K, V) linear map, so state_matrix @ Q with
-        # inv(Q) . emission is an identical model for any invertible Q
-        # (verified numerically, max output deviation 3.6e-07).  It exists so
-        # there is something to plot; the GEOMETRY of that plot is not
-        # identified by training and the figure must say so.  The identified
-        # object is emission_table().
+        self.state_head = nn.Linear(d_model, self.n_states)
         self.state_matrix = nn.Parameter(
             torch.randn(self.n_states, self.state_dim) / (self.state_dim ** 0.5)
         )
-
-        # S -> V.  Decodes a state vector into a next-token distribution.
-        #
-        # This layer is why the loss stays a genuine cross-entropy.  F.cross_entropy
-        # softmaxes whatever it is handed, and softmax of a one-hot cannot exceed
-        # 1/(1 + (V-1)/e) confidence -- 0.576 at V=3, 0.198 at V=12 -- so returning
-        # the bottleneck directly would put a floor under the achievable CE that
-        # GROWS WITH THE VOCABULARY.  The flower grid varies V, so that floor would
-        # be an artefact along the sweep's own axis.
         self.emission = nn.Linear(self.state_dim, token_size)
 
         self.save_hyperparameters()
@@ -207,6 +135,8 @@ class DiscreteCausalDecoder(L.LightningModule):
         # Filled by forward().
         self.last_encodings   = None    # (B,T,D)
         self.last_state_probs = None    # (B,T,K)  softmax of the state code
+        self.last_state_onehot = None   # (B,T,K)
+
         self.last_states      = None    # (B,T)    the state index actually taken
         self.last_causal_reps = None    # (B,T,S)  the state vector received
         self.last_attention   = None
@@ -300,16 +230,11 @@ class DiscreteCausalDecoder(L.LightningModule):
         states = state_logits.argmax(dim=-1)
         hard   = F.one_hot(states, num_classes=self.n_states).float()
 
-        # Straight-through estimator.  argmax has no derivative and F.one_hot
-        # returns a leaf, so this is mandatory rather than a refinement:
-        # without it the graph is severed here and every layer beneath stays at
-        # its initialisation while the loss still appears to fall.  Measured on
-        # the notebook prototype, 2 of 33 parameter tensors trained.
-        #
+        # Straight-through estimator
         # Forward value:     hard        Backward gradient: through probs
         state_onehot = (hard - probs).detach() + probs
+        self.last_state_onehot = state_onehot
 
-        # Row lookup: causal_rep[b,t] = state_matrix[states[b,t]].
         causal_rep = state_onehot @ self.state_matrix
         out_logits = self.emission(causal_rep)
 
@@ -344,50 +269,23 @@ class DiscreteCausalDecoder(L.LightningModule):
 
     # ---------------------------------------------------------------- losses
 
-    def usage_penalty(self, probs):
+    def usage_penalty(self, occ):
         """
         Penalise the bottleneck for not using its states as the process does.
-
-        With p_bar[k] the state occupancy marginalised over batch and positions:
-
-          * target_occupancy given -- beta * KL(pi_theory || p_bar), which is 0
-            exactly when the model's occupancy equals the process's stationary
-            distribution.  UNBIASED by construction: the minimiser of the
-            penalty is the truth, so adding it does not move the optimum.
-          * target_occupancy None -- beta * (log2(K) - H(p_bar)), the older
-            uniform version, whose minimiser is uniform and therefore NOT the
-            truth unless the process happens to be uniform.
-
-        Both are compared on SORTED distributions.  The state labels are
-        arbitrary -- nothing ties the model's state 0 to the theory's state 0 --
-        so an unsorted KL would additionally penalise the model for choosing a
-        different permutation, which is not a defect.  Sorting is a permutation,
-        so gradients still reach every entry.
 
         Returns (H(p_bar), penalty).  H is reported rather than the KL because
         it is the quantity comparable to C.
         """
-        p_bar = probs.reshape(-1, self.n_states).mean(dim=0)
+        occ_flat = occ.reshape(-1, self.n_states)
+        p_bar = occ_flat.mean(dim=0)
         H_usage = -(p_bar * torch.log2(p_bar + 1e-12)).sum()
 
         if self.usage_beta == 0.0:
-            return H_usage, p_bar.sum() * 0.0          # keeps the graph, costs nothing
-
-        if self.target_occupancy is None:
-            H_max = math.log2(self.n_states) if self.n_states > 1 else 0.0
-            return H_usage, self.usage_beta * (H_max - H_usage)
-
-        pi = torch.sort(self.target_occupancy, descending=True).values
-        pb = torch.sort(p_bar, descending=True).values
-        kl = (pi * (torch.log2(pi + 1e-12) - torch.log2(pb + 1e-12))).sum()
-        return H_usage, self.usage_beta * kl
+            return H_usage, p_bar.sum() * 0.0          # keeps the graph
+        
+        return H_usage, self.usage_beta * (H_usage)
 
     def training_step(self, batch, batch_idx):
-        # Backward mode swaps the batch, matching OneHot_model.training_step.
-        # This is not cosmetic: fed unswapped, a triu-masked model can see its
-        # own target -- target[t] = x[t+1] sits at input position t+1, which is
-        # inside the window [t, T-1] -- and the CE drops BELOW H_inf, which is
-        # impossible for a real predictor.
         if self.mode == "forward":
             inputs, targets = batch
         else:
@@ -396,10 +294,7 @@ class DiscreteCausalDecoder(L.LightningModule):
         out_logits = self(inputs)
         loss, perplexity = cross_ent_onehot(out_logits, targets)
 
-        # The CE is logged separately from the penalised objective.  Only the
-        # CE is comparable to H_inf; the total is not a cross-entropy and must
-        # never be quoted as one.
-        H_usage, penalty = self.usage_penalty(self.last_state_probs)
+        H_usage, penalty = self.usage_penalty(self.last_state_onehot)
 
         self.log("train_loss", loss, on_step=False, on_epoch=True, prog_bar=True)
         self.log("train_perplexity", perplexity,
@@ -427,12 +322,4 @@ class DiscreteCausalDecoder(L.LightningModule):
         self._epoch_states = set()
 
     def configure_optimizers(self):
-        # AdamW so weight_decay is decoupled.  At weight_decay=0.0 this is
-        # bit-identical to plain Adam, which is what every existing result used.
-        #
-        # Note decay reaches state_matrix like any other parameter and shrinks
-        # the state vectors toward the origin -- measured ~18% at lambda=0.1.
-        # emission can rescale to compensate, so the model need not change, but
-        # the SCALE of the state-vector scatter does.  Hold lambda fixed when
-        # comparing state geometry across runs.
         return AdamW(self.parameters(), lr=self.lr, weight_decay=self.weight_decay)
