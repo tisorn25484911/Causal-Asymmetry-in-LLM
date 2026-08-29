@@ -137,7 +137,7 @@ from DiscreteCausal_analysis import (
 from Model_analysis import (
     causal_state_count,
     causal_state_occupancy,
-    usage_beta_shared,
+    discrete_hparams,
     coin_true_conditional,
     flower_complexity,
     flower_entropy_rate,
@@ -206,25 +206,18 @@ def coin_spec(cfg: dict, p: float, q: float) -> dict:
         batch       = cfg["coin_batch"],
         k_fw        = 2,                 # 2 forward causal states, any (p, q)
         k_bw        = 3,                 # 3 backward causal states
-        # K for a discrete-bottleneck model.  Same numbers as k_fw/k_bw here,
-        # but kept separate: k_* is the assumed cluster count for the k-means
-        # S_emp estimator, n_states_* is a model hyperparameter.  Coupling them
-        # would mean a change to one silently changed the other.
-        n_states_fw = causal_state_count("coin", "forward"),
-        n_states_bw = causal_state_count("coin", "backward"),
+        # The TRUE counts, for comparison against what the bottleneck finds.
+        # Not the model's K -- see n_states below.
+        true_k_fw   = causal_state_count("coin", "forward"),
+        true_k_bw   = causal_state_count("coin", "backward"),
         # Stationary probability of each causal state; its entropy IS C+/C-.
-        # Used as the target of the anti-collapse penalty, which is unbiased
-        # against it and biased against uniform.
+        # Compared against the measured occupancy; NOT a training target.
         occupancy_fw = causal_state_occupancy("coin", "forward", p=p, q=q),
         occupancy_bw = causal_state_occupancy("coin", "backward", p=p, q=q),
-        # ONE anti-collapse strength for BOTH arms -- see usage_beta_shared.
-        usage_beta = usage_beta_shared(
-            causal_state_count("coin", "forward"),
-            statistical_complexity(p, q, "forward"),
-            causal_state_count("coin", "backward"),
-            statistical_complexity(p, q, "backward"),
-            cfg.get("usage_beta_gap", 0.1), cfg.get("usage_beta_high", 0.2),
-            cfg.get("usage_beta_low", 0.01)),
+        # K, state_dim and beta, resolved from V and the geometry.  ONE K for
+        # both arms: it is a budget, not an estimate, and unequal budgets would
+        # be exactly the arm-dependent asymmetry the paired design excludes.
+        **discrete_hparams(cfg, cfg["coin_num_token"], cfg["coin_batch"]),
         C_plus      = statistical_complexity(p, q, "forward"),
         C_minus     = statistical_complexity(p, q, "backward"),
         theory      = entropy_rate_coin(p, q),      # H_inf, both directions
@@ -266,22 +259,19 @@ def flower_spec(cfg: dict, n: int, m: int,
         seq_len     = cfg["flower_seq_len"],     # CYCLES; tokens = 2 x this
         max_epochs  = cfg["flower_max_epochs"],
         batch       = cfg["flower_batch"],
-        # The EXACT counts for a discrete bottleneck.  Note n_states_bw is not
-        # m+1 in general -- outcomes whose posteriors coincide are one backward
-        # state, and at n=1 they all are -- so it is computed from the dice that
-        # were actually drawn, under the same merge rule as C-.
-        n_states_fw = causal_state_count("flower", "forward", n=n, m=m),
-        n_states_bw = causal_state_count("flower", "backward", n=n, m=m,
+        # The TRUE counts, for comparison against what the bottleneck finds.
+        # Note true_k_bw is not m+1 in general -- outcomes whose posteriors
+        # coincide are ONE backward state, and at n=1 they all are -- so it is
+        # computed from the dice actually drawn, under the same merge rule as C-.
+        true_k_fw   = causal_state_count("flower", "forward", n=n, m=m),
+        true_k_bw   = causal_state_count("flower", "backward", n=n, m=m,
                                          dice_probs=dice_probs),
         occupancy_fw = causal_state_occupancy("flower", "forward", n=n, m=m),
         occupancy_bw = causal_state_occupancy("flower", "backward", n=n, m=m,
                                               dice_probs=dice_probs),
-        usage_beta = usage_beta_shared(
-            causal_state_count("flower", "forward", n=n, m=m), C_plus,
-            causal_state_count("flower", "backward", n=n, m=m, dice_probs=dice_probs),
-            C_minus,
-            cfg.get("usage_beta_gap", 0.1), cfg.get("usage_beta_high", 0.2),
-            cfg.get("usage_beta_low", 0.01)),
+        # K = 5V, state_dim = V, beta = 1/(batch*chunk).  V = n+m here, so K
+        # ranges 20..100 across the (n,m) grid rather than being a constant.
+        **discrete_hparams(cfg, n + m, cfg["flower_batch"]),
         k_fw        = n + 1,
         k_bw        = m + 1,                     # an upper bound: outcomes that
                                                  # induce the same posterior over
@@ -346,20 +336,16 @@ def one_repeat(spec: dict, cfg: dict, seed: int, khat: bool = False) -> dict:
     out = {"seed": seed}
     for arm, mode, use_t, k in (("fw", "forward",  "last",  spec["k_fw"]),
                                 ("bw", "backward", "first", spec["k_bw"])):
-        # K for this arm.  Only used by embed_type="discrete"; train_model
-        # ignores it for "onehot", which is what keeps that path unchanged.
-        n_states = spec.get(f"n_states_{arm}")
-        # Only when the config asks for the theory target; "uniform" (the
-        # default) passes None and the model falls back to the uniform penalty.
-        target_occ = (spec.get(f"occupancy_{arm}")
-                      if cfg.get("usage_target") == "theory" else None)
-        # One beta for BOTH arms.  cfg["usage_beta_fixed"] is the --usage-beta
-        # override: a single value for every process, which is what the two
-        # fixed-beta sweep arms use.  Otherwise the spec's per-process value from
-        # usage_beta_shared applies.
-        beta_arm = (cfg["usage_beta_fixed"]
-                    if cfg.get("usage_beta_fixed") is not None
-                    else spec.get("usage_beta", cfg.get("usage_beta", 0.0)))
+        # K, state_dim and beta come from the spec, where discrete_hparams
+        # resolved them once from V and the geometry.  All three are the SAME
+        # for both arms; only embed_type="discrete" reads them.
+        n_states  = spec.get("n_states")
+        state_dim = spec.get("state_dim")
+        # --usage-beta overrides the computed 1/N.  That is the beta sweep's
+        # only entry point; every other run leaves it None and gets 1/N.
+        beta_arm  = (cfg["usage_beta_fixed"]
+                     if cfg.get("usage_beta_fixed") is not None
+                     else spec.get("usage_beta"))
         # Rebuilt per arm rather than shared: the split is a pure function of
         # (N, seed) so both arms get the same one, while the training loader's
         # shuffle generator is freshly seeded instead of carrying the state the
@@ -379,10 +365,9 @@ def one_repeat(spec: dict, cfg: dict, seed: int, khat: bool = False) -> dict:
             val_every_n_steps=cfg["val_every_n_steps"],
             weight_decay=cfg.get("weight_decay", 0.0),
             n_states=n_states,
-            state_dim=cfg.get("state_dim"),
+            state_dim=state_dim,
             tau=cfg.get("tau", 1.0),
             usage_beta=beta_arm,
-            target_occupancy=target_occ,
         )
         to_cpu_for_analysis(rec.model)
 
@@ -437,6 +422,16 @@ def one_repeat(spec: dict, cfg: dict, seed: int, khat: bool = False) -> dict:
             arm_res["emission_table"] = csr["emissions"].tolist()
             arm_res["state_vectors"]  = csr["vectors"].tolist()
             arm_res["usage_beta"]     = csr["usage_beta"]
+            # H(state | current token), in bits.  0 exactly when the assignment
+            # is a function of the token -- which the TRUE causal state is, in
+            # both arms of both processes -- so any positive value means the
+            # bottleneck is keying on context it does not need.  The only
+            # diagnostic here that needs no ground truth.
+            arm_res["h_state_given_token"] = csr["h_state_given_token"]
+            # True count for this arm, so K vs k_discovered can be plotted from
+            # the pickle alone.  spec carries it; the record must too, because
+            # --plots-only reads records, not specs.
+            arm_res["true_k"] = spec.get(f"true_k_{arm}")
 
         out[arm] = arm_res
         del rec
@@ -1145,9 +1140,40 @@ def parse_args(argv=None):
                          "one-hot over the process's theoretical number of "
                          "causal states.")
     ap.add_argument("--usage-beta", type=float, default=None,
-                    help="anti-collapse penalty for --model discrete. The "
-                         "config default is 0.01; pass 0 to measure S_emp "
-                         "without the penalty's bias.")
+                    help="override the computed beta = 1/(batch*chunk_len).  "
+                         "Leave unset for normal runs; this is 06_beta_verify's "
+                         "axis and the control arm of 03/03b.  Pass 0 to "
+                         "measure S_emp with no penalty at all.")
+    # ── DISCRETE_V2_PLAN.md axes ───────────────────────────────────────
+    # Each overrides one resolved hyperparameter so the plan's sweeps run
+    # through this runner rather than needing their own.  All default to None,
+    # i.e. "use the value discrete_hparams computes", so no existing invocation
+    # changes.  Every one of these moves a quantity the results depend on, so
+    # each is written into run_config for provenance.
+    ap.add_argument("--n-states", type=int, default=None,
+                    help="override K (default 5V).  01_ksweep's axis.  K is a "
+                         "BUDGET: measured, K at the exact causal-state count "
+                         "fails and slack is required.")
+    ap.add_argument("--state-dim", type=int, default=None,
+                    help="override the state-vector dimension (default V).  "
+                         "02_statedim's axis.  Carries no expressive power -- "
+                         "state_matrix then emission compose to one (K,V) map.")
+    ap.add_argument("--d-model", type=int, default=None,
+                    help="override cfg['d_model'] (default 32).  04_capacity's "
+                         "axis, and the only completely untested one.")
+    ap.add_argument("--chunk-len", type=int, default=None,
+                    help="override cfg['train_chunk_len'] (default 256).  "
+                         "03_seqlen's axis.  NOTE this also moves beta, since "
+                         "beta = 1/(batch * chunk_len); pass --usage-beta to "
+                         "hold beta fixed and separate the two effects.")
+    ap.add_argument("--batch", type=int, default=None,
+                    help="override coin_batch and flower_batch (default 32).  "
+                         "03b_batch's axis.  Also moves beta -- same caveat.")
+    ap.add_argument("--epochs", type=int, default=None,
+                    help="override coin/flower_max_epochs (default 150).  "
+                         "05_budget's axis.  Measured, the budget is a CEILING: "
+                         "state recovery peaks and then decays while CE keeps "
+                         "falling, so more is not better.")
     ap.add_argument("--only", nargs="+", default=None, metavar="TAG",
                     help="run a subset; matches a full tag or any substring of "
                          "one, e.g. --only coin_p030 flower_n2_m6")
@@ -1251,6 +1277,18 @@ def main(argv=None):
         cfg["accelerator"] = args.accelerator
     if args.model is not None:
         cfg["embed_type"] = args.model
+    if args.d_model is not None:
+        cfg["d_model"] = args.d_model
+    if args.chunk_len is not None:
+        cfg["train_chunk_len"] = args.chunk_len
+    if args.batch is not None:
+        cfg["coin_batch"] = cfg["flower_batch"] = args.batch
+    if args.epochs is not None:
+        cfg["coin_max_epochs"] = cfg["flower_max_epochs"] = args.epochs
+    if args.n_states is not None:
+        cfg["n_states"] = args.n_states
+    if args.state_dim is not None:
+        cfg["state_dim"] = args.state_dim
     if args.usage_beta is not None:
         # A FIXED beta for every process, overriding the per-process rule.
         # This is how the two fixed-beta arms of the three-way sweep are run.

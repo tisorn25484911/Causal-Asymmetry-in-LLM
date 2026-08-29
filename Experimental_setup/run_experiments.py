@@ -112,6 +112,7 @@ from DiscreteCausal_analysis import (
 )
 from Model_analysis import (
     causal_state_count,
+    discrete_hparams,
     causal_state_occupancy,
     coin_true_conditional,
     warm_up_umap,
@@ -490,25 +491,34 @@ def _pair_report(res: dict, mode: str):
     }
 
 
-def _discrete_kwargs(cfg, process, mode, **kw) -> dict:
+def _discrete_kwargs(cfg, num_token: int, batch: int) -> dict:
     """
     Extra train_test_val_pipeline arguments for embed_type="discrete".
 
     Empty for "onehot", so every existing call is byte-identical and the two
-    architectures share one code path.  n_states is the process's THEORETICAL
-    causal-state count for this arm -- coin 2/3, flower n+1 and 1+#distinguishable
-    -- computed here rather than defaulted in the model, which would silently pin
-    the state budget to the vocabulary.
+    architectures share one code path.
+
+    K, state_dim and beta come from Model_analysis.discrete_hparams, which
+    resolves them from the vocabulary and the training geometry: K = 5V,
+    state_dim = V, beta = 1/(batch*chunk_len).  `num_token` and `batch` must be
+    passed by the caller because they differ between the coin and flower
+    experiments.
+
+    K is deliberately NOT the theoretical causal-state count.  Measured, the
+    exact count is the value that fails -- flower(2,3) forward at its true K=3
+    recovers 2 states -- so K is a budget with slack, and the count is a thing to
+    be discovered rather than supplied.  DISCRETE_V2_PLAN.md section 2.
     """
     if cfg.get("embed_type") != "discrete":
         return {}
+    h = discrete_hparams(cfg, num_token, batch)
+    beta = (cfg["usage_beta_fixed"]
+            if cfg.get("usage_beta_fixed") is not None else h["usage_beta"])
     return dict(
-        n_states=causal_state_count(process, mode, **kw),
-        target_occupancy=(causal_state_occupancy(process, mode, **kw)
-                          if cfg.get("usage_target") == "theory" else None),
-        state_dim=cfg.get("state_dim"),
+        n_states=h["n_states"],
+        state_dim=h["state_dim"],
         tau=cfg.get("tau", 1.0),
-        usage_beta=cfg.get("usage_beta", 0.0),
+        usage_beta=beta,
     )
 
 def experiment_1(cfg, out_root, all_results):
@@ -551,7 +561,7 @@ def experiment_1(cfg, out_root, all_results):
         n_layers=cfg["n_layers"], accelerator=cfg["accelerator"],
         val_every_n_steps=cfg["val_every_n_steps"],
         weight_decay=cfg["weight_decay"],
-        **_discrete_kwargs(cfg, "coin", "forward"),
+        **_discrete_kwargs(cfg, cfg["coin_num_token"], cfg["coin_batch"]),
     )
     cleanup()  # FIX-4
 
@@ -565,7 +575,7 @@ def experiment_1(cfg, out_root, all_results):
         n_layers=cfg["n_layers"], accelerator=cfg["accelerator"],
         val_every_n_steps=cfg["val_every_n_steps"],
         weight_decay=cfg["weight_decay"],
-        **_discrete_kwargs(cfg, "coin", "backward"),
+        **_discrete_kwargs(cfg, cfg["coin_num_token"], cfg["coin_batch"]),
     )
     cleanup()  # FIX-4
 
@@ -658,7 +668,7 @@ def experiment_1_2(cfg, out_root, all_results):
         n_layers=cfg["n_layers"], accelerator=cfg["accelerator"],
         val_every_n_steps=cfg["val_every_n_steps"],
         weight_decay=cfg["weight_decay"],
-        **_discrete_kwargs(cfg, "coin", "forward"),
+        **_discrete_kwargs(cfg, cfg["coin_num_token"], cfg["coin_batch"]),
     )
     cleanup()
     cv_bw = train_test_val_pipeline(
@@ -670,7 +680,7 @@ def experiment_1_2(cfg, out_root, all_results):
         n_layers=cfg["n_layers"], accelerator=cfg["accelerator"],
         val_every_n_steps=cfg["val_every_n_steps"],
         weight_decay=cfg["weight_decay"],
-        **_discrete_kwargs(cfg, "coin", "backward"),
+        **_discrete_kwargs(cfg, cfg["coin_num_token"], cfg["coin_batch"]),
     )
     cleanup()
 
@@ -844,7 +854,7 @@ def experiment_2(cfg, out_root, all_results, n, m, role):
         n_layers=cfg["n_layers"], accelerator=cfg["accelerator"],
         val_every_n_steps=cfg["val_every_n_steps"],
         weight_decay=cfg["weight_decay"],
-        **_discrete_kwargs(cfg, "flower", "forward", n=n, m=m, dice_probs=dice_probs),
+        **_discrete_kwargs(cfg, n + m, cfg["flower_batch"]),
     )
     cleanup()
 
@@ -858,7 +868,7 @@ def experiment_2(cfg, out_root, all_results, n, m, role):
         n_layers=cfg["n_layers"], accelerator=cfg["accelerator"],
         val_every_n_steps=cfg["val_every_n_steps"],
         weight_decay=cfg["weight_decay"],
-        **_discrete_kwargs(cfg, "flower", "backward", n=n, m=m, dice_probs=dice_probs),
+        **_discrete_kwargs(cfg, n + m, cfg["flower_batch"]),
     )
     cleanup()
 

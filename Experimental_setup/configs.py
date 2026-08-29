@@ -30,62 +30,54 @@ BASE = dict(
     # a bounded causal-state set (MODULAR_MODELS_PLAN.md).  The four settings
     # below apply only to "discrete" and are ignored by "onehot".
     embed_type       = "onehot",
-    # K -- the number of causal states.  None means "the runner has not supplied
-    # it", which train_model REFUSES for embed_type="discrete" rather than
-    # falling back to the vocabulary size.  Runners use
-    # Model_analysis.causal_state_count(process, mode, ...):
-    #     coin    forward 2       backward 3
-    #     flower  forward n+1     backward 1 + #distinguishable outcomes
+    # ── discrete bottleneck ────────────────────────────────────────────
+    # All four resolve through Model_analysis.discrete_hparams(cfg, V, batch),
+    # which the runners call.  DISCRETE_V2_PLAN.md sections 2 and 6.
+    #
+    # K -- the state BUDGET, not an estimate.  None -> n_states_mult * V.
+    # An explicit int overrides, which is how the K sweep works.
+    #
+    # Measured: K at the exact theoretical count FAILS.  flower(2,3) forward at
+    # K=3, its true count, recovers 2 states at ARI 0.745; K=4 the same.  Slack
+    # is required.  At K=5V both pilot processes recovered their full state set
+    # with S_emp within 0.006 bits of the closed form (flower(2,3) 5V=25, ARI
+    # 1.000, S_emp-C+ +0.0050; flower(3,5) 5V=40, ARI 0.982, +0.0064).
+    #
+    # Single-seed evidence from processes outside the baseline seven: a starting
+    # value, not an established optimum.  01_ksweep tests it.
     n_states         = None,
-    # Dimension of a state VECTOR.  None -> n_states.  No expressive power; it
-    # exists to give the state-vector scatter something to draw.
+    n_states_mult    = 5,
+    # Dimension of a state VECTOR.  None -> state_dim_mult * V.
+    #
+    # It carries NO expressive power: state_matrix followed by emission composes
+    # to one (K, V) map, so state_matrix @ Q with inv(Q) . emission is the same
+    # model for any invertible Q.  Setting it to K would make state_matrix mostly
+    # reparameterisation freedom -- 1600 parameters at K=40, of which only the
+    # K x V emission table is identified.
+    #
+    # Measured over 28 cells: S=V gave 6 exact state-count recoveries, S=K gave
+    # 3, S=round(1.3V) gave 5.
     state_dim        = None,
+    state_dim_mult   = 1,
     # Straight-through surrogate temperature.  Never changes the forward value.
     # Measured: tau <= 0.2 collapses the bottleneck.  1.0 is plain softmax.
     tau              = 1.0,
-    # Anti-collapse penalty on batch-marginal state usage.  NOT zero by default,
-    # unlike weight_decay, because zero is measurably unsafe: coin backward at
-    # K=3 over 4 seeds, beta=0 collapsed 1 seed in 4 and CE-H_inf ranged over
-    # 15x; beta=0.01 found all 3 states every time at +0.036 +/- 0.003.
+    # Strength of the complexity penalty.  None -> 1 / (batch * train_chunk_len),
+    # computed by discrete_hparams from the geometry actually in use.
     #
-    # It is not free.  It biases S_emp upward and ARM-DEPENDENTLY: forward
-    # -0.001, backward +0.024, ~6% of the true C- - C+ gap and in the direction
-    # the hypothesis predicts.  Runners also report S_emp at beta=0.
-    usage_beta       = 0.01,
-    # Target of the anti-collapse penalty.
+    # The penalty is beta * H(p_bar), and p_bar is the state occupancy averaged
+    # over every scored token, so beta is naturally per-token: 1/N with N the
+    # count the cross-entropy itself averages over.
     #
-    #   "uniform"  beta * (log2(K) - H(p_bar)).  Biased: its minimiser is
-    #              uniform while the truth has entropy C, and the gap
-    #              log2(K) - C runs from 0.019 to 0.694 bits across the seven
-    #              baseline processes.  The bias is at least QUANTIFIABLE, and
-    #              S_emp stays an independent measurement.
+    # NEVER write this as a literal.  Measured, beta is bounded above by an
+    # optimisation cliff -- above ~6e-4 at lr=1e-3 the bottleneck collapses to
+    # one state -- and the cliff scales with 1/lr, not with N.  At this geometry
+    # N = 32*256 = 8192 so 1/N = 1.22e-4, about 5x below it.  A literal decouples
+    # beta from N: at N = 32*49 the same rule gives 6.4e-4, already past the
+    # cliff, and 1 of 28 pilot cells collapsed there against 0 at every larger N.
     #
-    #   "theory"   beta * KL(pi_theory || p_bar) against causal_state_occupancy.
-    #              Statistically unbiased -- its minimiser IS the truth -- but it
-    #              makes S_emp CIRCULAR: penalising the model for not having the
-    #              occupancy whose entropy is C means S_emp ~ C is installed
-    #              rather than measured.  Measured, no single beta works even
-    #              within one process: flower_n2_m6 needs beta=1.0 forward and is
-    #              destroyed by it backward (S_emp 1.34 against C 2.11).
-    #
-    # "uniform" is the default because S_emp is the quantity this architecture
-    # exists to produce, and a quantifiable bias beats a circular one.
-    usage_target     = "uniform",
-    # beta is chosen PER ARM from the uniformity gap, log2(K) - C.  That gap is
-    # exactly how far the uniform target sits from the truth, so it is exactly
-    # how much a large beta can bias S_emp: use a large beta only where uniform
-    # is nearly right.
-    #
-    # Measured at 150 epochs, this puts all 14 arm-process combinations of the
-    # seven baseline processes inside conv_tol; a FIXED beta of either 0.01 or
-    # 0.2 puts 13 of 14 there, failing on different processes (flower_n2_m6
-    # collapses at 0.01, at +0.70; flower_n6_m4 misses at 0.2, at +0.107).
-    #
-    # It uses the closed form only to pick a hyperparameter, never as a training
-    # target -- unlike usage_target="theory", which makes S_emp circular.
-    usage_beta_gap   = 0.1,     # threshold on log2(K) - C
-    usage_beta_high  = 0.2,     # gap <= threshold: uniform is nearly the truth
-    usage_beta_low   = 0.01,    # gap >  threshold: uniform is wrong, tread lightly
+    # An explicit float overrides, which is how 06_beta_verify sweeps around 1/N.
+    usage_beta       = None,
     n_folds          = 5,
     n_layers         = 2,
     # ── optimiser ──────────────────────────────────────────────────────

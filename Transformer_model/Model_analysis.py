@@ -944,61 +944,70 @@ def _merged_outcome_mass(dp, merge_tol: float | None = None) -> list:
     return mass
 
 
-def usage_beta_shared(K_fw: int, C_plus: float, K_bw: int, C_minus: float,
-                      gap_threshold: float = 0.1, beta_high: float = 0.2,
-                      beta_low: float = 0.01) -> float:
+def discrete_hparams(cfg: dict, num_token: int, batch: int) -> dict:
     """
-    ONE beta for both arms of a process, from the smaller of their two gaps.
+    The three discrete-bottleneck hyperparameters, resolved from the vocabulary
+    and the training geometry.  DISCRETE_V2_PLAN.md sections 2 and 6.
 
-    Shared rather than per-arm, and that is not a simplification -- it is
-    required.  delta_CE is a PAIRED difference whose validity rests on the two
-    arms differing only in the mask and the batch convention.  Giving them
-    regularisation strengths that differ by 20x is exactly the class of
-    arm-dependent artefact the design exists to exclude, and the per-arm gap rule
-    did that on three of the seven baseline processes.
+        n_states   = n_states_mult  * V      default 5V
+        state_dim  = state_dim_mult * V      default  V
+        usage_beta = 1 / (batch * train_chunk_len)   when cfg["usage_beta"] is None
 
-    The SMALLER gap decides: a process qualifies for the strong penalty if
-    either arm is near-uniform.  Measured at 150 epochs this puts all seven
-    baseline processes inside conv_tol with both arms on the same beta:
+    `V` is the vocabulary, `num_token`.  Returns the same K for BOTH arms: it is
+    a state BUDGET, not an estimate, and giving the two arms different budgets is
+    the class of arm-dependent asymmetry the paired design exists to exclude.
 
-        process          gap fw  gap bw   min   beta   max|CE-H_inf|
-        coin_p010_q090    0.531   0.694  0.531  0.01      0.0190
-        coin_p030_q040    0.015   0.096  0.015  0.20      0.0625
-        coin_p040_q080    0.082   0.019  0.019  0.20      0.0709
-        flower_n2_m6      0.085   0.694  0.085  0.20      0.0591   (only 0.2 works)
-        flower_n2_m8      0.085   0.693  0.085  0.20      0.0328
-        flower_n4_m2      0.322   0.090  0.090  0.20      0.0837
-        flower_n6_m4      0.515   0.332  0.332  0.01      0.0983   (only 0.01 works)
+    Why beta is COMPUTED and never written as a literal
+    ---------------------------------------------------
+    The penalty is `beta * H(p_bar)`, and p_bar is the state occupancy averaged
+    over every scored token, so beta is naturally per-token: 1/N with
+    N = batch * chunk_len, the count the cross-entropy itself averages over.
 
-    Two of those sit within measurement noise of the tolerance (n6_m4 at 0.098,
-    n4_m2 at 0.084, against ~0.01 of batch-order noise), and the threshold was
-    chosen after seeing these numbers on one seed.  It is a fitted rule.
+    Measured, beta is also bounded above by an optimisation cliff -- above
+    ~6e-4 at lr=1e-3 the bottleneck collapses to a single state -- and the cliff
+    scales with 1/lr rather than with N.  At the DISCRETE geometry
+    N = 32*256 = 8192 and 1/N = 1.22e-4, about 5x below it.  A literal decouples
+    beta from N, so a change to batch or chunk moves it relative to the cliff
+    silently: at N = 32*49 the same rule gives 6.4e-4, already past it, and one
+    of 28 pilot cells collapsed there against zero at every larger N.
+
+    An explicit cfg["usage_beta"] overrides the rule.  That is how the beta
+    sweep works, and it is the only intended use of an explicit value.
+
+    Why 5V and V
+    ------------
+    Measured: K at the exact theoretical count FAILS -- flower(2,3) forward at
+    K=3 (its true count) recovers 2 states at ARI 0.745, as does K=4.  Slack is
+    required.  K=5V recovered the full state set with S_emp within 0.006 bits of
+    the closed form on both pilot processes (flower(2,3): 5V=25, ARI 1.000,
+    S_emp-C+ = +0.0050; flower(3,5): 5V=40, ARI 0.982, +0.0064).
+
+    state_dim carries no expressive power -- state_matrix followed by emission
+    composes to a single (K, V) map -- so it is set to V rather than to K, which
+    would make state_matrix mostly reparameterisation freedom.  Measured over 28
+    cells, S=V gave 6 exact state-count recoveries against 3 for S=K and 5 for
+    S=1.3V.
+
+    Both are STARTING values on single-seed pilot evidence from processes outside
+    the baseline seven, not established optima; 01_ksweep and 02_statedim test
+    them on the processes that matter.
     """
-    gap = min(np.log2(K_fw) - C_plus, np.log2(K_bw) - C_minus)
-    return float(beta_high if gap <= gap_threshold else beta_low)
+    V = int(num_token)
+    if V < 1:
+        raise ValueError(f"num_token must be >= 1, got {num_token}")
 
+    n_states  = cfg.get("n_states")  or int(cfg.get("n_states_mult",  5) * V)
+    state_dim = cfg.get("state_dim") or int(cfg.get("state_dim_mult", 1) * V)
 
-def usage_beta_for(K: int, C: float, gap_threshold: float = 0.1,
-                   beta_high: float = 0.2, beta_low: float = 0.01) -> float:
-    """
-    The anti-collapse strength for one arm, from its uniformity gap.
-
-    The uniform penalty pulls the state occupancy toward uniform, whose entropy
-    is log2(K), while the truth has entropy C.  So `log2(K) - C` is exactly the
-    distance between what the penalty wants and what is true -- and therefore
-    exactly the bias a large beta can drive S_emp toward.
-
-    Where the gap is small the penalty is nearly free and a large beta buys
-    collapse-resistance for almost nothing.  Where it is large the penalty is
-    actively wrong and beta must stay small.  Measured across the seven baseline
-    processes the gap runs from 0.019 (coin p=0.4,q=0.8 backward) to 0.694 (coin
-    p=0.1,q=0.9 backward), so a single beta cannot serve both ends.
-
-    Note this reads the closed form to choose a HYPERPARAMETER.  It does not put
-    the closed form in the objective; that is usage_target="theory", which makes
-    S_emp circular and is not the default.
-    """
-    return float(beta_high if (np.log2(K) - C) <= gap_threshold else beta_low)
+    beta = cfg.get("usage_beta")
+    if beta is None:
+        chunk = int(cfg["train_chunk_len"])
+        n_tok = int(batch) * chunk
+        if n_tok < 1:
+            raise ValueError(f"batch*chunk_len must be >= 1, got {n_tok}")
+        beta = 1.0 / n_tok
+    return dict(n_states=int(n_states), state_dim=int(state_dim),
+                usage_beta=float(beta))
 
 
 def causal_state_occupancy(process: str, mode: str, p: float | None = None,

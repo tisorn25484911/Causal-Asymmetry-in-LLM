@@ -1050,3 +1050,125 @@ def test_flower_null_control_holds_under_both_merge_rules():
         for tol in (None, 1e-9, 1e-6):
             cp, cm = flower_complexity(1, m, dice_probs=dp, merge_tol=tol)
             assert abs(cm - cp) < 1e-12, f"null control broken at m={m}, tol={tol}"
+
+
+# ══════════════════════════════════════════════════════════════════════════
+# DISCRETE_V2_PLAN.md — the resolved hyperparameters and the new diagnostic
+# ══════════════════════════════════════════════════════════════════════════
+
+def _discrete_cfg(**over):
+    from configs import CONFIGS
+    cfg = dict(CONFIGS["DISCRETE"])
+    cfg.update(over)
+    return cfg
+
+
+def test_discrete_hparams_gives_5V_and_V():
+    """K = 5V and state_dim = V, for every vocabulary in the baseline set."""
+    from Model_analysis import discrete_hparams
+    cfg = _discrete_cfg()
+    for V in (3, 5, 6, 8, 10, 20):
+        h = discrete_hparams(cfg, V, 32)
+        assert h["n_states"] == 5 * V, f"K != 5V at V={V}"
+        assert h["state_dim"] == V, f"state_dim != V at V={V}"
+
+
+def test_usage_beta_is_computed_from_geometry_not_hardcoded():
+    """
+    beta must equal 1/(batch * chunk_len) and MOVE when either factor moves.
+
+    The whole point of computing it: a literal decouples beta from N, and the
+    penalty collapses the bottleneck above ~6e-4 at lr=1e-3.
+    """
+    from Model_analysis import discrete_hparams
+    for batch, chunk in ((32, 256), (32, 128), (64, 256), (8, 64)):
+        cfg = _discrete_cfg(train_chunk_len=chunk)
+        got = discrete_hparams(cfg, 3, batch)["usage_beta"]
+        assert got == pytest.approx(1.0 / (batch * chunk)), (batch, chunk)
+    # and the DISCRETE geometry specifically
+    assert discrete_hparams(_discrete_cfg(), 3, 32)["usage_beta"] == pytest.approx(1 / 8192)
+
+
+def test_usage_beta_explicit_value_overrides_the_rule():
+    """The beta sweep works by setting cfg['usage_beta']; nothing else should."""
+    from Model_analysis import discrete_hparams
+    h = discrete_hparams(_discrete_cfg(usage_beta=0.2), 3, 32)
+    assert h["usage_beta"] == 0.2
+
+
+def test_dead_beta_machinery_is_gone():
+    """
+    usage_target / usage_beta_gap|high|low tuned beta from log2(K) - H(p_bar),
+    the OLD penalty's uniformity gap.  The penalty is now beta * H(p_bar), so
+    those keys select nothing and must not linger to be read by mistake.
+    """
+    import Model_analysis
+    cfg = _discrete_cfg()
+    for key in ("usage_target", "usage_beta_gap", "usage_beta_high", "usage_beta_low"):
+        assert key not in cfg, f"{key} still in the config"
+    for fn in ("usage_beta_shared", "usage_beta_for"):
+        assert not hasattr(Model_analysis, fn), f"{fn} still defined"
+
+
+def test_specs_carry_resolved_hparams_and_true_counts():
+    """
+    Every spec gets K=5V, state_dim=V, one beta -- and keeps the TRUE causal
+    state counts separately, which is what K vs k_discovered plots against.
+    """
+    import run_statistical_trj as R
+    cfg = _discrete_cfg(usage_beta_fixed=None)
+    specs = R.process_specs(cfg)
+    assert len(specs) == 7
+    betas = {s["usage_beta"] for s in specs}
+    assert len(betas) == 1 and betas.pop() == pytest.approx(1 / 8192)
+    for s in specs:
+        V = s["num_token"]
+        assert s["n_states"] == 5 * V, s["tag"]
+        assert s["state_dim"] == V, s["tag"]
+        assert s["true_k_fw"] >= 1 and s["true_k_bw"] >= 1, s["tag"]
+        # K must leave slack over BOTH true counts, or the count cannot be found
+        assert s["n_states"] > max(s["true_k_fw"], s["true_k_bw"]), s["tag"]
+
+
+def test_h_state_given_token_is_zero_for_a_function_of_the_token():
+    """
+    The true causal state IS a deterministic function of the current token in
+    both arms of both processes, so the diagnostic must read exactly 0 there --
+    and rise to log2(k) for an assignment independent of the token.
+    """
+    from torch.utils.data import DataLoader, Dataset
+    from DiscreteCausal_analysis import causal_state_report
+
+    class _Stub:
+        def __init__(self, K, V, rule):
+            self.n_states, self.token_size, self.mode = K, V, "forward"
+            self.rule, self.training, self.usage_beta = rule, False, 0.0
+            self.last_states = torch.zeros(1, 1, dtype=torch.long)
+        def state_assignment(self, *a): return self.last_states
+        def eval(self): pass
+        def train(self): pass
+        def parameters(self): yield torch.zeros(1)
+        def __call__(self, x): self.last_states = self.rule(x)
+        @property
+        def state_matrix(self): return torch.zeros(self.n_states, 2)
+        def emission_table(self): return torch.zeros(self.n_states, self.token_size)
+
+    class _DS(Dataset):
+        def __init__(self, x): self.x = x
+        def __len__(self): return len(self.x)
+        def __getitem__(self, i):
+            t = torch.tensor(self.x[i]); return t[:-1], t[1:]
+
+    X = np.random.default_rng(0).integers(0, 3, size=(64, 60))
+    ld = DataLoader(_DS(X), batch_size=32)
+
+    r = causal_state_report(_Stub(3, 3, lambda x: x.clone()), ld, min_pos=5)
+    assert r["h_state_given_token"] == pytest.approx(0.0, abs=1e-9)
+
+    r = causal_state_report(_Stub(3, 3, lambda x: (x == 1).long()), ld, min_pos=5)
+    assert r["h_state_given_token"] == pytest.approx(0.0, abs=1e-9)
+
+    g = torch.Generator().manual_seed(1)
+    r = causal_state_report(
+        _Stub(4, 3, lambda x: torch.randint(0, 4, x.shape, generator=g)), ld, min_pos=5)
+    assert r["h_state_given_token"] == pytest.approx(2.0, abs=0.02)

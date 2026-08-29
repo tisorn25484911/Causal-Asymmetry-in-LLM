@@ -72,7 +72,6 @@ class DiscreteCausalDecoder(L.LightningModule):
         state_dim: int | None = None,
         tau: float = 1.0,
         usage_beta: float = 0.0,
-        target_occupancy=None,
     ):
         super().__init__()
         self.mode = mode
@@ -98,10 +97,6 @@ class DiscreteCausalDecoder(L.LightningModule):
         # Strength of the anti-collapse penalty; see usage_penalty().  0.0 is
         # the default 
         self.usage_beta = usage_beta
-
-        # ALways set as NONE
-        self.register_buffer("target_occupancy", None)
-
 
         rand_prj = torch.randn(token_size, d_model)
         rand_prj = F.normalize(rand_prj, dim=1)

@@ -477,8 +477,26 @@ def process_row(tag: str, rec: dict, global_burn=None) -> dict:
     a_ful_all, _          = agg("area_full")
     _,         ds_conv    = agg("d_step")
 
-    s_fw = _stats([r["fw"]["S_emp"] for r in rec["runs"]])
-    s_bw = _stats([r["bw"]["S_emp"] for r in rec["runs"]])
+    # S_emp: prefer the DISCRETE estimate when the architecture produced one.
+    #
+    # `S_emp` is the k-means estimator at an assumed k -- the continuous decoder's
+    # only option.  `S_emp_states` is the entropy of the actual state occupancy,
+    # exact and hyperparameter-free, and is present only for embed_type=
+    # "discrete".  Plotting the clustered value for a discrete run reports the
+    # wrong instrument: measured, the discrete estimate lands within 0.006 bits
+    # of the closed form when the state set is recovered, which the clustered one
+    # does not.
+    _key = ("S_emp_states"
+            if all("S_emp_states" in r["fw"] and
+                   r["fw"]["S_emp_states"] == r["fw"]["S_emp_states"]  # not NaN
+                   for r in rec["runs"])
+            else "S_emp")
+    s_fw = _stats([r["fw"][_key] for r in rec["runs"]])
+    s_bw = _stats([r["bw"][_key] for r in rec["runs"]])
+    # Also carry the state counts, so the figure can hollow out the points whose
+    # state set was not recovered -- S_emp is only calibrated where it was.
+    _kf = [r["fw"].get("n_states_used") for r in rec["runs"]]
+    _kb = [r["bw"].get("n_states_used") for r in rec["runs"]]
 
     gap = spec["C_minus"] - spec["C_plus"]
     return dict(
@@ -508,6 +526,12 @@ def process_row(tag: str, rec: dict, global_burn=None) -> dict:
         # estimator error, for the third scatter panel
         s_err_fw=s_fw["mean"] - spec["C_plus"],
         s_err_bw=s_bw["mean"] - spec["C_minus"],
+        # which estimator the two above came from, and whether the state set was
+        # recovered -- S_emp is only calibrated where it was.
+        s_emp_kind=_key,
+        k_found_fw=float(np.mean([v for v in _kf if v is not None])) if any(v is not None for v in _kf) else np.nan,
+        k_found_bw=float(np.mean([v for v in _kb if v is not None])) if any(v is not None for v in _kb) else np.nan,
+        true_k_fw=spec.get("true_k_fw"), true_k_bw=spec.get("true_k_bw"),
     )
 
 
@@ -899,10 +923,12 @@ def plot_sweep_scatter(rows: list, out_root: str):
     ax.axvline(0.0, color="k", ls="--", lw=0.9)
     ax.set_xlabel("C− − C+ (bits, closed form)")
     ax.set_ylabel("S_emp − closed form (bits)")
-    ax.set_title("INSTRUMENT CHECK — fixed-k complexity error per arm\n"
-                 "S_emp is k-means at an assumed k, so S ≤ log2(k); it "
-                 "overestimates on unbalanced occupancy", fontsize=9,
-                 fontweight="bold")
+    _kind = rows[0].get("s_emp_kind", "S_emp") if rows else "S_emp"
+    _note = ("state occupancy, exact — no clustering"
+             if _kind == "S_emp_states"
+             else "k-means at an assumed k, so S ≤ log2(k)")
+    ax.set_title(f"INSTRUMENT CHECK — S_emp error per arm\n{_note}",
+                 fontsize=9, fontweight="bold")
     ax.legend(fontsize=7)
     ax.grid(True, alpha=0.3)
 

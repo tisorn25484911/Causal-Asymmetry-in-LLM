@@ -476,6 +476,13 @@ def parse_args(argv=None):
                          "REMAINING_WORK_PLAN.md S5.  Give each capacity its "
                          "OWN --out-root: tags do not encode d_model, so two "
                          "capacities in one folder overwrite each other.")
+    ap.add_argument("--usage-beta", type=float, default=None,
+                    help="override the computed beta = 1/(batch * chunk_len).  "
+                         "Leave unset for every normal run: the penalty is "
+                         "beta * S_emp, so beta is naturally per-token, and it "
+                         "is bounded above by a collapse cliff (~6e-4 at "
+                         "lr=1e-3) that a literal decouples it from.  This flag "
+                         "exists for the beta sweep, which sweeps AROUND 1/N.")
     ap.add_argument("--out-root", default=OUT_ROOT_DEFAULT)
     ap.add_argument("--redo", action="store_true")
     ap.add_argument("--dry-run", action="store_true")
@@ -495,6 +502,9 @@ def main(argv=None):
         cfg["accelerator"] = args.accelerator
     if args.d_model is not None:
         cfg["d_model"] = args.d_model
+    # None here means "use the computed 1/N", which discrete_hparams resolves
+    # per process from the geometry.  Set only by the beta sweep.
+    cfg["usage_beta_fixed"] = args.usage_beta
 
     cells = parse_cells(args.cells)
     specs, diags = dice_specs(cfg, cells, args.alpha, args.n_dice,
