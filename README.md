@@ -910,6 +910,8 @@ Transformer_model/                the primitives — no dependency on a runner
 │                                 hard one-hot causal-state bottleneck (§3.6)
 ├── DiscreteCausal_analysis.py    reading states off a trained model, and the
 │                                 three-panel causal-state figure
+├── DiscreteCausal_figures.py     F0–F12, the cross-experiment figures for the
+│                                 discrete decoder (DISCRETE_V2_PLAN.md §5)
 ├── Training_model.py             chunking, loaders, CV pipeline, recorder, divergence
 ├── Model_analysis.py             CE/PPL, complexity (both estimators), distances,
 │                                 UMAP, attention, paired ΔCE, result slimming
@@ -925,6 +927,8 @@ Experimental_setup/               the drivers
 ├── run_statistical_trj.py        seed-repeat harness, 7 processes x 100 repeats
 ├── run_sweep_experiment.py       125-process sweep: does measured track theoretical?
 ├── run_dice_experiment.py        the dice axis — separates C⁻−C⁺ from m−n
+├── run_discrete_v2.py            the discrete experiment schedule — 12 folders,
+│                                 one axis each; trains nothing itself
 ├── analyse_lambda_sweep.py       a(λ)/b(λ) decomposition across the weight-decay runs
 ├── analyse_capacity.py           |ΔCE| against d_model — the residual-argument test
 ├── pq_experiment.py              the p-q grid sweep and its heatmaps

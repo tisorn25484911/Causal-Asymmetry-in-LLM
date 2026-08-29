@@ -1761,6 +1761,126 @@ the per-arm `CE − H∞` in the summary before reading anything into ΔCE.
 
 ---
 
+## 14B. The discrete experiment schedule (`run_discrete_v2.py`)
+
+`DISCRETE_V2_PLAN.md` restructures the discrete work into 12 folders under
+`All_Results/discrete_v2/`, one experimental axis each.  `run_discrete_v2.py`
+holds that schedule.  It trains nothing itself: every entry is an invocation of
+`run_statistical_trj.py` or `run_sweep_experiment.py` with one axis moved, so
+the training, resume, provenance and analysis paths are the same tested code in
+all cases.
+
+```bash
+python Experimental_setup/run_discrete_v2.py --list             # the schedule
+python Experimental_setup/run_discrete_v2.py 07_seeds --dry-run # print, don't run
+python Experimental_setup/run_discrete_v2.py 07_seeds           # run one folder
+python Experimental_setup/run_discrete_v2.py all --dry-run      # the whole thing
+```
+
+Use `--dry-run` first.  The schedule is ~61 h in total, and the per-folder
+estimates are extrapolated from a smaller harness — they are **not**
+measurements.  Time one repeat of `00_base` and rescale before committing.
+
+### 14B.1 The three base values, and why none is a literal
+
+```
+n_states  = 5V     K is a BUDGET, not an estimate
+state_dim = V      carries no expressive power
+beta      = 1/(batch * chunk_len)   = 1.2207e-4 at the DISCRETE geometry
+```
+
+All three resolve in `Model_analysis.discrete_hparams(cfg, V, batch)`.
+
+**K = 5V** because K at the *exact* causal-state count fails: measured, a
+flower(2,3) forward arm at its true K=3 recovers 2 states, and so does K=4.  At
+K=5V both pilot processes recovered their full state set with S_emp within
+0.006 bits of the closed form.
+
+**state_dim = V** because `state_matrix` then `emission` compose into a single
+(K, V) map, so `state_matrix @ Q` with `inv(Q) . emission` is the same model for
+any invertible Q.  Setting it to K would make `state_matrix` mostly
+reparameterisation freedom — 1600 parameters at K=40, of which only the K×V
+emission table is identified.  Measured over 28 cells, S=V gave 6 exact
+state-count recoveries against 3 for S=K and 5 for S=1.3V.
+
+**beta = 1/N, computed and never written as a literal.**  The penalty is
+`beta * S_emp` and S_emp is a per-token mean, so beta is naturally per-token
+with N the count the cross-entropy itself averages over.  Measured, beta is also
+bounded above by a collapse cliff — above ~6e-4 at lr=1e-3 the bottleneck drops
+to a single state — and that cliff scales with 1/lr, not with N.  A literal
+decouples beta from N: at `chunk_len=49` the same rule gives 6.4e-4, already
+past the cliff, and one of 28 pilot cells collapsed there against zero at every
+larger N.
+
+`--usage-beta` overrides it.  That is `06_beta_verify`'s axis and the control
+arm of `03`/`03b`; every other run should leave it unset.
+
+### 14B.2 The six axes
+
+`run_statistical_trj.py` gained one flag per axis, so the sweeps need no new
+runner:
+
+| flag | default | folder |
+|---|---|---|
+| `--n-states` | 5V | `01_ksweep` |
+| `--state-dim` | V | `02_statedim` |
+| `--d-model` | 32 | `04_capacity` |
+| `--chunk-len` | 256 | `03_seqlen` |
+| `--batch` | 32 | `03b_batch` |
+| `--epochs` | 150 | `05_budget` |
+
+`--chunk-len` and `--batch` both move beta, since beta = 1/(B·T).  To separate
+the geometry effect from the beta effect, run each twice — once letting beta
+track, once pinning it with `--usage-beta`.  The schedule does this
+automatically for both folders.
+
+### 14B.3 Figures
+
+`Transformer_model/DiscreteCausal_figures.py` holds F0–F8 and F12.  F9 (the
+four-panel scatter against C⁻−C⁺), F10 (the trajectory overlay) and F11 (the
+per-process loss curves) already exist in `run_sweep_experiment.py` and
+`run_statistical_trj.py` and are not duplicated.
+
+| figure | shows |
+|---|---|
+| F0 | S_emp vs C, hollow marker where the state set was not recovered |
+| F1 | **K vs k_discovered** — the headline; `y=x` and `y=true_k` annotated in place |
+| F1b | K vs S_emp, the calibration view of the same sweep |
+| F2 | state_dim vs the signed state-count deficit |
+| F3 | chunk_len, with beta printed under each tick because the axis is confounded |
+| F4 | beta vs collapse rate, "vary T" against "vary B" — the control |
+| F5 | d_model vs the signed deficit |
+| F6 | recovery and CE−H∞ on a twin axis, with the first `conv_tol` entry marked |
+| F7 | beta as a *ratio* to 1/N, so the figure reads the same at any geometry |
+| F8 | seed spread — the noise floor, to be quoted in every other caption |
+| F12 | state-set recovery rate, which gates F9's S_emp panel |
+
+House style throughout: each variable encoded once, no colorbar where values are
+printed or the scale is fixed, reference lines annotated in place rather than in
+a legend, and a legend only at five or more series.
+
+### 14B.4 What the architecture buys, and what it does not
+
+ΔCE is a **difference of residuals**: once both arms converge to H∞ it vanishes
+regardless of C⁻−C⁺.  `S_emp` is not a residual — S_emp_fw estimates C⁺ and
+S_emp_bw estimates C⁻ — so
+
+```
+Delta_S = S_emp_bw - S_emp_fw     estimates    C- - C+     DIRECTLY
+```
+
+Measured, S_emp is calibrated to **±0.006 bits** when the state set is
+recovered.  The catch: that held in 6 of 28 pilot cells, and where states merged
+S_emp − C ran −0.17 to −1.04.  There is no partial credit, so Δ_S is usable only
+on cells where both arms recovered their counts — which is why F12 exists and
+why `k_found` is reported beside every S_emp.
+
+Do **not** read ΔCE off this architecture yet.  Measured, it swings −0.13 to
++0.26 bits on (K, beta) alone, against a real effect of 0.001–0.003 bits; the
+continuous decoder gives ΔCE ∈ [−0.0011, +0.0024] on the same processes.
+
+---
+
 ## 15. Command reference
 
 ```bash
@@ -1769,7 +1889,7 @@ conda activate qdrug
 cd /Users/tisornnaphattalung/Desktop/Quantum/URECA/LLM_final_version
 
 # Verification
-pytest tests/ -q                                    # 66 tests, ~20 s
+pytest tests/ -q                                    # 80 tests, ~2.5 min
 python Experimental_setup/run_experiments.py --config SMOKE            # ~2 min, exercises all paths
 
 # Training
@@ -1793,6 +1913,19 @@ python Experimental_setup/run_sweep_experiment.py --plots-only         # redraw,
 # The dice axis (Section 8A) — separates C--C+ from m-n, ~2.6 h
 python Experimental_setup/run_dice_experiment.py --dry-run             # the design, no training
 python Experimental_setup/run_dice_experiment.py --repeats 30
+
+# The discrete schedule (Section 14B) — 12 folders, ~61 h ESTIMATED, one axis each
+python Experimental_setup/run_discrete_v2.py --list                    # the schedule and why
+python Experimental_setup/run_discrete_v2.py 07_seeds --dry-run        # print, don't run
+python Experimental_setup/run_discrete_v2.py 07_seeds                  # the noise floor — run FIRST
+python Experimental_setup/run_discrete_v2.py 01_ksweep                 # K vs k_discovered
+python Experimental_setup/run_discrete_v2.py all --dry-run             # every command, no training
+
+# One discrete axis by hand (all six default to the resolved value)
+python Experimental_setup/run_statistical_trj.py --config DISCRETE --n-states 25 \
+       --out-root All_Results/discrete_v2/01_ksweep/K025
+python Experimental_setup/run_statistical_trj.py --config DISCRETE --chunk-len 128 \
+       --usage-beta 1.2207e-4 --out-root All_Results/discrete_v2/03_seqlen/T128_betaFixed
 python Experimental_setup/run_dice_experiment.py --plots-only
 
 # The capacity axis (Section 8B) — the direct test of the residual argument
