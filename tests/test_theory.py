@@ -1172,3 +1172,49 @@ def test_h_state_given_token_is_zero_for_a_function_of_the_token():
     r = causal_state_report(
         _Stub(4, 3, lambda x: torch.randint(0, 4, x.shape, generator=g)), ld, min_pos=5)
     assert r["h_state_given_token"] == pytest.approx(2.0, abs=0.02)
+
+
+# ── the S_emp instrument ───────────────────────────────────────────────────
+# Two estimators are stored on every discrete arm and both answer to "S_emp"
+# somewhere.  These pin the resolution, because picking the wrong one is silent:
+# it produces a plausible number, not an error.
+
+def _runs(fw_states, bw_states=None):
+    """Repeat records carrying only the fields resolve_s_emp reads."""
+    bw_states = fw_states if bw_states is None else bw_states
+    return [{"fw": {"S_emp": 0.7, **({} if f is None else {"S_emp_states": f})},
+             "bw": {"S_emp": 0.9, **({} if b is None else {"S_emp_states": b})}}
+            for f, b in zip(fw_states, bw_states)]
+
+
+def test_resolve_s_emp_prefers_states_when_all_arms_have_it():
+    from Model_analysis import resolve_s_emp
+    assert resolve_s_emp(_runs([0.0, 1.0, 1.5])) == "S_emp_states"
+
+
+def test_resolve_s_emp_falls_back_when_any_arm_lacks_it():
+    """The continuous decoder stores no state entropy at all."""
+    from Model_analysis import resolve_s_emp
+    assert resolve_s_emp(_runs([None, None])) == "S_emp"
+    assert resolve_s_emp(_runs([1.0, None])) == "S_emp"        # partial record
+    assert resolve_s_emp(_runs([1.0, 1.0], [1.0, None])) == "S_emp"  # bw only
+    assert resolve_s_emp(_runs([1.0, float("nan")])) == "S_emp"
+    assert resolve_s_emp([]) == "S_emp"
+
+
+def test_resolve_s_emp_keeps_a_zero_not_a_fallback():
+    """
+    K=1 is the case that exposed the bug: the state entropy is exactly 0 and
+    0 is falsy, so any truthiness test silently reports the k-means value
+    instead -- ~0.71 bits where the true complexity is 0.
+    """
+    from Model_analysis import resolve_s_emp
+    runs = _runs([0.0, -0.0, 0.0])
+    assert resolve_s_emp(runs) == "S_emp_states"
+    assert [r["fw"][resolve_s_emp(runs)] for r in runs] == [0.0, -0.0, 0.0]
+
+
+def test_s_emp_note_covers_both_keys():
+    from Model_analysis import S_EMP_NOTE, resolve_s_emp
+    assert set(S_EMP_NOTE) == {"S_emp", "S_emp_states"}
+    assert resolve_s_emp(_runs([1.0])) in S_EMP_NOTE

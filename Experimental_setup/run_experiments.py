@@ -130,8 +130,10 @@ from Model_analysis import (
     FW_BW_attention_comparison,
     latent_extraction,
     plot_attention_heatmap,
+    resolve_s_emp,
     statistical_complexity,
     statistical_complexity_empirical,
+    S_EMP_NOTE,
 )
 from utils import (
     cleanup, coin_tag, entropy_rate_coin, flower_tag, mkdir, repo_path,
@@ -452,15 +454,17 @@ def compare_fw_bw(tag, cv_fw, cv_bw, ana_fw, ana_bw, loader_ana, num_token, out_
     # (d) complexity bar
     if p is not None and q is not None:
         try:
-            fw_v = [ana_fw.get("S_emp", 0), ana_fw.get("S_theory", 0)]
-            bw_v = [ana_bw.get("S_emp", 0), ana_bw.get("S_theory", 0)]
+            key  = resolve_s_emp([{"fw": ana_fw, "bw": ana_bw}])
+            fw_v = [ana_fw.get(key, 0), ana_fw.get("S_theory", 0)]
+            bw_v = [ana_bw.get(key, 0), ana_bw.get("S_theory", 0)]
             x = np.arange(2)
             fig_c, ax_c = plt.subplots(figsize=(8, 5))
             ax_c.bar(x-0.2, fw_v, 0.35, label="Forward",  color="#4c72b0", alpha=0.85)
             ax_c.bar(x+0.2, bw_v, 0.35, label="Backward", color="#dd8452", alpha=0.85)
-            ax_c.set_xticks(x); ax_c.set_xticklabels(["Empirical", "Theoretical"])
+            ax_c.set_xticks(x); ax_c.set_xticklabels([key, "Theoretical"])
             ax_c.set_ylabel("Statistical Complexity (bits)")
-            ax_c.set_title(f"{tag} — complexity comparison")
+            ax_c.set_title(f"{tag} — complexity comparison\n{S_EMP_NOTE[key]}",
+                           fontsize=10)
             ax_c.legend(); ax_c.grid(True, alpha=0.3, axis="y")
             fig_c.tight_layout()
             savefig(fig_c, os.path.join(out_dir, f"{tag}_complexity_compare.png"))
@@ -926,9 +930,10 @@ def experiment_2(cfg, out_root, all_results, n, m, role):
     try:
         fig_cx, ax_cx = plt.subplots(figsize=(8, 5))
         x = np.arange(2)
-        emp = [ana_fw.get("S_emp", 0), ana_bw.get("S_emp", 0)]
+        key = resolve_s_emp([{"fw": ana_fw, "bw": ana_bw}])
+        emp = [ana_fw.get(key, 0), ana_bw.get(key, 0)]
         th  = [C_plus, C_minus]
-        b1 = ax_cx.bar(x - 0.2, emp, 0.35, label="Empirical",
+        b1 = ax_cx.bar(x - 0.2, emp, 0.35, label=f"Empirical ({key})",
                        color=["#4c72b0", "#dd8452"], alpha=0.85, edgecolor="k")
         b2 = ax_cx.bar(x + 0.2, th, 0.35, label="Theoretical",
                        color=["#4c72b0", "#dd8452"], alpha=0.45, edgecolor="k",
@@ -938,7 +943,8 @@ def experiment_2(cfg, out_root, all_results, n, m, role):
         ax_cx.set_xticks(x); ax_cx.set_xticklabels(["Forward (C+)", "Backward (C-)"])
         ax_cx.set_ylabel("Statistical Complexity (bits)")
         ax_cx.set_title(f"{tag} — complexity  (n={n}, m={m}: "
-                        f"{'C- > C+' if C_minus > C_plus else 'C+ > C-'})")
+                        f"{'C- > C+' if C_minus > C_plus else 'C+ > C-'})\n"
+                        f"{S_EMP_NOTE[key]}", fontsize=10)
         ax_cx.legend(); ax_cx.grid(True, alpha=0.3, axis="y"); fig_cx.tight_layout()
         savefig(fig_cx, os.path.join(odir, f"{tag}_complexity.png"))
     except Exception as e:

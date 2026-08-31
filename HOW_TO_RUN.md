@@ -1881,6 +1881,50 @@ continuous decoder gives ΔCE ∈ [−0.0011, +0.0024] on the same processes.
 
 ---
 
+## 14C. Which S_emp — the two estimators
+
+Every discrete arm record stores **two** empirical complexities.  They are not
+interchangeable and picking the wrong one is silent: it yields a plausible
+number, not an error.
+
+| field | what it measures | valid for |
+|---|---|---|
+| `S_emp_states` | `H(p_bar)`, entropy of the realised state occupancy | discrete only |
+| `S_emp` | k-means at an assumed `k` over `model.last_encodings` | both |
+
+`S_emp` is `statistical_complexity_empirical`.  It clusters the **pre-bottleneck**
+latent — continuous whatever the bottleneck does — at a `k` taken from the
+ground-truth state count.  On a discrete run it therefore cannot see the
+bottleneck at all.  The clean demonstration is `01_ksweep/K001`: with one state
+the causal representation is a constant vector and the complexity is exactly 0,
+but forcing k=2 clusters on the latent cloud still returns ≈0.71 bits.  The
+K=1 arms also confirm the bottleneck is empty a second way — forward and
+backward CE agree to four decimals (0.8903 / 0.8904), which is what a
+context-free unigram predictor must give, since the marginal is
+time-reversal invariant.
+
+`S_emp_states` is exact and hyperparameter-free, is 0 at K=1, and lands within
+0.006 bits of the closed form when the state set is recovered.
+
+Never select between them by hand.  `Model_analysis.resolve_s_emp(runs)` returns
+the field name — `S_emp_states` when every arm of every repeat carries a finite
+one, else `S_emp` — and `S_EMP_NOTE[key]` is the matching caption.  Every
+figure, table and console line resolves through it, so a plot and its caption
+cannot quote different instruments.  Both numbers are stored on every record,
+so a mis-plotted figure is always fixable by redraw:
+
+```bash
+python Experimental_setup/replot_complexity.py --dry-run   # marks what moves
+python Experimental_setup/replot_complexity.py
+```
+
+One caveat when editing mid-run: a training process that has already imported
+the module keeps the old code and will overwrite its figures on the way out.
+Later subprocesses are spawned fresh and pick the fix up.  Redraw after the
+pre-edit processes exit.
+
+---
+
 ## 15. Command reference
 
 ```bash
@@ -1889,7 +1933,7 @@ conda activate qdrug
 cd /Users/tisornnaphattalung/Desktop/Quantum/URECA/LLM_final_version
 
 # Verification
-pytest tests/ -q                                    # 80 tests, ~2.5 min
+pytest tests/ -q                                    # 84 tests, ~2.7 min
 python Experimental_setup/run_experiments.py --config SMOKE            # ~2 min, exercises all paths
 
 # Training
@@ -1927,6 +1971,16 @@ python Experimental_setup/run_statistical_trj.py --config DISCRETE --n-states 25
 python Experimental_setup/run_statistical_trj.py --config DISCRETE --chunk-len 128 \
        --usage-beta 1.2207e-4 --out-root All_Results/discrete_v2/03_seqlen/T128_betaFixed
 python Experimental_setup/run_dice_experiment.py --plots-only
+
+# Redraw the complexity figures from stored records — no training, seconds
+python Experimental_setup/replot_complexity.py --dry-run                # what would change
+python Experimental_setup/replot_complexity.py                          # the whole tree
+python Experimental_setup/replot_complexity.py All_Results/discrete_v2  # one subtree
+
+# The two sweeps on ONE axis — 08 is all coin, 09 all flower, and only the
+# flower family reaches negative C− − C+, so the sign test needs both
+python Experimental_setup/plot_sweep_combined.py               # -> sweep_combined/
+python Experimental_setup/plot_sweep_combined.py --panel-only  # just the one panel
 
 # The capacity axis (Section 8B) — the direct test of the residual argument
 for D in 8 16 32 64; do

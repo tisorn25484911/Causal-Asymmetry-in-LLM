@@ -152,7 +152,7 @@ for _d in ("Transformer_model", "Experimental_setup"):
 # scores a paired repeat, paired_stats runs the same paired estimator the rest of
 # the repo uses, _traj_pair/_stats/_verdict/CONV_TOL keep the definitions single.
 from configs import CONFIGS
-from Model_analysis import savefig
+from Model_analysis import resolve_s_emp, savefig, S_EMP_NOTE
 from run_statistical_trj import (
     CONV_TOL,
     _stats,
@@ -486,11 +486,11 @@ def process_row(tag: str, rec: dict, global_burn=None) -> dict:
     # wrong instrument: measured, the discrete estimate lands within 0.006 bits
     # of the closed form when the state set is recovered, which the clustered one
     # does not.
-    _key = ("S_emp_states"
-            if all("S_emp_states" in r["fw"] and
-                   r["fw"]["S_emp_states"] == r["fw"]["S_emp_states"]  # not NaN
-                   for r in rec["runs"])
-            else "S_emp")
+    # Resolved centrally so this and _draw_complexity cannot disagree.  Note it
+    # checks BOTH arms: the local version this replaced tested only "fw", so a
+    # record whose backward arm lacked the field selected the state estimator
+    # and then raised KeyError on the next line.
+    _key = resolve_s_emp(rec["runs"])
     s_fw = _stats([r["fw"][_key] for r in rec["runs"]])
     s_bw = _stats([r["bw"][_key] for r in rec["runs"]])
     # Also carry the state counts, so the figure can hollow out the points whose
@@ -924,9 +924,7 @@ def plot_sweep_scatter(rows: list, out_root: str):
     ax.set_xlabel("C− − C+ (bits, closed form)")
     ax.set_ylabel("S_emp − closed form (bits)")
     _kind = rows[0].get("s_emp_kind", "S_emp") if rows else "S_emp"
-    _note = ("state occupancy, exact — no clustering"
-             if _kind == "S_emp_states"
-             else "k-means at an assumed k, so S ≤ log2(k)")
+    _note = S_EMP_NOTE[_kind]
     ax.set_title(f"INSTRUMENT CHECK — S_emp error per arm\n{_note}",
                  fontsize=9, fontweight="bold")
     ax.legend(fontsize=7)

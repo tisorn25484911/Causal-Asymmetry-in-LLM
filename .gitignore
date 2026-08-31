@@ -29,11 +29,26 @@ results_sweep_wd/
 # results_* trees stay where they are as the onehot baseline.
 All_Results/onehot/
 All_Results/discrete/
+# DISCRETE_V2_PLAN.md.  The 12-folder schedule, on the same standard as the two
+# trees above: ~7,500 arm-trainings of output, all of it regenerable.
+All_Results/discrete_v2/
 
 # Model weights, Lightning checkpoints, pickled result bundles
 *.pt
 *.ckpt
 *.pkl
+
+# ---------------------------------------------------------------------------
+# Figures.  Every .png in this repo is generated -- there are no hand-drawn or
+# documentation images -- and each runner can redraw its own with --plots-only,
+# or replot_complexity.py / plot_sweep_combined.py for the shared ones.  No
+# leading slash, so this matches at any depth.
+#
+# NOTE: this does not untrack the 23 figures already committed under
+# All_Results/results_trajectories/ (the onehot baseline).  git ignores only
+# UNtracked paths; those stay versioned until `git rm --cached` says otherwise.
+# ---------------------------------------------------------------------------
+*.png
 
 # ---------------------------------------------------------------------------
 # Python
@@ -55,7 +70,14 @@ env/
 .DS_Store
 .claude/settings.local.json
 *.code-workspace
-# Run logs from the Phase 1.9 re-runs
-run_*.log
-# ... and from the model-comparison launcher, which names its logs per step
-Run_logs/*.log
+# Run logs, at any depth.  `Run_logs/*.log` matched only the top level, so the
+# per-experiment subtrees the lane scripts write -- Run_logs/discrete_v2/*.log
+# and friends -- were slipping through.  A bare pattern matches at any depth and
+# subsumes both of the earlier rules.
+#
+# Run_logs/ itself is NOT ignored: the launcher scripts, requirements.txt and
+# requirements-lock.txt live there and are meant to be versioned.
+*.log
+# The lane scripts drop a pid file beside each log; they name processes on one
+# machine at one moment and mean nothing to anyone else.
+*.pid

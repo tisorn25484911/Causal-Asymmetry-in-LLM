@@ -1010,6 +1010,51 @@ def discrete_hparams(cfg: dict, num_token: int, batch: int) -> dict:
                 usage_beta=float(beta))
 
 
+# The two estimators are BOTH stored on every arm record and both are named
+# "S_emp" somewhere, so a consumer that picks by hand picks wrong eventually.
+# Every plot, table and summary resolves through here instead.
+S_EMP_NOTE = {
+    "S_emp_states": "state occupancy, exact — no clustering",
+    "S_emp":        "k-means at an assumed k, so S ≤ log2(k)",
+}
+
+
+def resolve_s_emp(runs, arms=("fw", "bw")) -> str:
+    """
+    Which S_emp field to read from a list of per-repeat run records.
+
+    Returns "S_emp_states" when every arm of every repeat carries a finite one,
+    otherwise "S_emp".  Look up S_EMP_NOTE[key] for the caption.
+
+    Why this is not a free choice
+    -----------------------------
+    `S_emp` is `statistical_complexity_empirical`: k-means at an assumed k over
+    the PRE-BOTTLENECK latent, model.last_encodings, which is continuous
+    whatever the bottleneck does.  For the continuous decoder it is the only
+    instrument available.  For the discrete decoder it measures the wrong
+    tensor at a k taken from the ground truth, so it cannot see the bottleneck
+    at all: at n_states=1 the causal representation is a constant vector and
+    the complexity is exactly 0, but forcing k=2 clusters on the latent cloud
+    still returns ~0.71 bits (coin(0.10,0.90) forward, 01_ksweep/K001).
+
+    `S_emp_states` is the entropy of the realised state occupancy, H(p_bar).
+    It is exact, hyperparameter-free, correctly 0 at K=1, and measured lands
+    within 0.006 bits of the closed form when the state set is recovered.
+
+    The all-arms-finite rule keeps one figure on one instrument: a record that
+    mixed the two across repeats would put incomparable numbers in one mean.
+    """
+    runs = list(runs)
+    if not runs:
+        return "S_emp"
+    for r in runs:
+        for arm in arms:
+            v = (r.get(arm) or {}).get("S_emp_states")
+            if not isinstance(v, (int, float)) or v != v:      # missing or NaN
+                return "S_emp"
+    return "S_emp_states"
+
+
 def causal_state_occupancy(process: str, mode: str, p: float | None = None,
                            q: float | None = None, n: int | None = None,
                            m: int | None = None, dice_probs=None,

@@ -112,13 +112,6 @@ import matplotlib.pyplot as plt
 import numpy as np
 import torch
 
-# ── repo path bootstrap ────────────────────────────────────────────────────
-# REORGANISATION_FIX_PLAN.md 4.1.  The tree is split across Transformer_model/
-# and Experimental_setup/ but the modules are still flat (`from utils import
-# ...`), so both directories have to be importable.  Python only ever puts the
-# *script's own* directory on sys.path -- which is why this is needed, and why
-# cd-ing elsewhere does not help.  Anchored on __file__, so the script runs
-# from any working directory.
 import sys
 _ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 for _d in ("Transformer_model", "Experimental_setup"):
@@ -143,9 +136,11 @@ from Model_analysis import (
     flower_entropy_rate,
     paired_delta_ce,
     recover_causal_states,
+    resolve_s_emp,
     savefig,
     statistical_complexity,
     statistical_complexity_empirical,
+    S_EMP_NOTE,
 )
 from utils import (
     cleanup, coin_tag, entropy_rate_coin, flower_tag, mkdir, repo_path,
@@ -582,30 +577,51 @@ def _draw_complexity(ax, rec: dict, compact: bool = False, legend: bool = True):
     The theoretical bars are the closed forms -- statistical_complexity for the
     coin, flower_complexity for the flower -- so a systematic gap is visible
     rather than inferred.
+
+    The estimator is resolved, not assumed: a discrete run is plotted from its
+    state occupancy and a continuous one from k-means, and the caption says
+    which.  Plotting k-means for a discrete run reports the wrong instrument --
+    it clusters the pre-bottleneck latent at a k taken from the ground truth,
+    so at n_states=1 it returns ~0.7 bits where the true complexity is 0.
     """
     spec = rec["spec"]
-    s_fw = _stats([r["fw"]["S_emp"] for r in rec["runs"]])
-    s_bw = _stats([r["bw"]["S_emp"] for r in rec["runs"]])
+    key  = resolve_s_emp(rec["runs"])
+    s_fw = _stats([r["fw"][key] for r in rec["runs"]])
+    s_bw = _stats([r["bw"][key] for r in rec["runs"]])
     emp  = [s_fw["mean"], s_bw["mean"]]
     th   = [spec["C_plus"], spec["C_minus"]]
     x    = np.arange(2)
     fs, fsl = (6, 6) if compact else (9, 9)
 
     b1 = ax.bar(x - 0.2, emp, 0.35, color=[FW_COLOUR, BW_COLOUR],
-                alpha=0.85, edgecolor="k", label=f"Empirical S_emp (n={s_fw['n']} runs)")
+                alpha=0.85, edgecolor="k",
+                label=f"Empirical {key} (n={s_fw['n']} runs)")
     b2 = ax.bar(x + 0.2, th, 0.35, color=[FW_COLOUR, BW_COLOUR],
                 alpha=0.45, edgecolor="k", hatch="//", label="Theoretical (closed form)")
     _errbars(ax, x - 0.2, emp, [s_fw["sd"], s_bw["sd"]], [s_fw["sem"], s_bw["sem"]])
     ax.bar_label(b1, fmt="%.4f", padding=(8 if compact else 14), fontsize=fs)
     ax.bar_label(b2, fmt="%.4f", padding=3, fontsize=fs)
 
+    # The tick tells the reader what the bar was measured with.  For k-means
+    # that is the assumed k; for the state estimator k is not used at all, so
+    # quoting it there would be the same confusion in the axis instead of the
+    # bar -- the budget K and the states actually occupied are what matter.
+    if key == "S_emp_states":
+        def _lab(arm):
+            u = [r[arm].get("n_states_used") for r in rec["runs"]
+                 if r[arm].get("n_states_used")]
+            K = spec.get("n_states", "?")
+            return f"K={K}, used {int(np.median(u))}" if u else f"K={K}"
+    else:
+        def _lab(arm):
+            return f"k={spec['k_fw' if arm == 'fw' else 'k_bw']}"
+
     ax.set_xticks(x)
     if compact:
-        ax.set_xticklabels([f"FW  k={spec['k_fw']}", f"BW  k={spec['k_bw']}"],
-                           fontsize=7)
+        ax.set_xticklabels([f"FW  {_lab('fw')}", f"BW  {_lab('bw')}"], fontsize=7)
     else:
-        ax.set_xticklabels([f"Forward  (C+, k={spec['k_fw']})",
-                            f"Backward  (C-, k={spec['k_bw']})"])
+        ax.set_xticklabels([f"Forward  (C+, {_lab('fw')})",
+                            f"Backward  (C-, {_lab('bw')})"])
     ax.set_ylabel("Statistical complexity (bits)")
     ax.set_ylim(0, max(emp + th) * 1.20)          # headroom for the bar labels
     if not compact:
@@ -620,8 +636,10 @@ def _draw_complexity(ax, rec: dict, compact: bool = False, legend: bool = True):
 
     if compact:
         return
-    note = ("S_emp is k-means at the k above, so S ≤ log2(k); it overestimates "
-            "when the true state occupancy is unbalanced.")
+    note = f"{key}: {S_EMP_NOTE[key]}."
+    if key == "S_emp":
+        note += ("  It overestimates when the true state occupancy is "
+                 "unbalanced.")
     k_fw = [r["fw"].get("k_hat") for r in rec["runs"] if r["fw"].get("k_hat")]
     k_bw = [r["bw"].get("k_hat") for r in rec["runs"] if r["bw"].get("k_hat")]
     if k_fw and k_bw:
@@ -1400,11 +1418,14 @@ def main(argv=None):
                 if args.khat:
                     extra = (f"  k̂ {run['fw'].get('k_hat')}/"
                              f"{run['bw'].get('k_hat')}")
+                # Same resolution as the figure, on this repeat alone, so the
+                # console and the plot cannot quote different instruments.
+                _k = resolve_s_emp([run])
                 print(f"  [{tag} {done:>3}/{args.repeats}] seed={seed}  "
                       f"CE_FW={run['fw']['final_ce']:.4f}  "
                       f"CE_BW={run['bw']['final_ce']:.4f}  "
                       f"delta={run['delta_ce']:+.4f}  "
-                      f"S_emp {run['fw']['S_emp']:.3f}/{run['bw']['S_emp']:.3f}"
+                      f"{_k} {run['fw'][_k]:.3f}/{run['bw'][_k]:.3f}"
                       f"{extra}  ({time.time()-t0:.1f}s, ETA {eta:.1f} min)"
                       f"{flag}")
 

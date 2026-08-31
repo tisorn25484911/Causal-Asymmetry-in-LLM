@@ -929,6 +929,10 @@ Experimental_setup/               the drivers
 ├── run_dice_experiment.py        the dice axis — separates C⁻−C⁺ from m−n
 ├── run_discrete_v2.py            the discrete experiment schedule — 12 folders,
 │                                 one axis each; trains nothing itself
+├── replot_complexity.py          redraw the complexity figures from stored
+│                                 records — no model loaded, no training
+├── plot_sweep_combined.py        08_pqsweep + 09_nmsweep on one axis — the
+│                                 sign test needs both families together
 ├── analyse_lambda_sweep.py       a(λ)/b(λ) decomposition across the weight-decay runs
 ├── analyse_capacity.py           |ΔCE| against d_model — the residual-argument test
 ├── pq_experiment.py              the p-q grid sweep and its heatmaps
