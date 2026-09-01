@@ -17,14 +17,7 @@ class CoinDataset(Dataset):
         target = x[1:]
         return input, target
     
-# IMPROVEMENT_PLAN.md C4.  `FlowerDataset` and `flower_process_generation`
-# used to be defined HERE as well as in Flower_process_generation.py -- this
-# copy with n=4/m=2 hard-coded as attributes and no `pre_depth`, that one
-# parametric and with it.  Every runner imported the generator from this file
-# and the Dataset from the other, so this file's FlowerDataset was dead in all
-# of them.  Both copies are deleted; Flower_process_generation.py is the single
-# definition.  Duplicated definitions are fine right up until one is fixed and
-# the other is not.
+
 
 
 def coin_generation(num_samples = 1000, seq_len = 20, p = 0.6, q = 0.4):

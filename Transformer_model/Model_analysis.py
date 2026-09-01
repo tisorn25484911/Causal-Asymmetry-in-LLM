@@ -516,19 +516,11 @@ def perplexity_calculation(model, data_loader, max_batches=None, pad_id=None):
 
     Both models are scored on the SAME ground-truth sequences, which is what
     makes this the comparison metric (unlike self_generated_entropy_rate, C3).
-
-    D4: this used to append every batch's logits to a list and torch.cat them
-    all before computing one loss -- 80 MB of float32 held on CPU for the
-    flower config, and more once analysis moved to longer sequences.  CE is
-    accumulated incrementally instead, token-weighted so the result is
-    identical to concatenating first (the previous code computed a single mean
-    over all B*T tokens, and sum(CE_i * n_i) / sum(n_i) is that same mean).
-    Only one batch of logits is alive at a time now.
     """
     device = next(model.parameters()).device
     total_ce_tokens, total_tokens = 0.0, 0
 
-    with torch.no_grad():
+    with torch.no_grad(): 
         for batch_idx, batch in enumerate(data_loader):
             if max_batches is not None and batch_idx >= max_batches:
                 break
@@ -618,10 +610,7 @@ def perplexity_ind_CE(model, data_loader, p, q, num_token=3, max_batches=None):
             p_model = torch.softmax(logits, dim=-1).cpu().numpy()  # (B, T, V)
             inp_np  = inputs.cpu().numpy()          # (B, T)
 
-            # D2: vectorised.  This was `for b: for t:` in pure Python.
-            # LLM_asymmetry_testing calls it with max_batches=None, i.e. 500
-            # sequences x 1999 positions = 1e6 iterations per call, four calls
-            # per experiment.  Fancy-indexing target_prob by the input tokens
+
             # gives the (B, T, V) soft-label array in one step.
             p_true = target_prob[inp_np]                     # (B, T, V)
             ce_bt  = -(p_true * np.log2(p_model + 1e-12)).sum(-1)   # (B, T)
@@ -862,30 +851,6 @@ def flower_complexity(n: int, m: int, dice_probs,
         hypothesis.
 
     `merge_tol` -- when two posteriors count as "the same"
-    -----------------------------------------------------
-    REMAINING_WORK_PLAN.md C10.  `merge_tol=None` (the default) uses the original
-    rule: round the posterior to MERGE_ROUND_DP decimals and require exact
-    equality.  Passing a float instead groups posteriors within that distance in
-    max-norm.
-
-    These are NOT equivalent, and the difference is not academic.  Measured on
-    Dirichlet(alpha=0.2) dice at (n,m)=(2,8), seed 74, two outcomes had posteriors
-    [9.3e-12, ~1] and [6.5e-10, ~1] -- differing by 6.4e-10.  The rounding rule
-    calls them two backward states (C- = 2.1041); a 1e-9 tolerance calls them one
-    (C- = 2.0748).  A 0.029-bit difference in the x-axis of the whole experiment.
-
-    Both readings are defensible.  Exactly, an epsilon-machine is defined by exact
-    conditional distributions, so distinct posteriors are distinct states.
-    Operationally, telling those two apart from data needs of order 1e18 samples,
-    so a finite-sample predictor cannot possibly represent them separately -- and
-    the hypothesis under test is about what a *memory-bounded* model does.
-
-    The default is the rounding rule because every result this repo has reported
-    used it, and switching would make new numbers incomparable with the 81-cell
-    baseline.  It matters only for spiky dice (small alpha), where near-zero column
-    masses amplify float noise; over 3600 Dirichlet(1.0) draws the two rules agree
-    exactly.  Any experiment that deliberately uses small alpha should state which
-    rule it used, and preferably report both.
 
     """
     dp = np.asarray(dice_probs, dtype=float)
@@ -1606,15 +1571,6 @@ def compare_FW_BW_latents(model_fw, model_bw, data_loader, max_batches = None):
 def FW_BW_loss_comparison(recorder_fw, recorder_bw, save_path=None):
     """
     Forward vs backward training loss, and their difference.
-
-    IMPROVEMENT_PLAN.md B10.  Four defects, all fixed here:
-      * the function ended in a bare `return`, so the figure it had just built
-        was unreachable and discarded;
-      * both x-axes were labelled "Epoch" while step_loss is indexed by
-        gradient step;
-      * panel 2's title said "Backward Model Training Loss" while it plots the
-        BW - FW difference;
-      * panel 1's title said "Forward Model Training Loss" while it plots both.
 
     Note the runners do not call this — they use their own plot_loss_theory,
     which was already correct.  Kept and fixed rather than deleted so ad-hoc

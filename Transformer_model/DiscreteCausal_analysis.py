@@ -18,7 +18,8 @@ import torch
 import matplotlib
 matplotlib.use("Agg")
 import matplotlib.pyplot as plt
-
+from Flower_process_generation import FlowerDataset, flower_process_generation
+from Data_generation import CoinDataset, coin_generation
 # Notebook palette.  One sequential hue for magnitude (occupancy is a count, so
 # sequential, not categorical), a grey for unused states, and text in ink
 # rather than in the series colour.
@@ -419,3 +420,80 @@ def plot_causal_states_pair(report_fw, report_bw, out_dir: str, tag: str,
     for p in paths:
         print(f"  figure saved -> {p}")
     return paths
+
+def transition_matrix_extraction(model, process, n_p = None, m_q = None , burn_in = 100, total_run = 500, max_batches = None):
+    """
+    Empirical state-to-state transition matrix, read off the model's own
+    free-running generation:  T[i][j] = P(s_{t+1} = j | s_t = i).
+
+    The model is seeded with a burn-in drawn from the TRUE process, then rolls
+    forward on its own samples.  At each step the state the bottleneck lands in
+    at the newest position is recorded, and the s_i -> s_j counts are
+    row-normalised.  This is the state-transition analogue of the emission
+    heatmap above, and like `emission_table` it is only identified up to a
+    PERMUTATION of the state labels -- which index the bottleneck assigns to
+    which causal state is arbitrary, so compare against a closed form only after
+    matching the labels up.
+
+    `n_p` / `m_q` are the process parameters -- (p, q) for Coin, (n, m) for
+    Flower.  They are deliberately not named `np`/`mq`: a parameter called `np`
+    shadows the numpy import for the whole body, which is what stopped this
+    function from running at all.
+    """
+    # Data generation
+    samples = 1
+    pre_depth = 0
+    dice_probs=None
+    if process == "Coin":
+        data, states = coin_generation(samples, burn_in, n_p, m_q)
+        NUM_TOKEN = 3
+    elif process == "Flower":
+        data, states = flower_process_generation(samples, burn_in, pre_depth, n_p, m_q, dice_probs)
+        NUM_TOKEN = n_p + m_q
+    else:
+        raise ValueError(f"unknown process {process!r} -- expected 'Coin' or 'Flower'")
+
+    # Recordings of transitioned states
+    transition = np.zeros((model.n_states, model.n_states))
+
+    # Model next token prediction
+    model.eval()
+    device = next(model.parameters()).device
+    is_bw  = (getattr(model, "mode", "forward") == "backward")
+    inputs_ini = torch.tensor(data, dtype=torch.long, device=device)
+
+    pred_seq = []
+    window_size = model.max_len
+    if inputs_ini.shape[1] < window_size: print("add more burn_in")
+    pos = 0 if is_bw else -1
+    inputs = inputs_ini[:, -window_size:]
+    causal_idx_prev = None
+    for i in range(total_run):
+        if is_bw:
+            inputs = inputs[:, :window_size]
+        else:
+            inputs = inputs[:, -window_size:]
+        with torch.no_grad():
+            logits = model(inputs)
+        causal_state = model.last_states          # (B,T), already the argmax
+        causal_idx = int(causal_state[0, pos])
+        if causal_idx_prev is not None:
+            transition[causal_idx_prev][causal_idx] += 1
+        causal_idx_prev = causal_idx
+
+        prob = torch.softmax(logits[0, pos], dim = -1).cpu().numpy().astype(np.float64)
+        next_token = int(np.random.choice(NUM_TOKEN, p=prob / prob.sum()))
+        nxt = torch.tensor([[next_token]], dtype=torch.long, device=device)
+        if is_bw:
+            inputs = torch.cat((nxt, inputs), dim=1)
+            pred_seq = [next_token] + pred_seq
+        else:
+            inputs = torch.cat((inputs, nxt), dim=1)
+            pred_seq = pred_seq + [next_token]
+
+    # Row-normalise: T is P(s_j | s_i), so each row sums to 1.  Dividing the
+    # whole table by one scalar count left it un-normalised.  Unvisited states
+    # keep a zero row rather than raising.
+    row = transition.sum(axis=1, keepdims=True)
+    transition = np.divide(transition, row, out=np.zeros_like(transition), where=row > 0)
+    return transition
