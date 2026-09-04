@@ -1287,6 +1287,15 @@ def parse_args(argv=None):
                     help="pickle to cross-check overlapping processes against")
     ap.add_argument("--verbose", action="store_true",
                     help="do not suppress per-run training output")
+    # The matrices cannot be read back off a finished folder: this runner keeps
+    # no weights, so the best repeat has to be retrained.  run_transition_matrix
+    # does that, and can also be pointed at an already-finished folder.
+    ap.add_argument("--transition", action="store_true",
+                    help="after the sweep, retrain the best repeat of each "
+                         "point and write its state-transition matrices")
+    ap.add_argument("--transition-total-run", type=int, default=5000,
+                    help="generation steps per arm for --transition "
+                         "(default 5000)")
     return ap.parse_args(argv)
 
 
@@ -1487,6 +1496,11 @@ def main(argv=None):
     plot_sweep_trajectories(rows, out_root)
     baseline_crosscheck(rows, repo_path(args.baseline))
     print_sweep_summary(rows, out_root)
+    if args.transition:
+        from run_transition_matrix import one_folder
+        one_folder(os.path.basename(out_root.rstrip("/")),
+                   os.path.dirname(out_root.rstrip("/")),
+                   args.transition_total_run)
 
 
 if __name__ == "__main__":

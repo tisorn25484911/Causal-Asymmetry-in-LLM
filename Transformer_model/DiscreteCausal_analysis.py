@@ -421,7 +421,8 @@ def plot_causal_states_pair(report_fw, report_bw, out_dir: str, tag: str,
         print(f"  figure saved -> {p}")
     return paths
 
-def transition_matrix_extraction(model, process, n_p = None, m_q = None , burn_in = 100, total_run = 500, max_batches = None):
+def transition_matrix_extraction(model, process, n_p = None, m_q = None , burn_in = 100, total_run = 500, max_batches = None, window_size = None,
+                                 dice_probs = None):
     """
     Empirical state-to-state transition matrix, read off the model's own
     free-running generation:  T[i][j] = P(s_{t+1} = j | s_t = i).
@@ -435,15 +436,26 @@ def transition_matrix_extraction(model, process, n_p = None, m_q = None , burn_i
     which causal state is arbitrary, so compare against a closed form only after
     matching the labels up.
 
+    `dice_probs` is the Flower dice realisation to seed from; pass the one in
+    the run's spec.
+
+    `window_size` is the context the model rolls forward on.  Pass the TRAINING
+    chunk length: see the "analysis" note in configs.py -- the model only ever
+    saw positional indices [0, chunk), so a longer window measures
+    extrapolation rather than what was learned, and does so ASYMMETRICALLY
+    between the two arms.  It falls back to max_len for a standalone model with
+    no runner to ask.
+
     `n_p` / `m_q` are the process parameters -- (p, q) for Coin, (n, m) for
     Flower.  They are deliberately not named `np`/`mq`: a parameter called `np`
     shadows the numpy import for the whole body, which is what stopped this
     function from running at all.
     """
-    # Data generation
+    # Data generation.  `dice_probs` MUST be the realisation the model was
+    # trained on -- leaving it None re-draws a fresh random set of dice, so the
+    # burn-in would come from a different process than the one being inspected.
     samples = 1
     pre_depth = 0
-    dice_probs=None
     if process == "Coin":
         data, states = coin_generation(samples, burn_in, n_p, m_q)
         NUM_TOKEN = 3
@@ -463,7 +475,12 @@ def transition_matrix_extraction(model, process, n_p = None, m_q = None , burn_i
     inputs_ini = torch.tensor(data, dtype=torch.long, device=device)
 
     pred_seq = []
-    window_size = model.max_len
+    # d_model is the embedding WIDTH; the original `window_size = model.d_model`
+    # silently cut the context to 32 tokens.
+    window_size = model.max_len if window_size is None else int(window_size)
+    window_size = min(window_size, model.max_len)
+    # Against the seed LENGTH, not `burn_in`: Flower counts burn_in in cycles
+    # and emits two tokens per cycle, so comparing burn_in warns wrongly.
     if inputs_ini.shape[1] < window_size: print("add more burn_in")
     pos = 0 if is_bw else -1
     inputs = inputs_ini[:, -window_size:]
@@ -497,3 +514,62 @@ def transition_matrix_extraction(model, process, n_p = None, m_q = None , burn_i
     row = transition.sum(axis=1, keepdims=True)
     transition = np.divide(transition, row, out=np.zeros_like(transition), where=row > 0)
     return transition
+
+
+def plot_transition_matrix_pair(T_fw, T_bw, out_dir: str, tag: str,
+                                counts_fw=None, counts_bw=None) -> str | None:
+    """
+    The forward and backward state-transition matrices as one heatmap pair.
+
+    Same presentation as the emission heatmap above -- Blues on [0, 1] with the
+    value printed in each cell -- because both are row-stochastic tables over
+    states and reading them side by side is the point.
+
+    Only the states the model actually VISITED are drawn, as in the emission
+    heatmap: K is the bottleneck's capacity, not its occupancy, and at K=15
+    with 2 states used the full grid is 13 empty rows and 225 printed numbers.
+    Ticks carry the real state index, so the picture stays traceable back to
+    the occupancy plots, and the sub-matrix is still row-stochastic because a
+    state that is never entered is never left either.
+
+    Returns the path written, or None when either arm is missing.
+    """
+    if T_fw is None or T_bw is None:
+        return None
+    os.makedirs(out_dir, exist_ok=True)
+
+    arms = (("forward", T_fw, counts_fw), ("backward", T_bw, counts_bw))
+    fig, axes = plt.subplots(1, 2, figsize=(11, 4.4), constrained_layout=True)
+    for ax, (name, T, cnt) in zip(axes, arms):
+        # Visited = entered or left.  Same index set on both axes, so what is
+        # drawn is still a square transition matrix.
+        seen = (T.sum(axis=1) > 0) | (T.sum(axis=0) > 0)
+        keep = np.flatnonzero(seen)
+        if keep.size == 0:
+            keep = np.arange(T.shape[0])
+        sub = T[np.ix_(keep, keep)]
+        K = keep.size
+        im = ax.imshow(sub, cmap="Blues", vmin=0, vmax=1, aspect="auto")
+        # The cell value, in white on the dark end so it stays readable.
+        fs = 8 if K <= 8 else 5
+        for i in range(K):
+            for j in range(K):
+                ax.text(j, i, f"{sub[i, j]:.2f}", ha="center", va="center",
+                        fontsize=fs, color="white" if sub[i, j] > 0.55 else _INK)
+        ax.set_xticks(range(K)); ax.set_yticks(range(K))
+        ax.set_xticklabels([str(k) for k in keep])
+        ax.set_yticklabels([str(k) for k in keep])
+        ax.set_xlabel("to"); ax.set_ylabel("from")
+        ax.set_title(name)
+        # Thin white gridlines between cells, as in the emission heatmap.
+        ax.set_xticks(np.arange(-.5, K, 1), minor=True)
+        ax.set_yticks(np.arange(-.5, K, 1), minor=True)
+        ax.grid(which="minor", color="white", lw=2)
+        ax.tick_params(which="minor", length=0)
+    cb = fig.colorbar(im, ax=axes, pad=0.02)
+    cb.outline.set_visible(False)
+    fig.suptitle(tag)
+
+    p = os.path.join(out_dir, f"{tag}_state_transition.png")
+    fig.savefig(p, dpi=150, bbox_inches="tight"); plt.close(fig)
+    return p

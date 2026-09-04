@@ -65,13 +65,6 @@ def Rev_HMM_generation(data, states):
 
 def make_loader(data, batch_size, shuffle=True):
     """
-    Plain DataLoader over `data`.
-
-    IMPROVEMENT_PLAN.md C7.  This used to take a `states` argument that was a
-    no-op: the body read `seqs, _ = data, states`, a tuple unpack that assigns
-    seqs = data and discards states, written in a form that made `states` look
-    load-bearing.  No caller ever used the state sequences.
-
     It also had a mode="backward" branch that reversed the *data* — a third,
     unused notion of "backward" alongside the triu mask and the batch swap,
     and NOT the mechanism any experiment uses.  Only pq_experiment.py calls

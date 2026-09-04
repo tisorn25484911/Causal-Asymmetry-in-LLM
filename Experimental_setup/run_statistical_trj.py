@@ -311,13 +311,20 @@ def build_dataset(spec: dict, seed: int):
     return FlowerDataset(data, seq_len=len(data[0]))
 
 
-def one_repeat(spec: dict, cfg: dict, seed: int, khat: bool = False) -> dict:
+def one_repeat(spec: dict, cfg: dict, seed: int, khat: bool = False,
+               keep_models: bool = False) -> dict:
     """
     Train both arms once on one realisation of the process and measure them.
 
     Returns {"seed", "fw": {...}, "bw": {...}, "delta_ce"}, where each arm dict
     carries final_ce / final_ppl / S_emp / traj / val_traj / val_at / diverged
     (+ k_hat / S_hat when `khat`).
+
+    `keep_models` additionally returns the two live models under "_models" and
+    the analysis chunk under "_chunk", for transition_matrix_extraction.  It is
+    off by default because holding 30 repeats x 2 arms of trained models is
+    exactly what the `del rec` below exists to prevent; only the single best
+    repeat is ever re-trained with it on.
     """
     ds      = build_dataset(spec, seed)
     max_len = full_seq_len(ds)                       # PE table covers the input
@@ -429,6 +436,9 @@ def one_repeat(spec: dict, cfg: dict, seed: int, khat: bool = False) -> dict:
             arm_res["true_k"] = spec.get(f"true_k_{arm}")
 
         out[arm] = arm_res
+        if keep_models:
+            out.setdefault("_models", {})[arm] = rec.model
+            out["_chunk"] = chunk
         del rec
         cleanup()
 
@@ -1212,6 +1222,15 @@ def parse_args(argv=None):
                     help="redraw every figure from the saved pickle, no training")
     ap.add_argument("--verbose", action="store_true",
                     help="do not suppress the per-run training output")
+    # The matrices cannot be read back off a finished folder: this runner keeps
+    # no weights, so the best repeat has to be retrained.  run_transition_matrix
+    # does that, and can also be pointed at an already-finished folder.
+    ap.add_argument("--transition", action="store_true",
+                    help="after the run, retrain the best repeat of each "
+                         "process and write its state-transition matrices")
+    ap.add_argument("--transition-total-run", type=int, default=5000,
+                    help="generation steps per arm for --transition "
+                         "(default 5000)")
 
     return ap.parse_args(argv)
 
@@ -1482,6 +1501,11 @@ def main(argv=None):
     plot_summary(combined, out_root)
     plot_grid_summary(combined, out_root)
     print_summary(combined, out_root)
+    if args.transition:
+        from run_transition_matrix import one_folder
+        one_folder(os.path.basename(out_root.rstrip("/")),
+                   os.path.dirname(out_root.rstrip("/")),
+                   args.transition_total_run)
 
     print(f"\n{'='*70}\n  ALL COMPLETE — {(time.time()-t_start)/60:.1f} min")
     for root, _dirs, files in os.walk(out_root):

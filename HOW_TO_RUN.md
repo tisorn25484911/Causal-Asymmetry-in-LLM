@@ -1192,6 +1192,105 @@ disagree only where the model itself under-resolves the states.
 
 ---
 
+## 9A. The state-transition matrices
+
+```bash
+# smoke test — one process, short run, ~2 min
+python Experimental_setup/run_transition_matrix.py 08_pqsweep \
+       --tags sweep_coin_p015_q015 --total-run 300
+
+# the real thing — every process in the three folders, ~4 h
+python Experimental_setup/run_transition_matrix.py 00_base 08_pqsweep 09_nmsweep \
+       --total-run 5000
+```
+
+This reads the *learned* state-to-state transition matrix off a trained
+bottleneck:
+
+    T[i][j] = P(s_{t+1} = j | s_t = i)
+
+`DiscreteCausal_analysis.transition_matrix_extraction` seeds the model with a
+burn-in drawn from the true process, then lets it free-run on its own samples,
+recording which causal state the bottleneck occupies at each new position. It
+is the state-transition analogue of the `P(next | state)` emission heatmap from
+Section 9, and it applies only to the discrete architecture — the one-hot
+decoder has no explicit states to count.
+
+### 9A.1 Why it has to retrain
+
+`run_statistical_trj.py` and `run_sweep_experiment.py` keep **no weights**.
+Every repeat's model is dropped at the end of `one_repeat` and only the metrics
+reach the pickle, so there is nothing under `discrete_v2/` to load. The
+matrices therefore cannot be recovered from a finished folder by reading it:
+the chosen repeat has to be trained again. That is what this runner does, and
+one repeat per process is cheap next to re-running the experiment — about 4 h
+for all 57 processes, against the ~18 h the three folders originally took.
+
+The retrain is seeded from the repeat's own recorded seed, so it is the same
+draw. `accelerator="auto"` selects MPS, which Section 1.3 notes is not
+bit-reproducible, so in principle it is a re-draw rather than the identical
+model; in practice the retrained cross-entropy has matched the recorded value
+to four decimal places on every process checked. The runner prints both, so a
+divergence is visible rather than silent.
+
+### 9A.2 Which repeat is inspected
+
+One model per process, chosen as: among the repeats the pickle marks
+**converged** (|CE − H∞| ≤ `conv_tol` in *both* arms), the one minimising
+max(|CE_fw − H∞|, |CE_bw − H∞|). This is the same two-arm distance `conv_tol`
+already thresholds, so "best" here means what "converged" means everywhere else
+rather than introducing a second, competing notion. A process with no converged
+repeat falls back to the closest overall and is flagged both on the console
+(`[NO converged repeat — closest overall]`) and by `fell_back` in the pickle.
+
+### 9A.3 Options
+
+```
+folders               One or more folder names under --out-root, e.g. 00_base.
+--out-root DIR        Default: All_Results/discrete_v2.
+--total-run N         Generation steps per arm.  Default: 5000.
+--tags TAG [TAG ...]  Restrict to these process tags.  Default: all.
+```
+
+Both runners also accept `--transition`, which invokes this at the end of a
+fresh run, and `--transition-total-run N`:
+
+```bash
+python Experimental_setup/run_sweep_experiment.py --config DISCRETE --repeats 20 \
+       --sweep-coin 0.15 0.35 0.55 0.75 0.95 --transition
+```
+
+### 9A.4 What is produced
+
+Into `<folder>/state_transition/`:
+
+```
+<tag>_state_transition.png     forward | backward heatmap pair
+transition_matrices.pkl        {tag: {T_fw, T_bw, seed, ce_recorded, ce_retrained, ...}}
+```
+
+Only the states the model actually **visited** are drawn. K is the
+bottleneck's capacity, not its occupancy: the coin sweep runs at K=15 and the
+flower sweep at K=40, so the full grid would be mostly empty rows and hundreds
+of printed zeros. Ticks carry the real state index, so the picture stays
+traceable back to the occupancy plots, and the sub-matrix is still
+row-stochastic — a state that is never entered is never left either.
+
+### 9A.5 Two things to know before reading one
+
+The matrix is identified only **up to a permutation of the state labels**.
+Which index the bottleneck assigns to which causal state is arbitrary, so a
+comparison against a closed form has to match the labels up first; the
+forward panel of a coin point may well be indexed {10, 12} rather than {0, 1}.
+
+The generation is **free-running**, not teacher-forced. The model rolls forward
+on its own samples, so the matrix describes the process the model has become,
+not the process it was trained on. Where the two differ — a state the true
+machine visits but the model never re-enters — that difference is the
+measurement, not an artefact to correct.
+
+---
+
 ## 10. The post-hoc evaluators
 
 ```bash
@@ -1976,6 +2075,15 @@ python Experimental_setup/run_dice_experiment.py --plots-only
 python Experimental_setup/replot_complexity.py --dry-run                # what would change
 python Experimental_setup/replot_complexity.py                          # the whole tree
 python Experimental_setup/replot_complexity.py All_Results/discrete_v2  # one subtree
+
+# The learned state-transition matrices (Section 9A) — RETRAINS the best
+# repeat of each process, because the runners keep no weights
+python Experimental_setup/run_transition_matrix.py 08_pqsweep \
+       --tags sweep_coin_p015_q015 --total-run 300      # smoke test, ~2 min
+python Experimental_setup/run_transition_matrix.py 00_base 08_pqsweep 09_nmsweep \
+       --total-run 5000                                  # all 57 processes, ~4 h
+python Experimental_setup/run_sweep_experiment.py --config DISCRETE --repeats 20 \
+       --sweep-coin 0.15 0.35 0.55 0.75 0.95 --transition   # as part of a fresh run
 
 # The two sweeps on ONE axis — 08 is all coin, 09 all flower, and only the
 # flower family reaches negative C− − C+, so the sign test needs both
