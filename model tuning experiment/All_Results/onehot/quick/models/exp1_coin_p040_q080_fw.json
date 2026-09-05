@@ -1,0 +1,16 @@
+{
+  "tag": "exp1_coin_p040_q080",
+  "d_model": 32,
+  "n_layers": 2,
+  "token_size": 3,
+  "max_len": 1999,
+  "embed_type": "onehot",
+  "seed": 0,
+  "optimizer": "adamw",
+  "weight_decay": 0.0,
+  "p": 0.4,
+  "q": 0.8,
+  "n": null,
+  "m": null,
+  "mode": "forward"
+}

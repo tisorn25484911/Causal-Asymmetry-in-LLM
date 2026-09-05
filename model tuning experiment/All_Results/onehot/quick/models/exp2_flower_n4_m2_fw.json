@@ -1,0 +1,16 @@
+{
+  "tag": "exp2_flower_n4_m2",
+  "d_model": 32,
+  "n_layers": 2,
+  "token_size": 6,
+  "max_len": 3999,
+  "embed_type": "onehot",
+  "seed": 0,
+  "optimizer": "adamw",
+  "weight_decay": 0.0,
+  "p": null,
+  "q": null,
+  "n": 4,
+  "m": 2,
+  "mode": "forward"
+}
