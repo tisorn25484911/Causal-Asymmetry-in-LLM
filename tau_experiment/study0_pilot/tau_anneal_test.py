@@ -42,7 +42,7 @@ import torch
 import torch.utils.data as tud
 
 HERE = os.path.dirname(os.path.abspath(__file__))
-sys.path.insert(0, os.path.join(os.path.dirname(HERE), "Experimental_pipeline"))
+sys.path.insert(0, os.path.join(os.path.dirname(os.path.dirname(HERE)), "Experimental_pipeline"))
 
 from config import CONFIG, coin_spec, flower_spec                # noqa: E402
 from extraction import causal_state_report                       # noqa: E402

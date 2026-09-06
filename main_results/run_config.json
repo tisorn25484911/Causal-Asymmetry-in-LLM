@@ -1,7 +1,7 @@
 {
   "seed": 0,
   "flower_dice_seed": 42,
-  "seq_len": 300,
+  "seq_len": 700,
   "burn_in": 250,
   "num_samples": 500,
   "batch": 32,
