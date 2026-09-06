@@ -7,7 +7,7 @@ Run the pipeline on one process, or on all seven, for N repeats.
     python Experimental_pipeline/run_process.py --all --repeats 30       # the seven
     python Experimental_pipeline/run_process.py --all --plots-only       # redraw only
 
-Writes main_results/trainings/<tag>/{repeats.pkl, F1..F4}, and with --all also
+Writes main_results/trainings/<tag>/{repeats.pkl, F1..F5}, and with --all also
 main_results/arc_comparision/F4_all_processes.png.
 
 Per repeat this trains FOUR models -- {discrete, onehot} x {forward, backward} --
@@ -26,7 +26,7 @@ if _HERE not in sys.path:
 
 import figures as FIG                                            # noqa: E402
 from config import CONFIG, baseline_specs, coin_spec, flower_spec  # noqa: E402
-from pipeline import run_process                                 # noqa: E402
+from pipeline import loss_gap_report, run_process                # noqa: E402
 from training import load_pkl, mkdir, save_run_config            # noqa: E402
 
 OUT_DEFAULT = os.path.join(_ROOT, "main_results", "trainings")
@@ -88,6 +88,7 @@ def main(argv=None):
                 print(f"  {spec['tag']}: no repeats.pkl, skipped")
                 continue
             rec = load_pkl(path)
+            print(f"\n  {spec['tag']}\n{loss_gap_report(rec)}")
             for p in FIG.draw_all(rec, os.path.dirname(path)):
                 print(f"  redrew -> {p}")
         else:

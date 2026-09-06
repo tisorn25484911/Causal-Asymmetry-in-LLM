@@ -2,8 +2,9 @@
 The experiment itself.
 
     one_repeat        one realisation -> 4 trained models -> extracted states
-    run_process       one process x N repeats -> repeats.pkl + F1-F4
-    run_sweep         a grid of processes -> per-cell F1-F4 + the grid figure
+    run_process       one process x N repeats -> repeats.pkl + F1-F5
+    run_sweep         a grid of processes -> per-cell F1-F5 + the grid figure
+    loss_gap_report   how far each arm finished from the entropy rate
 
 Four models per repeat: {discrete, onehot} x {forward, backward}, all four on
 the SAME realisation with the same hold-out split.  That is not incidental --
@@ -132,6 +133,43 @@ def one_repeat(spec: dict, cfg: dict, seed: int, keep_discrete: bool = False) ->
     return out
 
 
+def loss_gap_report(rec: dict, indent: str = "  ") -> str:
+    """
+    CE - H_inf per architecture and arm, mean +- sd over repeats.
+
+    H_inf is the value the cross-entropy converges to once the model has the
+    process, so the GAP is the quantity that says whether a run finished, and it
+    is the same quantity conv_tol thresholds -- reported here rather than left
+    implicit in a per-repeat line.
+
+    The spread is not decoration.  These runs are bimodal rather than spread:
+    a repeat either converges near zero or collapses a full bit away, so a mean
+    inside conv_tol can hide a failed repeat entirely.  The worst-repeat and
+    diverged columns are printed beside the mean for exactly that reason, and
+    `sd` uses ddof=1 because repeats are a sample, not the population.
+    """
+    H, tol, runs = rec["spec"]["theory"], rec["cfg"]["conv_tol"], rec["runs"]
+    n = len(runs)
+    out = [f"{indent}FINAL LOSS GAP TO THE ENTROPY RATE   CE - H_inf, bits   "
+           f"(H_inf = {H:.4f}, conv_tol = {tol})",
+           f"{indent}{'arch':<10}{'arm':<10}{'CE':>19}{'CE - H_inf':>21}"
+           f"{'worst':>10}{'conv':>9}{'div':>7}",
+           f"{indent}{'-' * 86}"]
+    for arch in ARCHS:
+        for arm, _, _ in ARMS:
+            ce = np.array([r[arch][arm]["final_ce"] for r in runs], dtype=float)
+            g  = ce - H
+            sd = (lambda v: v.std(ddof=1) if v.size > 1 else 0.0)
+            worst = g[np.argmax(np.abs(g))] if g.size else float("nan")
+            out.append(
+                f"{indent}{arch:<10}{arm:<10}{ce.mean():>10.4f} +- {sd(ce):<6.4f}"
+                f"{g.mean():>+13.4f} +- {sd(g):<6.4f}{worst:>+10.4f}"
+                f"{sum(r[arch][arm]['within_tol'] for r in runs):>6}/{n:<3}"
+                f"{sum(r[arch][arm]['diverged'] for r in runs):>4}/{n:<3}")
+    out.append(f"{indent}{'-' * 86}")
+    return "\n".join(out)
+
+
 def best_repeat_index(runs: list, spec: dict, arch: str = "discrete") -> tuple:
     """
     (index, fell_back) of the repeat to draw F1-F3 from.
@@ -182,6 +220,7 @@ def run_process(spec: dict, cfg: dict, out_root: str, repeats: int,
 
     best, fell_back = best_repeat_index(runs, spec)
     if verbose:
+        print(f"\n{loss_gap_report(dict(spec=spec, cfg=cfg, runs=runs))}")
         n_conv = sum(r["discrete"]["converged"] for r in runs)
         print(f"  converged (discrete): {n_conv}/{repeats}   best repeat {best}"
               f"{'  [NO converged repeat -- closest overall]' if fell_back else ''}")
