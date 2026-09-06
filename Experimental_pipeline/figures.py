@@ -9,6 +9,7 @@ The four figures, and the two aggregates.
 
     grid   F4_complexity_grid.png   theory vs empirical, every cell
     pooled F4_all_processes.png     theory vs empirical, every process
+    conv   F5_convergence_all.png   the gap to H_inf over training, every process
 
 Labels are deliberately minimal and nothing here writes an explanation into the
 image: the numbers are in the pickle and the reasoning is in the plan.
@@ -364,4 +365,62 @@ def draw_pooled(recs, out_root, fname="F4_all_processes.png") -> str:
     for ax, (arm, name) in zip(axes, ARMS):
         _scatter(ax, recs, arm, name)
     fig.suptitle(f"{len(recs)} processes")
+    return _save(fig, os.path.join(out_root, fname))
+
+
+def draw_convergence_grid(recs, out_root, fname="F5_convergence_all.png") -> str:
+    """
+    Every process on one convergence plot.
+
+    The y axis is the GAP, CE - H_inf, not CE.  Each process has its own H_inf --
+    0.47 to 2.10 across the seven -- so raw CE curves cannot be compared between
+    panels at all, while the gap can: zero is converged everywhere and the
+    conv_tol band is the same band on every panel.
+
+    Log scale, because the interesting part is the last order of magnitude.  On a
+    linear axis every curve is pinned to the floor by its first fifty steps and
+    the question the figure exists to answer -- does it flatten above conv_tol or
+    below it -- is exactly the part that gets squashed.
+
+    Colour is the architecture and dash is the arm, so a panel carries four
+    series without four hues.  Medians only; per-repeat spread is in each
+    process's own F5.
+    """
+    n = len(recs)
+    ncol = min(4, n)
+    nrow = int(np.ceil(n / ncol))
+    fig, axes = plt.subplots(nrow, ncol, figsize=(3.5 * ncol, 3.1 * nrow),
+                             constrained_layout=True, sharey=True, squeeze=False)
+    floor = 3e-3
+
+    for j, rec in enumerate(recs):
+        ax = axes[j // ncol][j % ncol]
+        H, tol = rec["spec"]["theory"], rec["cfg"]["conv_tol"]
+        ax.axhspan(floor, tol, color=_GREY, alpha=0.55, zorder=0, lw=0)
+        for arch, colour in ARCHS:
+            for arm, name in ARMS:
+                x, Y = _stack(rec["runs"], arch, arm, "val_loss", "val_at")
+                if Y is None:
+                    continue
+                g = np.maximum(np.median(Y, axis=0) - H, floor)
+                ax.plot(x, g, color=colour, lw=1.8 if arm == "fw" else 1.4,
+                        ls="-" if arm == "fw" else (0, (4, 2)), zorder=3,
+                        label=f"{arch} {name}")
+        ax.set_yscale("log")
+        ax.set_ylim(floor, 3.0)
+        ax.set_title(f"{rec['spec']['tag']}   H_inf={H:.3f}", fontsize=9)
+        if j // ncol == nrow - 1:
+            ax.set_xlabel("gradient step", fontsize=9)
+        if j % ncol == 0:
+            ax.set_ylabel("CE - H_inf  (bits, log)", fontsize=9)
+        if j == 0:
+            ax.legend(frameon=False, fontsize=7.2, loc="lower left", ncol=1)
+        ax.text(ax.get_xlim()[1], tol, f"conv_tol {tol} ", ha="right", va="bottom",
+                fontsize=7.5, color=_INK)
+
+    for j in range(n, nrow * ncol):
+        axes[j // ncol][j % ncol].axis("off")
+
+    fig.suptitle(f"Convergence to the entropy rate — {n} processes, "
+                 f"median over repeats  (band = converged)")
     return _save(fig, os.path.join(out_root, fname))

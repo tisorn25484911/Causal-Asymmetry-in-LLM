@@ -98,6 +98,7 @@ def main(argv=None):
     if len(recs) > 1:
         mkdir(ARC_DIR)
         print(f"\n  pooled -> {FIG.draw_pooled(recs, ARC_DIR)}")
+        print(f"  pooled -> {FIG.draw_convergence_grid(recs, ARC_DIR)}")
     print(f"\n  total {(time.time()-t0)/60:.1f} min")
     return 0
 
