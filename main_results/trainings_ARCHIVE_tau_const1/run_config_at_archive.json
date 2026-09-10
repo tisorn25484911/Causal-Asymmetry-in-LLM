@@ -1,7 +1,7 @@
 {
   "seed": 0,
   "flower_dice_seed": 42,
-  "seq_len": 300,
+  "seq_len": 700,
   "burn_in": 250,
   "num_samples": 500,
   "batch": 32,
@@ -10,7 +10,7 @@
   "n_layers": 2,
   "n_states_mult": 5,
   "state_dim_mult": 1,
-  "tau": "geom:0.5:5",
+  "tau": 1.0,
   "usage_beta": null,
   "lr": 0.001,
   "weight_decay": 0.01,

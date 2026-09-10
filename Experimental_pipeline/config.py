@@ -43,7 +43,21 @@ CONFIG = dict(
     # ── discrete bottleneck ────────────────────────────────────────────
     n_states_mult     = 5,      # K = 5V.  A state BUDGET, not an estimate.
     state_dim_mult    = 1,      # S = V.
-    tau               = 1.0,
+    # Straight-through surrogate temperature.  A float is constant; "geom:A:B"
+    # rises geometrically A -> B across training.  It never changes the forward
+    # value -- argmax is scale-invariant -- only the gradient.  See schedules.py
+    # for the mechanism and the measurements.
+    #
+    # Measured over 320 models in tau_experiment/: a RISING schedule beats
+    # const:1 by -0.336 +- 0.246 bits of |S_emp - C| where the bottleneck is
+    # merging states, const:5 is WORSE than const:1 (so it is the rise, not the
+    # level), and the textbook high->low anneal is worse still (+0.439 +- 0.110,
+    # 5% win rate -- the only two-SEM effect in the study, and a harm).
+    #
+    # SCOPE: on four cells chosen before the winner was known it bought nothing
+    # (-0.036 +- 0.049).  The gain tracks how badly const:1 was already doing.
+    # Set this back to 1.0 to reproduce every result predating 2026-09-06.
+    tau               = "geom:0.5:5",
     usage_beta        = None,   # None -> 1/(batch*seq_len); see resolve_hparams
 
     # ── optimiser ──────────────────────────────────────────────────────

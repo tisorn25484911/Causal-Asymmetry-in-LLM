@@ -27,6 +27,7 @@ if _HERE not in sys.path:
 import figures as FIG                                            # noqa: E402
 from config import CONFIG, baseline_specs, coin_spec, flower_spec  # noqa: E402
 from pipeline import loss_gap_report, run_process                # noqa: E402
+from schedules import parse_tau                                  # noqa: E402
 from training import load_pkl, mkdir, save_run_config            # noqa: E402
 
 OUT_DEFAULT = os.path.join(_ROOT, "main_results", "trainings")
@@ -48,6 +49,10 @@ def parse_args(argv=None):
                     help="override the base seed; repeat i uses seed+i")
     ap.add_argument("--epochs", type=int, default=None,
                     help="override max_epochs (for a quick shakedown)")
+    ap.add_argument("--tau", default=None, metavar="SPEC",
+                    help="override the temperature schedule: a float, 'const:X' "
+                         "or 'geom:A:B'.  Use --tau 1.0 to reproduce results "
+                         "predating the schedule.  See schedules.py")
     ap.add_argument("--plots-only", action="store_true",
                     help="redraw every figure from repeats.pkl, no training")
     return ap.parse_args(argv)
@@ -74,6 +79,16 @@ def main(argv=None):
         cfg["seed"] = args.seed
     if args.epochs is not None:
         cfg["max_epochs"] = args.epochs
+    if args.tau is not None:
+        # A bare number on the command line is a constant temperature; anything
+        # else is a schedule spec.  parse_tau validates it here rather than
+        # 130 seconds into the first fit.
+        try:
+            cfg["tau"] = float(args.tau)
+        except ValueError:
+            cfg["tau"] = args.tau
+        parse_tau(cfg["tau"])
+        print(f"  tau override: {cfg['tau']!r}")
 
     specs = select_specs(args, cfg)
     mkdir(args.out_root)

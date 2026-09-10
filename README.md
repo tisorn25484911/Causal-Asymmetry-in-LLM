@@ -61,7 +61,8 @@ pipeline.run_process(spec, cfg, repeats)
         │       │                        (all four models see the same data)
         │       └── for arch in (discrete, onehot):
         │             for arm in (forward, backward):
-        │                 training.train_model          ← models.build_model
+        │                 training.train_model    ← models.build_model
+        │                 │                       ← schedules.TauSchedule
         │                 training.eval_ce              ← convergence check
         │                 discrete → extraction.causal_state_report    (S_emp)
         │                 onehot   → extraction.recover_causal_states  (S_hat)
@@ -76,6 +77,40 @@ pipeline.run_process(spec, cfg, repeats)
 Every figure is drawn **from the saved pickle**, so `--plots-only` redraws
 without retraining.
 
+## The temperature schedule
+
+The discrete bottleneck is trained through a straight-through estimator, and its
+surrogate temperature `tau` **rises across training** — `geom:0.5:5` by default.
+
+τ never changes what the model computes. The forward value is
+`one_hot(argmax(z))` at every τ, because argmax is scale-invariant. τ appears
+only in the gradient, `∂pᵢ/∂zⱼ = (1/τ)·pᵢ(δᵢⱼ − pⱼ)`, and two things follow: the
+off-diagonal mass decays like `e^(−Δ/τ)`, so a state that has already lost gets
+exponentially little gradient and can never be claimed; and the whole bottleneck
+gradient carries a `1/τ` factor, including the `β·H(p̄)` penalty, which
+*minimises* occupancy entropy and so actively prunes states. Both bite late,
+because both depend on a logit gap training itself creates — which is why τ
+should be low early and high late.
+
+Measured over 320 models in `tau_experiment/`, against `const:1`:
+
+| | Δ\|S_emp − C\| | |
+|---|---|---|
+| `geom:0.5:5` | −0.336 ± 0.246 | the default |
+| `const:5` | +0.172 ± 0.120 | high τ *alone* is worse — it is the rise, not the level |
+| `geom:5:0.5` | +0.439 ± 0.110 | the **textbook** high→low anneal, 5% win rate |
+
+Gumbel-softmax anneals high→low to harden a *soft* relaxation into a discrete
+decision. This architecture is already hard at every τ, so that schedule imports
+the cost without the benefit.
+
+**Scope, and it is narrow.** On four processes chosen before the winner was
+known the schedule bought nothing (−0.036 ± 0.049). The gain tracks how badly
+`const:1` was already doing (r = −0.44 over 13 cells): −0.370 bits where
+`|S_emp − C| > 0.30`, +0.003 where it was already below. Treat it as a rescue
+for runs that are visibly merging states, not as a free win. `--tau 1.0`
+reproduces every result predating it.
+
 ## Layout
 
 ```
@@ -86,6 +121,7 @@ Experimental_pipeline/
 ├── config.py        the master config + per-process specs
 ├── processes.py     generation, Datasets, and every closed form
 ├── models.py        OneHotDecoder + DiscreteCausalDecoder, one shared stack
+├── schedules.py     the straight-through temperature schedule, and only that
 ├── training.py      train loop, split, eval, seeding, divergence, io
 ├── extraction.py    the three extractors
 ├── figures.py       the four figures + the two aggregates
@@ -95,10 +131,15 @@ main_results/
 ├── run_config.json
 ├── trainings/<tag>/           repeats.pkl, F1–F4
 ├── sweep_params/sweep_{coin,flower}/   grid.pkl, F4_complexity_grid.png, <cell>/F1–F4
-└── arc_comparision/           F4_all_processes.png
+├── arc_comparision/           F4_all_processes.png
+└── trainings_ARCHIVE_tau_const1/       the pre-schedule results, kept for comparison
 
+tau_experiment/                the study that chose the schedule, standalone
 model tuning experiment/       the superseded exploratory tree, frozen
 ```
+
+`*.pkl` is gitignored, so `main_results/` is **not** recoverable from history —
+archive before re-running anything you want to keep.
 
 `Experimental_pipeline/` imports nothing from `model tuning experiment/`. It
 depends only on numpy, torch, lightning, matplotlib and scikit-learn.

@@ -31,6 +31,7 @@ import torch
 import torch.utils.data as tud
 
 from models import build_model, cross_ent_onehot
+from schedules import TauSchedule, is_scheduled, parse_tau
 
 
 # ══════════════════════════════════════════════════════════════════════════
@@ -276,10 +277,22 @@ def train_model(train_loader, embed_type: str, val_loader=None, *,
                 num_token: int, d_model: int, max_len: int, max_epochs: int,
                 lr: float, mode: str, n_layers: int, weight_decay: float,
                 accelerator: str = "auto", val_every_n_steps: int = 25,
-                n_states=None, state_dim=None, tau: float = 1.0,
+                n_states=None, state_dim=None, tau: float | str = 1.0,
                 usage_beta: float = 0.0) -> Recorder:
     """
     Train one model and return the Recorder holding its curves and the model.
+
+    `tau` is a float (constant) or a schedule spec such as "geom:0.5:5", which
+    rises geometrically across training.  See schedules.py for what it does and
+    what it is worth; the short version is that it changes only the gradient,
+    never the forward value, and that it rescues runs whose bottleneck is
+    merging causal states while doing nothing for runs that already recover
+    them.  A float reproduces the pre-schedule pipeline exactly.
+
+    The callback is attached ONLY for a genuinely varying schedule and only for
+    the discrete architecture -- build_model discards tau for "onehot"
+    (models.py:357), so attaching it there would write an attribute nothing
+    reads.
 
     A note on reproducibility: seeding makes the models of one repeat *paired* --
     they share the split and the initialisation -- but it does NOT make a run
@@ -287,15 +300,21 @@ def train_model(train_loader, embed_type: str, val_loader=None, *,
     from the first backward pass.  `accelerator="cpu"` is exactly repeatable at
     roughly 6x the wall clock.
     """
+    _, tau_fn = parse_tau(tau)
+    # build_model needs a FLOAT: models.py:296 divides the state logits by it.
     model = build_model(
         embed_type, token_size=num_token, d_model=d_model, max_len=max_len,
         lr=lr, mode=mode, n_layers=n_layers, weight_decay=weight_decay,
-        n_states=n_states, state_dim=state_dim, tau=tau, usage_beta=usage_beta)
+        n_states=n_states, state_dim=state_dim, tau=tau_fn(0.0),
+        usage_beta=usage_beta)
 
     rec = Recorder(val_loader=val_loader, val_every_n_steps=val_every_n_steps)
+    callbacks = [rec]
+    if embed_type == "discrete" and is_scheduled(tau):
+        callbacks.append(TauSchedule(tau_fn, len(train_loader) * max_epochs))
     trainer = L.Trainer(
         max_epochs=max_epochs, accelerator=accelerator, devices="auto",
-        log_every_n_steps=5, callbacks=[rec],
+        log_every_n_steps=5, callbacks=callbacks,
         # Nothing here reads lightning_logs/*.ckpt, and left on it drops a
         # checkpoint directory per model for nothing.
         logger=False, enable_checkpointing=False,

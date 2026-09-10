@@ -33,6 +33,13 @@ All_Results/discrete/
 # trees above: ~7,500 arm-trainings of output, all of it regenerable.
 All_Results/discrete_v2/
 
+# The whole tau/softmax-temperature side investigation: a self-contained
+# scratch tree (harness, per-study runners, JSON result dumps, generated
+# REPORT.html/SUMMARY.txt).  It is exploratory work kept on disk, not part of
+# the pipeline the repo publishes, so it is excluded wholesale rather than
+# pattern-by-pattern.
+/tau_experiment/
+
 # Model weights, Lightning checkpoints, pickled result bundles
 *.pt
 *.ckpt

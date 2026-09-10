@@ -19,7 +19,8 @@ python Experimental_pipeline/checks.py --full    # + the extraction gate, ~5 min
 The fast checks hold the generators against the formulas in `processes.py`:
 empirical transition matrices, occupancies and entropy rates from 10⁵ tokens,
 all to within 1e-2, plus the identity `entropy(occupancy) == C`. The `--full`
-gate trains one real discrete model and asserts its `S_emp` lands on `C+`.
+gate trains one real discrete model — under whatever `cfg["tau"]` is set to — and
+asserts its `S_emp` lands on `C+`.
 
 **If `--full` fails, stop.** It means something in the geometry or the
 bottleneck moved that the sampler checks cannot see, and no figure downstream is
@@ -32,14 +33,24 @@ python Experimental_pipeline/run_process.py --process coin   --p 0.3 --q 0.4 --r
 python Experimental_pipeline/run_process.py --process flower --n 2   --m 8   --repeats 30
 python Experimental_pipeline/run_process.py --all --repeats 30       # the seven baselines
 python Experimental_pipeline/run_process.py --all --plots-only       # redraw, no training
+python Experimental_pipeline/run_process.py --all --repeats 5 --tau 1.0   # pre-schedule control
 ```
 
 Writes `main_results/trainings/<tag>/` — `repeats.pkl` plus F1–F4. With `--all`
 it also writes `main_results/arc_comparision/F4_all_processes.png`.
 
+**It overwrites in place, and `*.pkl` is gitignored.** Copy the directory before
+re-running anything you want to keep; `main_results/trainings_ARCHIVE_tau_const1/`
+is the pre-schedule set, kept for exactly this reason.
+
 The seven baselines are coin (0.1,0.9), (0.3,0.4), (0.4,0.8) and flower (2,6),
 (2,8), (4,2), (6,4) — the same processes the archived `00_base` used, with the
 same dice seed, so the numbers are comparable to it.
+
+Repeat *i* uses seed `cfg["seed"] + i`, and data, split and initialisation are
+pure functions of that seed, so repeat *i* of one run pairs against repeat *i* of
+another **provided the geometry matches**. Check `cfg["seq_len"]` in both pickles
+before pairing — see §7.
 
 ## 3. A grid
 
@@ -84,7 +95,8 @@ of them per run.
 |---|---|---|
 | `--repeats` | 30 / 5 | Statistics. Set it from the measured spread, not from precedent: `S_emp` forward has SD ≈ 0.002 (5 repeats is plenty), backward SD ≈ 0.25 (30 gives SEM ≈ 0.046). |
 | `--seed` | 0 | Base seed; repeat *i* uses `seed + i`. |
-| `--epochs` | 150 | Override `max_epochs` for a shakedown. |
+| `--epochs` | 150 | Override `max_epochs` for a shakedown. **Also rescales the τ schedule** — see below. |
+| `--tau` | `geom:0.5:5` | The temperature schedule: a float, `const:X`, or `geom:A:B`. `--tau 1.0` reproduces every result predating the schedule. Validated at parse time, not 130 s into the first fit. |
 | `--sweep-coin` / `--sweep-flower` | — | The grid values. Remember they cross. |
 | `num_samples` | 500 | Sequences per repeat. The only pure data knob — cost is now proportional to it, since nothing is discarded. |
 | `n_pts` | 1000 | Points clustered in F2. Cost is O(n²) in the distance matrix. |
@@ -99,7 +111,8 @@ of them per run.
 | `seq_len` | 300 | **β tracks it.** `β = 1/(batch·seq_len)`, and β must stay under an optimisation cliff at ~6e-4 (lr=1e-3) above which the bottleneck collapses to one state. At 32×300, β = 1.04e-4, 5.8× under. Shortening `seq_len` raises β toward the cliff — at 32×49 the same rule gives 6.4e-4, already past it. |
 | `batch` | 32 | Same coupling, same direction. |
 | `lr` | 1e-3 | The cliff scales with **1/lr**, not with N. Raising `lr` lowers the cliff, so a β that was safe may not be. |
-| `max_epochs` | 150 | A **ceiling, not a floor.** Cross-entropy on a deterministic transition has no finite optimum, so the backward arm converges and then *diverges past* H∞. Measured held-out CE above H∞ for the coin backward arm: 10 ep +0.289, 75 ep +0.022, **150 ep +0.016**, 200 ep +0.121, 300 ep +0.185. Longer is worse. |
+| `max_epochs` | 150 | A **ceiling, not a floor.** Cross-entropy on a deterministic transition has no finite optimum, so the backward arm converges and then *diverges past* H∞. Measured held-out CE above H∞ for the coin backward arm: 10 ep +0.289, 75 ep +0.022, **150 ep +0.016**, 200 ep +0.121, 300 ep +0.185. Longer is worse. Also: the τ schedule is indexed by `global_step / total_steps`, so changing this **rescales** it — a 75-epoch run traverses the same τ range at twice the rate. |
+| `tau` | `geom:0.5:5` | **Interacts with β.** The `1/τ` factor scales the *entire* bottleneck gradient, the `β·H(p̄)` usage penalty included, so raising τ late weakens the state-pruning pressure at the same time as it lifts the `e^(−Δ/τ)` lockout. Nothing here has tested moving τ and β together. Measured against `const:1`: `geom:0.5:5` −0.336 ± 0.246 bits, `const:5` **+0.172** (high τ alone is worse — it is the rise that helps), textbook `geom:5:0.5` **+0.439 ± 0.110** at a 5% win rate. Scope is narrow: on four processes chosen before the winner was known it bought nothing (−0.036 ± 0.049). See `README.md` and `tau_experiment/`. |
 | `weight_decay` | 0.01 | What restores a finite optimum on those deterministic transitions. At 0.0, AdamW is bit-identical to Adam and the divergence returns. Its total effect scales with `lr · weight_decay · steps`, so a value chosen for one step budget does not transfer to another. |
 | `n_states_mult` | 5 (K = 5V) | A state **budget**, not an estimate. K at the exact theoretical count *fails* — flower(2,3) forward at its true K=3 recovers only 2 states. Slack is required. |
 | `state_dim_mult` | 1 (S = V) | `state_matrix` then `emission` composes to a single (K,V) map, so S carries no expressive power. S=K would make `state_matrix` mostly reparameterisation freedom. |
@@ -153,7 +166,9 @@ the closest one anyway. Treat those figures as weaker evidence and say so.
 
 | Symptom | Likely cause |
 |---|---|
-| `S_emp` ≈ 0 for a repeat | The bottleneck collapsed to one state. Check β against the cliff (§5) and whether that repeat diverged. |
+| `S_emp` ≈ 0 for a repeat | The bottleneck collapsed to one state. Check β against the cliff (§5) and whether that repeat diverged. A τ schedule **ending low** does this reliably — `geom:5:0.5` collapses to a single state with `h_state_given_token` exactly 0. |
+| Two runs of the same config disagree | Expected on `accelerator=auto` (MPS is not bit-reproducible). On `cpu` it is reproducible **only with a fresh loader**: `split_loader` returns a `DataLoader(shuffle=True, generator=…)` whose generator advances on every pass, so reusing one loader across models gives each a different batch order. `pipeline.one_repeat` does reuse it across the four models — their *initialisation* is identical, their batch order is not. |
+| Numbers not comparable to an older run | Check `cfg["seq_len"]` and `cfg["tau"]` in both pickles. β is derived as `1/(batch·seq_len)`, so a geometry change moves β too — a 700-token run has β = 4.46e-5 against 1.04e-4 at 300, and is not a control for a 300-token one. |
 | `S_emp` far above C | Over-splitting: the budget K is being used for distinctions the process does not have. `h_state_given_token > 0` confirms it. |
 | Wide error bars on the backward bar of F4 | Expected. Backward `S_emp` has SD ≈ 0.25 across repeats on the coin — a property of the method, not a bug. It is the same in the archived results. |
 | `k_hat` much larger than `plateau` | The `state_tol` problem in §5. Read the plateau. |
