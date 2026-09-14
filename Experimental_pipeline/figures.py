@@ -151,9 +151,9 @@ def f3_transition_matrix(rec, out_dir):
     Learned T[i][j] = P(s_{t+1}=j | s_t=i), visited states only, both arms, with
     the closed form beside the FORWARD panel under the matched permutation.
 
-    Only forward carries a theory panel.  The backward epsilon-machine
-    transition structure is not derived anywhere in this project, and a wrong
-    overlay is worse than none.
+    Only forward carries a theory panel.  The backward closed form is now in
+    spec["T_theory_bw"] (processes.*_rev_transition_matrix) but is not drawn
+    here yet.
     """
     from extraction import match_permutation
     spec = rec["spec"]

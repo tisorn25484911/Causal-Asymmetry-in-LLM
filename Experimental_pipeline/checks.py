@@ -1,13 +1,13 @@
 #!/usr/bin/env python
 """
-Self-checks for the pipeline.  Every one can fail loudly.
+Self-checks for the pipeline.
 
     python Experimental_pipeline/checks.py            # fast: processes only, ~20 s
     python Experimental_pipeline/checks.py --full     # + the extraction gate, ~5 min
 
 The fast checks hold the SAMPLERS against their own closed forms: if a generator
-change ever silently invalidates a formula in processes.py, these are what catch
-it.  The full check trains one real model and asserts that the discrete
+change ever silently invalidates a formula in processes.py. 
+The full check trains one real model and asserts that the discrete
 bottleneck's S_emp lands on C+; it is the gate that says the pipeline as a whole
 still measures what it claims to.
 """
@@ -52,12 +52,7 @@ def _states(tokens, kind, params):
 def check_processes(num_samples=200, seq_len=500):
     """
     Samplers vs closed forms.
-
-    Transitions are counted PER SEQUENCE.  Ravelling them together joins the last
-    token of one sequence to the first of the next, which for flower is a
-    selection->selection step the process cannot produce (odd length, every
-    sequence starts on a selection) -- that spurious mass inflates H(next|state)
-    by ~0.02 bits and would read as a generator bug.
+    Transitions are counted PER SEQUENCE. 
     """
     print("\n-- generators vs their own closed forms --")
     d = P.generate("coin", {"p": .3, "q": .4}, 5, 300, 250, np.random.default_rng(0))

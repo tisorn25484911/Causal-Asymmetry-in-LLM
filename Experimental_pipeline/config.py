@@ -14,22 +14,19 @@ geometry (`resolve_hparams`); every theoretical quantity is computed by
 import numpy as np
 
 from processes import (causal_state_count, causal_state_occupancy, coin_complexity,
-                       coin_tag, coin_transition_matrix, entropy_rate_coin,
-                       flower_complexity, flower_entropy_rate, flower_tag,
+                       coin_rev_transition_matrix, coin_tag, coin_transition_matrix,
+                       entropy_rate_coin, flower_complexity, flower_entropy_rate,
+                       flower_rev_transition_matrix, flower_tag,
                        flower_transition_matrix, make_dice)
 
 CONFIG = dict(
     # ── reproducibility ────────────────────────────────────────────────
     seed              = 0,
-    # The dice DEFINE a flower process -- they set C+ and C- -- so they are
-    # drawn from their own fixed seed, never the repeat seed.  42 is the value
-    # the archived runs used, so the processes here are the same ones.
     flower_dice_seed  = 42,
 
     # ── sequence geometry ──────────────────────────────────────────────
     # seq_len is in TOKENS for BOTH processes, and every generated token is
-    # trained on.  The old tree generated 2000 (coin) / 4000 (flower) tokens
-    # per sequence and kept a random 256-token window, discarding 87-94%.
+    # trained on.
     seq_len           = 300,
     burn_in           = 250,    # tokens drawn and discarded before the window
     num_samples       = 500,    # sequences per repeat
@@ -43,21 +40,8 @@ CONFIG = dict(
     # ── discrete bottleneck ────────────────────────────────────────────
     n_states_mult     = 5,      # K = 5V.  A state BUDGET, not an estimate.
     state_dim_mult    = 1,      # S = V.
-    # Straight-through surrogate temperature.  A float is constant; "geom:A:B"
-    # rises geometrically A -> B across training.  It never changes the forward
-    # value -- argmax is scale-invariant -- only the gradient.  See schedules.py
-    # for the mechanism and the measurements.
-    #
-    # Measured over 320 models in tau_experiment/: a RISING schedule beats
-    # const:1 by -0.336 +- 0.246 bits of |S_emp - C| where the bottleneck is
-    # merging states, const:5 is WORSE than const:1 (so it is the rise, not the
-    # level), and the textbook high->low anneal is worse still (+0.439 +- 0.110,
-    # 5% win rate -- the only two-SEM effect in the study, and a harm).
-    #
-    # SCOPE: on four cells chosen before the winner was known it bought nothing
-    # (-0.036 +- 0.049).  The gain tracks how badly const:1 was already doing.
-    # Set this back to 1.0 to reproduce every result predating 2026-09-06.
-    tau               = "geom:0.5:5",
+
+    tau               = 1,      #"geom:0.5:5",
     usage_beta        = None,   # None -> 1/(batch*seq_len); see resolve_hparams
 
     # ── optimiser ──────────────────────────────────────────────────────
@@ -71,7 +55,7 @@ CONFIG = dict(
     ana_batch         = 32,
     max_batches       = 20,
     state_min_pos     = 5,
-    state_tol         = 0.10,   # the one genuinely free parameter -- see below
+    state_tol         = 0.10,   
     cluster_metric    = "euclidean",
     n_pts             = 1000,
     conv_tol          = 0.10,   # |CE - H_inf| above this = not converged
@@ -86,24 +70,7 @@ FLOWER_NM = [(2, 6), (2, 8), (4, 2), (6, 4)]
 
 def resolve_hparams(cfg: dict, num_token: int) -> dict:
     """
-    K, state_dim and usage_beta, resolved from V and the training geometry.
-
-    WHY BETA IS COMPUTED AND NEVER A LITERAL.  The penalty is beta * H(p_bar),
-    and p_bar is the state occupancy averaged over every scored token, so beta is
-    naturally per-token: 1/N with N the count the cross-entropy itself averages
-    over, i.e. batch * seq_len.  Beta is also bounded above by an optimisation
-    cliff -- above ~6e-4 at lr=1e-3 the bottleneck collapses to a single state --
-    and the cliff scales with 1/lr rather than with N.  A literal decouples beta
-    from N, so a change to batch or seq_len moves it relative to the cliff
-    silently.  At this geometry N = 32*300 and 1/N = 1.042e-4, 5.8x below it.
-
-    WHY 5V AND V.  K at the exact theoretical count FAILS -- flower(2,3) forward
-    at its true K=3 recovers only 2 states -- so the budget needs slack.  K=5V
-    recovered the full state set with S_emp within 0.006 bits of the closed form
-    on both pilot processes.  state_dim carries no expressive power, since
-    state_matrix followed by emission composes to a single (K,V) map, so it is
-    set to V rather than K, which would make state_matrix mostly
-    reparameterisation freedom.
+    Set beta value to that of set by the config
     """
     beta = (1.0 / (cfg["batch"] * cfg["seq_len"]) if cfg["usage_beta"] is None
             else float(cfg["usage_beta"]))
@@ -131,7 +98,8 @@ def coin_spec(cfg: dict, p: float, q: float) -> dict:
         true_k_bw  = causal_state_count("coin", "backward"),
         occ_fw     = causal_state_occupancy("coin", "forward",  p=p, q=q),
         occ_bw     = causal_state_occupancy("coin", "backward", p=p, q=q),
-        T_theory_fw = coin_transition_matrix(p, q),    # backward: not derived
+        T_theory_fw = coin_transition_matrix(p, q),
+        T_theory_bw = coin_rev_transition_matrix(p, q),
     ), cfg)
 
 
@@ -153,6 +121,7 @@ def flower_spec(cfg: dict, n: int, m: int) -> dict:
         occ_bw     = causal_state_occupancy("flower", "backward", n=n, m=m,
                                             dice_probs=dice),
         T_theory_fw = flower_transition_matrix(n),
+        T_theory_bw = flower_rev_transition_matrix(n, m, dice),
     ), cfg)
 
 
@@ -164,13 +133,13 @@ def baseline_specs(cfg: dict) -> list:
 
 def coin_grid_specs(cfg: dict, values) -> list:
     """
-    The (p, q) grid, CROSSED WITH ITSELF: k values give k**2 cells, not k.
+    The (p, q) grid, k values give k**2 cells.
     """
     v = [float(x) for x in values]
     return [coin_spec(cfg, p, q) for p in v for q in v]
 
 
 def flower_grid_specs(cfg: dict, values) -> list:
-    """The (n, m) grid, crossed: k values give k**2 cells."""
+    """The (n, m) grid"""
     v = [int(x) for x in values]
     return [flower_spec(cfg, n, m) for n in v for m in v]

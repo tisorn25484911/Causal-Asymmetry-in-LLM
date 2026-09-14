@@ -29,9 +29,6 @@ MERGE_ROUND_DP = 9
 class SequenceDataset(Dataset):
     """
     (num_samples, seq_len+1) tokens -> (input, target) = (x[:-1], x[1:]).
-
-    One class for both processes.  The old tree had CoinDataset and
-    FlowerDataset, which differed only in an unused `num_token` attribute.
     """
 
     def __init__(self, seqs):
@@ -117,17 +114,6 @@ def generate(kind: str, params: dict, num_samples: int, seq_len: int,
 
     `burn_in` tokens are drawn and discarded first, so every kept token is at
     stationarity regardless of how the chain was initialised.
-
-    This replaces generate-2000-then-keep-a-256-window.  Nothing is discarded
-    beyond the burn-in, training and analysis run at the same length by
-    construction, and `max_len = seq_len` -- so the model is never asked for a
-    positional index it did not train on.
-
-    FLOWER PHASE.  A flower sequence alternates select/roll, so token type is
-    fixed by index parity.  With an even `burn_in` every kept sequence starts on
-    a selection token -- exactly what the old whole-cycle `pre_depth` discard
-    did.  Preserved rather than randomised, because randomising it would change
-    the process the archived results were measured on.
     """
     total = burn_in + seq_len + 1
     rows = []
@@ -203,9 +189,7 @@ def _merged_outcome_mass(dp, merge_tol: float | None = None) -> list:
     j' of dice_probs are proportional.
 
     Shared by flower_complexity, causal_state_count and causal_state_occupancy so
-    all three count states under one rule.  Two definitions of "the same backward
-    state" in one repository would drift, and a K that disagreed with its own
-    theory is worse than no K.
+    all three count states under one rule.
     """
     dp = np.asarray(dp, dtype=float)
     pi_outcome = dp.mean(axis=0)
@@ -341,13 +325,12 @@ def causal_state_occupancy(kind: str, mode: str, p=None, q=None, n=None, m=None,
 
 
 # ── theoretical STATE-TO-STATE transition matrices ────────────────────────
-# T[i][j] = P(s_{t+1} = j | s_t = i).  Forward arms only.  The backward
-# epsilon-machine transition structure -- coin's 3 states, flower's merged
-# outcomes -- is real derivation work with room for error, and a wrong theory
-# panel is worse than none, so F3's backward panels carry no overlay.
-#
-# Nothing in the old tree computed these.  `coin_true_conditional` there is
-# P(next TOKEN | current token), which is a different object.
+# Forward:   T[i][j] = P(s_{t+1} = j | s_t = i).
+# Backward:  T[i][j] = P(s_{t-1} = j | s_t = i) -- the same layout one step in
+# REVERSE time, which is what extraction.transition_matrix_extraction records
+# for a backward model: it prepends each generated token and reads the state at
+# position 0, so consecutive readings are s_t then s_{t-1}.  Every state order
+# matches causal_state_occupancy for the same (kind, mode).
 
 def coin_transition_matrix(p: float, q: float) -> np.ndarray:
     """
@@ -361,6 +344,29 @@ def coin_transition_matrix(p: float, q: float) -> np.ndarray:
     """
     return np.array([[1.0 - p, p],
                      [q,       1.0 - q]], dtype=float)
+
+
+def coin_rev_transition_matrix(p: float, q: float) -> np.ndarray:
+    """
+    (3, 3) backward state transition matrix, state order [0, 1, 2] matching
+    causal_state_occupancy("coin", "backward").
+
+    Backward the causal state is the current TOKEN (Thompson et al., Fig. 2b),
+    and the token before it is fixed by the hidden coin one and two steps back:
+
+        0 -> 0 w.p. 1-p      0 -> 2 w.p. p
+        1 -> 0 w.p. q(1-p)   1 -> 1 w.p. 1-q      1 -> 2 w.p. pq
+        2 -> 1 w.p. 1
+
+    A 2 heralds the first tail after heads, so it is always preceded by a 1.
+    A 0 is preceded by another tail, written 2 if the coin was heads before
+    that -- w.p. p, the two-state chain being reversible -- and 0 otherwise.
+    A 1 is preceded by heads w.p. 1-q, else by a tail that splits the same
+    way.  Stationary under [q-pq, p, pq]/(p+q), the C- occupancy.
+    """
+    return np.array([[1.0 - p,       0.0,     p    ],
+                     [q * (1.0 - p), 1.0 - q, p * q],
+                     [0.0,           1.0,     0.0  ]], dtype=float)
 
 
 def flower_transition_matrix(n: int) -> np.ndarray:
@@ -378,6 +384,36 @@ def flower_transition_matrix(n: int) -> np.ndarray:
     n = int(n)
     T = np.zeros((n + 1, n + 1), dtype=float)
     T[0, 1:] = 1.0 / n
+    T[1:, 0] = 1.0
+    return T
+
+
+def flower_rev_transition_matrix(n: int, m: int, dice_probs,
+                                 merge_tol: float | None = None) -> np.ndarray:
+    """
+    (k+1, k+1) backward state transition matrix, k the number of
+    distinguishable outcomes, state order [S, class 0, ..., class k-1] matching
+    causal_state_occupancy("flower", "backward").
+
+    S is "the current token is a selection": read backwards, the token before
+    it is the PREVIOUS cycle's outcome, independent of everything seen, so
+    S -> class c with that class's stationary mass.  An outcome is always
+    preceded by the selection that produced it, so class c -> S w.p. 1.
+
+    The mirror of flower_transition_matrix -- one hub, deterministic return --
+    except that the hub branches over merged outcomes instead of uniformly over
+    dice, which is the whole of the asymmetry: C- = 1 + H(mass)/2 against
+    C+ = 1 + log2(n)/2.  The classes come from _merged_outcome_mass, so this
+    matrix, C-, the state count and the occupancy all merge under one rule.
+    """
+    dp = np.asarray(dice_probs, dtype=float)
+    if dp.shape != (n, m):
+        raise ValueError(f"dice_probs must have shape ({n}, {m}), got {dp.shape}")
+    mass = np.asarray(_merged_outcome_mass(dp, merge_tol), dtype=float)
+    mass = mass / mass.sum()
+    k = len(mass)
+    T = np.zeros((k + 1, k + 1), dtype=float)
+    T[0, 1:] = mass
     T[1:, 0] = 1.0
     return T
 
