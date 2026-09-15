@@ -180,42 +180,70 @@ def flower_entropy_rate(n: int, m: int, dice_probs) -> float:
                  + 0.5 * np.mean([entropy_bits(dp[i]) for i in range(n)]))
 
 
+def _face_marginal(n: int, dice_probs) -> np.ndarray:
+    """
+    (m,) stationary probability of each outcome, from the dice alone: a
+    uniform 1/n choice of die, then that die's bias.
+
+        P(face j) = (1/n) sum_i p^i_j
+    """
+    dp = np.asarray(dice_probs, dtype=float)
+    return dp.sum(axis=0) / n
+
+
+def _bayes_rev_prob(n: int, dice_probs) -> np.ndarray:
+    """
+    (n, m) posterior P(die = i | face = j), by Bayes from the dice alone:
+
+        P(die i | face j) = P(die i, face j) / P(face j) = (p^i_j / n) / P(face j)
+
+    Column j is everything a backward observer can retrodict about the die
+    from outcome j, so two faces with the same column are the same backward
+    causal state.  A face that never occurs gets a zero column.
+    """
+    dp     = np.asarray(dice_probs, dtype=float)
+    joint  = dp / n
+    p_face = _face_marginal(n, dp)
+    return np.divide(joint, p_face, out=np.zeros_like(joint), where=p_face > 0)
+
+
 def _merged_outcome_mass(dp, merge_tol: float | None = None) -> list:
     """
     Mass of each *distinguishable* backward outcome state.
 
     Two outcomes j and j' are the same backward state exactly when they induce
-    the same posterior P(die=i | outcome=j) over dice -- i.e. when columns j and
-    j' of dice_probs are proportional.
+    the same posterior over dice (_bayes_rev_prob) -- i.e. when columns j and
+    j' of dice_probs are proportional.  A state's mass is the outcome marginal
+    (_face_marginal) summed over its faces.  Closed form throughout: nothing
+    here is sampled.
 
-    Shared by flower_complexity, causal_state_count and causal_state_occupancy so
-    all three count states under one rule.
+    Shared by flower_complexity, causal_state_count, causal_state_occupancy and
+    flower_rev_transition_matrix so all four count states under one rule.
     """
     dp = np.asarray(dp, dtype=float)
-    pi_outcome = dp.mean(axis=0)
-    col_mass   = dp.sum(axis=0)
-    m = dp.shape[1]
+    n, m = dp.shape
+    pi_outcome = _face_marginal(n, dp)
+    posterior  = _bayes_rev_prob(n, dp)
 
     if merge_tol is None:
         merged: dict[tuple, float] = {}
         for j in range(m):
-            if col_mass[j] <= 0:                       # outcome never occurs
+            if pi_outcome[j] <= 0:                     # outcome never occurs
                 continue
-            key = tuple(np.round(dp[:, j] / col_mass[j], MERGE_ROUND_DP))
+            key = tuple(np.round(posterior[:, j], MERGE_ROUND_DP))
             merged[key] = merged.get(key, 0.0) + pi_outcome[j]
         return list(merged.values())
 
     reps, mass = [], []
     for j in range(m):
-        if col_mass[j] <= 0:
+        if pi_outcome[j] <= 0:
             continue
-        posterior = dp[:, j] / col_mass[j]
         for k, r in enumerate(reps):
-            if np.max(np.abs(posterior - r)) <= merge_tol:
+            if np.max(np.abs(posterior[:, j] - r)) <= merge_tol:
                 mass[k] += float(pi_outcome[j])
                 break
         else:
-            reps.append(posterior)
+            reps.append(posterior[:, j])
             mass.append(float(pi_outcome[j]))
     return mass
 
@@ -393,28 +421,40 @@ def flower_rev_transition_matrix(n: int, m: int, dice_probs,
     """
     (k+1, k+1) backward state transition matrix, k the number of
     distinguishable outcomes, state order [S, class 0, ..., class k-1] matching
-    causal_state_occupancy("flower", "backward").
+    causal_state_occupancy("flower", "backward").  Closed form: every entry
+    comes from the dice and the uniform 1/n die choice, nothing is sampled.
 
-    S is "the current token is a selection": read backwards, the token before
+    S is "the current token is a selection".  Read backwards the token before
     it is the PREVIOUS cycle's outcome, independent of everything seen, so
-    S -> class c with that class's stationary mass.  An outcome is always
-    preceded by the selection that produced it, so class c -> S w.p. 1.
+    S -> class c with the outcome marginal (_face_marginal) summed over the
+    faces in the class.  An outcome is always preceded by the selection that
+    produced it, so class c -> S w.p. 1.
+
+    Where Bayes enters: faces are grouped by their posterior over dice
+    (_bayes_rev_prob), since that posterior is all a backward observer can
+    retrodict from an outcome, so equal posteriors are one causal state.  The
+    posterior itself is the reverse machine's EMISSION -- which die follows the
+    outcome -- not a transition: every selection token is the one state S, so
+    the die identity is a symbol.  The grouping is _merged_outcome_mass, so
+    this matrix, C-, the state count and the occupancy merge under one rule.
 
     The mirror of flower_transition_matrix -- one hub, deterministic return --
-    except that the hub branches over merged outcomes instead of uniformly over
+    with the hub branching over merged outcomes instead of uniformly over
     dice, which is the whole of the asymmetry: C- = 1 + H(mass)/2 against
-    C+ = 1 + log2(n)/2.  The classes come from _merged_outcome_mass, so this
-    matrix, C-, the state count and the occupancy all merge under one rule.
+    C+ = 1 + log2(n)/2.
     """
     dp = np.asarray(dice_probs, dtype=float)
     if dp.shape != (n, m):
         raise ValueError(f"dice_probs must have shape ({n}, {m}), got {dp.shape}")
-    mass = np.asarray(_merged_outcome_mass(dp, merge_tol), dtype=float)
-    mass = mass / mass.sum()
-    k = len(mass)
-    T = np.zeros((k + 1, k + 1), dtype=float)
-    T[0, 1:] = mass
-    T[1:, 0] = 1.0
+
+    # outcome marginal per distinguishable posterior, from the dice alone
+    face_dist = np.asarray(_merged_outcome_mass(dp, merge_tol), dtype=float)
+    face_dist = face_dist / face_dist.sum()
+    rev_dim   = len(face_dist) + 1
+
+    T = np.zeros((rev_dim, rev_dim), dtype=float)
+    T[0, 1:] = face_dist        # S -> outcome class: the previous cycle's outcome
+    T[1:, 0] = 1.0              # outcome class -> S: its selection always precedes it
     return T
 
 
