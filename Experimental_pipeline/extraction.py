@@ -1,6 +1,5 @@
 """
 The three extractors.
-
     causal_state_report          DISCRETE model -> states, occupancy, emissions,
                                  S_emp_states.  Exact: a position's state is
                                  argmax(state_logits).  No free parameter.
@@ -9,19 +8,6 @@ The three extractors.
                                  genuinely free parameter, `state_tol`.
     transition_matrix_extraction DISCRETE model -> T[i][j] = P(s_j | s_i), read
                                  off the model's own free-running generation.
-
-What is NOT here: `statistical_complexity_empirical`.  It runs k-means at an
-ASSUMED k, so S <= log2(k) by construction -- it cannot report a state count it
-was not told, which makes it useless as an extraction method.  The two above are
-strictly better and are exactly the pipeline's two methods.
-
-A NOTE ON THE BACKWARD ARM.  The loader always yields the forward convention
-(x[:-1], x[1:]).  A backward model is TRAINED on the swap, so every function
-here that feeds it must swap too, via `model._split`.  In the old tree
-`causal_state_report` did this and `latent_extraction` did not, so the two
-extractors were reading a one-token-shifted view of the same data; harmless in
-expectation, but the whole point of F4 is that both estimators see the same
-realisation.
 """
 import numpy as np
 import torch
@@ -85,13 +71,7 @@ def causal_state_report(model, data_loader, min_pos: int = 5, device=None):
     p = p / p.sum() if p.sum() > 0 else p
     s_emp = entropy_bits(p)
 
-    # H(state | current token), in bits.  For every process here the true causal
-    # state is a DETERMINISTIC function of the current token in BOTH arms, so
-    # the truth scores exactly 0 and any positive value means the bottleneck is
-    # keying on context it does not need.  It needs no ground truth, which makes
-    # it the one available unsupervised warning that states were merged --
-    # measured 0.000 on every run that recovered its state set, 0.11-0.48 on
-    # every run that did not.
+    # H(state | current token), in bits. 
     j   = joint.numpy().astype(float)
     tot = j.sum()
     h_cond = 0.0
@@ -215,13 +195,6 @@ def recover_causal_states(model, data_loader, use_t="last", max_batches=20,
     DISCOVER the number of causal states and their occupancy entropy, rather
     than assuming it.
 
-    THE THRESHOLD IS A REAL FREE PARAMETER AND NO SINGLE VALUE IS CORRECT.  The
-    smallest true separation between backward states varies by an order of
-    magnitude across the processes here -- 0.135 at p=0.1,q=0.9 against 0.612 at
-    p=q=0.5 -- so a threshold that resolves one merges another.  That is why
-    `stability` is always returned and always reported: "k_hat = 2" is not
-    defensible alone, whereas "k_hat = 2, stable across tol in [0.10, 0.60]" is.
-
     Returns k_hat, S_hat, labels, tokens, probs, state_tol, metric, stability,
     plateau.
     """
@@ -237,11 +210,6 @@ def recover_causal_states(model, data_loader, use_t="last", max_batches=20,
     D = DISTANCE_MATRICES[metric](probs)          # one matrix, reused per threshold
 
     def _fit(tol):
-        # COMPLETE linkage: two clusters merge only if every cross-pair is within
-        # tol, so a cluster is a set whose members are all mutually within tol --
-        # the literal reading of "same predictive distribution to within
-        # tolerance".  Single linkage merges on the closest pair and chains
-        # distinct states together.
         return AgglomerativeClustering(n_clusters=None, distance_threshold=tol,
                                        metric="precomputed",
                                        linkage="complete").fit_predict(D)
@@ -258,15 +226,10 @@ def recover_causal_states(model, data_loader, use_t="last", max_batches=20,
     plateau = max(spans, key=spans.get) if spans else k_hat
 
     # S_hat AT THE PLATEAU, alongside S_hat at the requested tol.
-    #
-    # This is not a second knob, it is the mitigation for the first one.  A
-    # single threshold over-splits: measured on coin p=0.3,q=0.4 at tol=0.10,
-    # k_hat is 4 forward against a true 2 and 7 backward against a true 3, which
-    # biases S_hat by +0.68 and +0.96 bits.  The plateau -- the k that survives
+    #The plateau -- the k that survives
     # the widest span of thresholds -- recovers 2 and 3 exactly, and it is
     # chosen WITHOUT reference to the truth, so using it is not tuning on the
-    # answer.  The plateau tolerance is the smallest one that reaches it, i.e.
-    # the least-merged member of the winning span.
+    # answer. 
     tol_plateau = next((t for t, k in stability if k == plateau), float(state_tol))
     lab_p = _fit(tol_plateau)
     cnt_p = np.bincount(lab_p, minlength=int(len(np.unique(lab_p)))).astype(float)
@@ -311,9 +274,6 @@ def transition_matrix_extraction(model, kind: str, params: dict, *,
     is_bw  = (getattr(model, "mode", "forward") == "backward")
     V      = int(model.token_size)
 
-    # The seed sequence comes from processes.generate, so there is exactly one
-    # sampler in the pipeline -- and a flower burn-in uses the run's own dice
-    # rather than a freshly drawn set.
     seed_tokens = generate(kind, params, num_samples=1, seq_len=burn_in,
                            burn_in=0, rng=rng)
     inputs = torch.as_tensor(seed_tokens, dtype=torch.long, device=device)
