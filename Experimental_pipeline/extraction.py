@@ -1,5 +1,5 @@
 """
-The three extractors.
+The three extractors, and the comparison of what they extract with the theory.
     causal_state_report          DISCRETE model -> states, occupancy, emissions,
                                  S_emp_states.  Exact: a position's state is
                                  argmax(state_logits).  No free parameter.
@@ -8,6 +8,9 @@ The three extractors.
                                  genuinely free parameter, `state_tol`.
     transition_matrix_extraction DISCRETE model -> T[i][j] = P(s_j | s_i), read
                                  off the model's own free-running generation.
+    compare_transition_matrix    that matrix against the closed form of EITHER
+                                 arm, with the learned states mapped onto the
+                                 theoretical ones by their emission rows.
 """
 import numpy as np
 import torch
@@ -337,3 +340,121 @@ def match_permutation(learned: np.ndarray, theory: np.ndarray, occupied=None):
         if best is None or err < best[2]:
             best = (sub[np.ix_(pm, pm)], occupied[pm], err)
     return best
+
+
+# ══════════════════════════════════════════════════════════════════════════
+# 4. DISCRETE — the learned transition matrix against the closed form
+# ══════════════════════════════════════════════════════════════════════════
+def assign_states_by_emission(learned_emissions, true_emissions, states=None):
+    """
+    Map each learned state to the theoretical state whose emission row is
+    nearest in total variation.
+
+    The emission table is the IDENTIFIED object (models.DiscreteCausalDecoder.
+    emission_table: invariant to the reparameterisation the state vectors
+    admit), so it is the right thing to match on.  A permutation chosen to
+    minimise the transition error would be fitted to the very quantity it is
+    then scored by; the emission rows are a separate measurement.
+
+    Many-to-one is allowed -- the bottleneck may split one causal state into
+    several, which is the usual backward-arm outcome -- and a theoretical state
+    that no learned state maps to is left missing rather than forced.
+
+    `states` restricts the assignment (e.g. to the states visited in
+    generation); the rest get -1.
+
+    Returns (assignment (K,) int, tv (K,) distance to the assigned row).
+    """
+    E = np.asarray(learned_emissions, dtype=float)
+    F = np.asarray(true_emissions, dtype=float)
+    K = E.shape[0]
+    if states is None:
+        states = np.arange(K)
+    assignment = np.full(K, -1, dtype=np.int64)
+    tv = np.full(K, np.nan)
+    for s in np.asarray(states, dtype=np.int64):
+        d = 0.5 * np.abs(E[s][None, :] - F).sum(axis=1)
+        assignment[s] = int(np.argmin(d))
+        tv[s] = float(d[assignment[s]])
+    return assignment, tv
+
+
+def compare_transition_matrix(learned, theory, learned_emissions, true_emissions,
+                              weights=None):
+    """
+    Aggregate a learned state-to-state matrix onto the theoretical states and
+    compare it with the closed form cell by cell.
+
+    Arm-agnostic: pass T_theory_fw for a forward model and T_theory_bw for a
+    backward one.  transition_matrix_extraction already records a backward
+    model's matrix one step back in time -- consecutive readings are s_t then
+    s_{t-1} -- which is exactly the convention of
+    processes.coin_rev_transition_matrix / flower_rev_transition_matrix, so the
+    two are comparable without any transposition.
+
+        learned            (K,K) row-stochastic, from transition_matrix_extraction;
+                           a state never visited in generation has a zero row
+        theory             (k,k) the closed form, state order of
+                           processes.causal_state_occupancy for the same arm
+        learned_emissions  (K,V) model.emission_table()
+        true_emissions     (k,V) processes.true_machine(kind, params, mode)
+                           ["emission_probs"], the same state order as `theory`
+        weights            (K,) occupancy used to mix learned rows that share a
+                           theoretical state (causal_state_report's occupancy);
+                           uniform within a group when None or all zero
+
+    Each visited learned state is assigned to a theoretical state by
+    assign_states_by_emission.  The rows of one group are mixed by `weights`
+    and its columns summed, giving a (k,k) matrix on the theoretical states;
+    a group with no learned state is a zero row and is reported in `missing`.
+    Columns of learned states outside the visited set are dropped, so a row
+    can sum to slightly less than 1 -- `row_mass` says by how much.
+
+    Returns a dict:
+        assignment  (K,) theoretical state per learned state, -1 if unvisited
+        groups      {theory state: [learned states]}
+        emission_tv (K,) TV distance of each learned emission row to its match
+        aggregated  (k,k) the learned matrix on the theoretical states
+        theory      (k,k)
+        abs_error   (k,k) |aggregated - theory|, NaN on missing rows
+        max_error   over present rows;  mean_error  likewise
+        missing     theoretical states with no learned state
+        row_mass    (k,) sum of each aggregated row
+        n_visited   learned states visited in generation
+        permutation match_permutation(learned, theory) when n_visited == k,
+                    else None -- the F3 comparison, for reference
+    """
+    L = np.asarray(learned, dtype=float)
+    T = np.asarray(theory, dtype=float)
+    K, k = L.shape[0], T.shape[0]
+    visited = np.flatnonzero(L.sum(axis=1) > 0)
+    assignment, tv = assign_states_by_emission(learned_emissions, true_emissions,
+                                               states=visited)
+    w = (np.ones(K) if weights is None else np.asarray(weights, dtype=float)).copy()
+
+    groups = {t: [int(s) for s in visited if assignment[s] == t] for t in range(k)}
+    mixed = np.zeros((k, K))
+    for t, members in groups.items():
+        if not members:
+            continue
+        wm = w[members]
+        wm = wm / wm.sum() if wm.sum() > 0 else np.full(len(members), 1.0 / len(members))
+        mixed[t] = wm @ L[members]
+    aggregated = np.zeros((k, k))
+    for u, members in groups.items():
+        if members:
+            aggregated[:, u] = mixed[:, members].sum(axis=1)
+
+    missing = [t for t, m in groups.items() if not m]
+    present = [t for t in range(k) if t not in missing]
+    abs_error = np.full((k, k), np.nan)
+    abs_error[present] = np.abs(aggregated[present] - T[present])
+    errs = abs_error[present]
+    return dict(
+        assignment=assignment, groups=groups, emission_tv=tv,
+        aggregated=aggregated, theory=T, abs_error=abs_error,
+        max_error=float(errs.max()) if errs.size else float("nan"),
+        mean_error=float(errs.mean()) if errs.size else float("nan"),
+        missing=missing, row_mass=aggregated.sum(axis=1), n_visited=int(visited.size),
+        permutation=(match_permutation(L, T, occupied=visited) if visited.size == k else None),
+    )
