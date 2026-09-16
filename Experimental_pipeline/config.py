@@ -46,6 +46,8 @@ CONFIG = dict(
 
     # ── optimiser ──────────────────────────────────────────────────────
     lr                = 1e-3,
+    lr_schedule       = "const",  # opt-in: "cos:MIN" or "cos:MIN:HOLD"; see schedules.parse_lr
+    restore_best      = False,    # opt-in: hand back the best-validation weights, not the last step's
     weight_decay      = 0.01,
     max_epochs        = 150,
     val_every_n_steps = 25,

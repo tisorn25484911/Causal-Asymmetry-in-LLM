@@ -46,6 +46,8 @@ and ramp between the same endpoints; they were within noise of each other
 (F3), so carrying four more shapes into the pipeline would add four things to
 get wrong and buy nothing.
 """
+import math
+
 import lightning as L
 
 # tau <= 0 divides by zero at models.py:296, and a geometric schedule cannot
@@ -129,3 +131,98 @@ class TauSchedule(L.Callback):
         pl_module.tau = tau
         if trainer.global_step % 100 == 0:
             self.trace.append((int(trainer.global_step), round(tau, 5)))
+
+
+
+# ══════════════════════════════════════════════════════════════════════════
+# LEARNING-RATE SCHEDULE  (opt-in; "const" is the pipeline as archived)
+# ══════════════════════════════════════════════════════════════════════════
+def parse_lr(spec, lr: float):
+    """
+    'const'          -> lr for the whole run: every archived result
+    'cos:MIN'        -> cosine from lr down to MIN over the whole run
+    'cos:MIN:HOLD'   -> lr HELD for the first HOLD fraction of the run, then
+                        cosine from lr down to MIN over the remainder
+
+    Returns (label, f -> lr) with f the training fraction in [0, 1].
+
+    The hold is the knob that matters, not the shape.  A decay helps only once
+    the bottleneck has found its states: it turns the large exploratory steps
+    into small consolidating ones, which is what stops a converged run from
+    overshooting H_inf later (the divergence training.diagnose_divergence
+    counts).  The GRU notebook's plain cosine (1e-3 -> 1e-5) works on the coin
+    because its two states are found within the first third of training, while
+    the rate is still near its peak, and the decay then settles them.  A process
+    with more states is found LATER, so the decay must start later -- hold
+    longer -- or it consolidates a half-found machine.  Read the hold off the
+    constant-rate run: it is the step at which the validation CE reaches H_inf.
+
+    Two couplings to keep in mind: AdamW multiplies the weight decay by the
+    current lr, so a scheduled run applies less total decay than a constant one
+    (weaker cap on the logit growth, but also smaller late steps), and the
+    usage-penalty cliff scales with 1/lr, so a falling rate moves it up, the
+    safe direction.  The tau schedule is indexed by the same training fraction
+    and is unaffected.
+    """
+    lr = float(lr)
+    if lr <= 0:
+        raise ValueError(f"lr must be > 0, got {lr}")
+    if spec is None or str(spec) in ("", "const"):
+        return "const", (lambda f, lr=lr: lr)
+
+    kind, *rest = str(spec).split(":")
+    if kind != "cos" or not 1 <= len(rest) <= 2:
+        raise ValueError(
+            f"unknown lr schedule {spec!r}; use 'const', 'cos:MIN' or 'cos:MIN:HOLD'")
+    try:
+        lr_min = float(rest[0])
+        hold = float(rest[1]) if len(rest) == 2 else 0.0
+    except ValueError:
+        raise ValueError(f"unparseable lr schedule {spec!r}")
+    if not 0.0 < lr_min <= lr:
+        raise ValueError(f"lr schedule floor must lie in (0, lr={lr:g}], got {lr_min:g}")
+    if not 0.0 <= hold < 1.0:
+        raise ValueError(f"lr schedule hold must lie in [0, 1), got {hold:g}")
+
+    def fn(f, lr=lr, lr_min=lr_min, hold=hold):
+        f = min(1.0, max(0.0, float(f)))
+        if f <= hold:
+            return lr
+        g = (f - hold) / (1.0 - hold)
+        return lr_min + 0.5 * (lr - lr_min) * (1.0 + math.cos(math.pi * g))
+
+    return str(spec), fn
+
+
+def is_lr_scheduled(spec) -> bool:
+    """True when `spec` actually varies, i.e. needs the callback attached."""
+    return not (spec is None or str(spec) in ("", "const"))
+
+
+class LRSchedule(L.Callback):
+    """
+    Rewrite every optimizer param group's lr before each training batch.
+
+    A callback rather than a Lightning lr_scheduler so that
+    models._Decoder.configure_optimizers stays a bare AdamW and the archived
+    runs stay bit-for-bit what they were.  Indexed like TauSchedule, by
+    `trainer.global_step / (total_steps - 1)`, so changing `max_epochs`
+    RESCALES the schedule rather than truncating it.
+    """
+
+    def __init__(self, fn, total_steps: int):
+        super().__init__()
+        self.fn = fn
+        self.total_steps = max(2, int(total_steps))
+        self.trace = []                      # (step, lr) every 100 steps
+
+    def lr_at(self, step: int) -> float:
+        return self.fn(step / (self.total_steps - 1))
+
+    def on_train_batch_start(self, trainer, pl_module, batch, batch_idx):
+        lr = self.lr_at(trainer.global_step)
+        for opt in trainer.optimizers:
+            for group in opt.param_groups:
+                group["lr"] = lr
+        if trainer.global_step % 100 == 0:
+            self.trace.append((int(trainer.global_step), lr))

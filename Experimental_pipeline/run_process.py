@@ -27,7 +27,7 @@ if _HERE not in sys.path:
 import figures as FIG                                            # noqa: E402
 from config import CONFIG, baseline_specs, coin_spec, flower_spec  # noqa: E402
 from pipeline import loss_gap_report, run_process                # noqa: E402
-from schedules import parse_tau                                  # noqa: E402
+from schedules import parse_lr, parse_tau                        # noqa: E402
 from training import load_pkl, mkdir, save_run_config            # noqa: E402
 
 OUT_DEFAULT = os.path.join(_ROOT, "main_results", "trainings")
@@ -53,6 +53,12 @@ def parse_args(argv=None):
                     help="override the temperature schedule: a float, 'const:X' "
                          "or 'geom:A:B'.  Use --tau 1.0 to reproduce results "
                          "predating the schedule.  See schedules.py")
+    ap.add_argument("--lr-schedule", default=None, metavar="SPEC",
+                    help="override the learning-rate schedule: 'const' (default), "
+                         "'cos:MIN' or 'cos:MIN:HOLD'.  See schedules.parse_lr")
+    ap.add_argument("--restore-best", action="store_true",
+                    help="hand back each model at its best validation point instead "
+                         "of its last step (training.train_model restore_best)")
     ap.add_argument("--plots-only", action="store_true",
                     help="redraw every figure from repeats.pkl, no training")
     return ap.parse_args(argv)
@@ -89,6 +95,13 @@ def main(argv=None):
             cfg["tau"] = args.tau
         parse_tau(cfg["tau"])
         print(f"  tau override: {cfg['tau']!r}")
+    if args.lr_schedule is not None:
+        cfg["lr_schedule"] = args.lr_schedule
+        parse_lr(cfg["lr_schedule"], cfg["lr"])
+        print(f"  lr schedule override: {cfg['lr_schedule']!r}")
+    if args.restore_best:
+        cfg["restore_best"] = True
+        print("  restore_best: models are returned at their best validation point")
 
     specs = select_specs(args, cfg)
     mkdir(args.out_root)

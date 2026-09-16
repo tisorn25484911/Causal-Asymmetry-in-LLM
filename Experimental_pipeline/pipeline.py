@@ -78,7 +78,9 @@ def one_repeat(spec: dict, cfg: dict, seed: int, keep_discrete: bool = False) ->
                 max_len=ds.seq_len, max_epochs=cfg["max_epochs"], lr=cfg["lr"],
                 mode=mode, n_layers=cfg["n_layers"],
                 weight_decay=cfg["weight_decay"], accelerator=cfg["accelerator"],
-                val_every_n_steps=cfg["val_every_n_steps"], **kw)
+                val_every_n_steps=cfg["val_every_n_steps"],
+                lr_schedule=cfg.get("lr_schedule", "const"),
+                restore_best=cfg.get("restore_best", False), **kw)
             to_cpu_for_analysis(rec.model)
 
             ce, ppl = eval_ce(rec.model, test_loader)

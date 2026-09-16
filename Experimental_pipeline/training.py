@@ -31,7 +31,7 @@ import torch
 import torch.utils.data as tud
 
 from models import build_model, cross_ent_onehot
-from schedules import TauSchedule, is_scheduled, parse_tau
+from schedules import LRSchedule, TauSchedule, is_lr_scheduled, is_scheduled, parse_lr, parse_tau
 
 
 # ══════════════════════════════════════════════════════════════════════════
@@ -219,16 +219,31 @@ class Recorder(L.Callback):
 
     The epoch mean accumulates before the recording gate, so it stays a true
     epoch mean at any stride.
+
+    With `keep_best` the weights are snapshotted at every validation point that
+    improves on the best so far (`best_val`, `best_step`, `best_state`), so
+    train_model can hand back the model at its validation minimum rather than
+    at the last step.  The point of it: on these processes the discrete
+    bottleneck's state partition keeps wandering after the cross-entropy has
+    converged (the surrogate gradient on the state head never vanishes), and a
+    long run ends with whatever partition it happened to hold when the rate got
+    small.  The snapshot keeps the one the validation set liked best.  Note the
+    snapshot is selected on `val_loader`, so a CE reported on that same loader is
+    a selected quantity; score a fresh draw of the process for an unbiased one.
     """
 
-    def __init__(self, val_loader=None, val_every_n_steps: int = 25):
+    def __init__(self, val_loader=None, val_every_n_steps: int = 25, keep_best: bool = False):
         super().__init__()
         self.val_loader        = val_loader
         self.val_every_n_steps = max(1, int(val_every_n_steps))
+        self.keep_best         = bool(keep_best)
         self.step_loss, self.step_at         = [], []
         self.step_val_loss, self.step_val_at = [], []
+        self.step_lr = []                    # the rate each step was taken at
         self.epoch_loss = []
         self.model = None
+        self.best_val, self.best_step, self.best_state = float("inf"), -1, None
+        self.restored_best = False
         self._sum, self._count = 0.0, 0
 
     def on_train_batch_end(self, trainer, pl_module, outputs, batch, batch_idx):
@@ -242,11 +257,16 @@ class Recorder(L.Callback):
         step = trainer.global_step
         self.step_loss.append(loss)
         self.step_at.append(step)
+        self.step_lr.append(float(trainer.optimizers[0].param_groups[0]["lr"]))
 
         if self.val_loader is not None and step % self.val_every_n_steps == 0:
             val_ce, _ = eval_ce(pl_module, self.val_loader)
             self.step_val_loss.append(val_ce)
             self.step_val_at.append(step)
+            if self.keep_best and val_ce < self.best_val:
+                self.best_val, self.best_step = float(val_ce), int(step)
+                self.best_state = {k: v.detach().clone()
+                                   for k, v in pl_module.state_dict().items()}
             pl_module.train()
 
     def on_train_epoch_end(self, trainer, pl_module):
@@ -278,9 +298,21 @@ def train_model(train_loader, embed_type: str, val_loader=None, *,
                 lr: float, mode: str, n_layers: int, weight_decay: float,
                 accelerator: str = "auto", val_every_n_steps: int = 25,
                 n_states=None, state_dim=None, tau: float | str = 1.0,
-                usage_beta: float = 0.0) -> Recorder:
+                usage_beta: float = 0.0, lr_schedule: str = "const",
+                restore_best: bool = False) -> Recorder:
     """
     Train one model and return the Recorder holding its curves and the model.
+
+    `lr_schedule` is "const" (the pipeline as archived) or a spec such as
+    "cos:1e-5:0.5" -- the rate held for the first half of training, then a
+    cosine down to 1e-5.  See schedules.parse_lr for what the hold is for.
+    Applied by a callback, so the optimiser itself is untouched.
+
+    `restore_best` returns the model at its best validation point (Recorder,
+    `keep_best`) instead of at the last step; `rec.best_step` / `rec.best_val`
+    say which.  Off by default so every archived run stays what it was.  It
+    needs a `val_loader`.  Restoring is clean for the discrete model: tau and
+    the rate shape only the gradient, never the forward value.
 
     `tau` is a float (constant) or a schedule spec such as "geom:0.5:5", which
     rises geometrically across training.  See schedules.py for what it does and
@@ -301,6 +333,7 @@ def train_model(train_loader, embed_type: str, val_loader=None, *,
     roughly 6x the wall clock.
     """
     _, tau_fn = parse_tau(tau)
+    _, lr_fn = parse_lr(lr_schedule, lr)
     # build_model needs a FLOAT: models.py:296 divides the state logits by it.
     model = build_model(
         embed_type, token_size=num_token, d_model=d_model, max_len=max_len,
@@ -308,10 +341,15 @@ def train_model(train_loader, embed_type: str, val_loader=None, *,
         n_states=n_states, state_dim=state_dim, tau=tau_fn(0.0),
         usage_beta=usage_beta)
 
-    rec = Recorder(val_loader=val_loader, val_every_n_steps=val_every_n_steps)
+    if restore_best and val_loader is None:
+        raise ValueError("restore_best needs a val_loader to select the checkpoint on")
+    rec = Recorder(val_loader=val_loader, val_every_n_steps=val_every_n_steps,
+                   keep_best=restore_best)
     callbacks = [rec]
     if embed_type == "discrete" and is_scheduled(tau):
         callbacks.append(TauSchedule(tau_fn, len(train_loader) * max_epochs))
+    if is_lr_scheduled(lr_schedule):
+        callbacks.append(LRSchedule(lr_fn, len(train_loader) * max_epochs))
     trainer = L.Trainer(
         max_epochs=max_epochs, accelerator=accelerator, devices="auto",
         log_every_n_steps=5, callbacks=callbacks,
@@ -321,5 +359,8 @@ def train_model(train_loader, embed_type: str, val_loader=None, *,
         enable_progress_bar=False, enable_model_summary=False,
     )
     trainer.fit(model, train_loader)
+    if restore_best and rec.best_state is not None:
+        model.load_state_dict(rec.best_state)
+        rec.restored_best = True
     rec.model = model
     return rec
