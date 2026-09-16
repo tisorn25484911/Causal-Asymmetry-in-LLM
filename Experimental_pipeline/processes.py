@@ -207,45 +207,63 @@ def _bayes_rev_prob(n: int, dice_probs) -> np.ndarray:
     return np.divide(joint, p_face, out=np.zeros_like(joint), where=p_face > 0)
 
 
-def _merged_outcome_mass(dp, merge_tol: float | None = None) -> list:
+def _outcome_classes(dp, merge_tol: float | None = None) -> tuple[np.ndarray, list]:
     """
-    Mass of each *distinguishable* backward outcome state.
+    (class of each face, mass of each class): the backward outcome states.
 
     Two outcomes j and j' are the same backward state exactly when they induce
     the same posterior over dice (_bayes_rev_prob) -- i.e. when columns j and
     j' of dice_probs are proportional.  A state's mass is the outcome marginal
-    (_face_marginal) summed over its faces.  Closed form throughout: nothing
-    here is sampled.
+    (_face_marginal) summed over its faces.  Classes are numbered in order of
+    first appearance; a face that never occurs gets class -1 and no mass.
+    Closed form throughout: nothing here is sampled.
 
-    Shared by flower_complexity, causal_state_count, causal_state_occupancy and
-    flower_rev_transition_matrix so all four count states under one rule.
+    The ONE merge rule.  _merged_outcome_mass (and through it flower_complexity,
+    causal_state_count, causal_state_occupancy, flower_rev_transition_matrix)
+    and the backward true_machine all read it from here.
     """
     dp = np.asarray(dp, dtype=float)
     n, m = dp.shape
     pi_outcome = _face_marginal(n, dp)
     posterior  = _bayes_rev_prob(n, dp)
 
+    cls  = np.full(m, -1, dtype=np.int64)
+    mass: list = []
     if merge_tol is None:
-        merged: dict[tuple, float] = {}
+        keys: dict[tuple, int] = {}
         for j in range(m):
             if pi_outcome[j] <= 0:                     # outcome never occurs
                 continue
             key = tuple(np.round(posterior[:, j], MERGE_ROUND_DP))
-            merged[key] = merged.get(key, 0.0) + pi_outcome[j]
-        return list(merged.values())
+            if key not in keys:
+                keys[key] = len(mass)
+                mass.append(0.0)
+            cls[j] = keys[key]
+            mass[cls[j]] += float(pi_outcome[j])
+        return cls, mass
 
-    reps, mass = [], []
+    reps = []
     for j in range(m):
         if pi_outcome[j] <= 0:
             continue
         for k, r in enumerate(reps):
             if np.max(np.abs(posterior[:, j] - r)) <= merge_tol:
+                cls[j] = k
                 mass[k] += float(pi_outcome[j])
                 break
         else:
+            cls[j] = len(reps)
             reps.append(posterior[:, j])
             mass.append(float(pi_outcome[j]))
-    return mass
+    return cls, mass
+
+
+def _merged_outcome_mass(dp, merge_tol: float | None = None) -> list:
+    """
+    Mass of each *distinguishable* backward outcome state -- the masses half of
+    _outcome_classes, kept as the name the closed forms call.
+    """
+    return _outcome_classes(dp, merge_tol)[1]
 
 
 def coin_complexity(p: float, q: float) -> tuple[float, float]:
@@ -456,6 +474,78 @@ def flower_rev_transition_matrix(n: int, m: int, dice_probs,
     T[0, 1:] = face_dist        # S -> outcome class: the previous cycle's outcome
     T[1:, 0] = 1.0              # outcome class -> S: its selection always precedes it
     return T
+
+
+# ── theoretical epsilon-machines WITH emissions ───────────────────────────
+def true_machine(kind: str, params: dict, mode: str = "forward",
+                 merge_tol: float | None = None) -> dict:
+    """
+    The epsilon-machine of the process in this direction, as a unifilar HMM:
+
+        next_state      (K, V) int    state after emitting token x from state s
+        emission_probs  (K, V) float  P(x | s)
+
+    the format an extracted symbolic machine is compared against.  Forward the
+    emission is P(next token | state); backward it is P(previous token | state)
+    and next_state is the state one step back in time -- the convention of the
+    *_rev_transition_matrix functions.  The state order matches
+    causal_state_occupancy for the same (kind, mode), and the induced
+    state-to-state matrix is the matching *_transition_matrix; checks.py holds
+    all three against each other and against the samplers.
+
+    Every machine here is synchronised by its LAST token -- the state after
+    emitting x is a function of x alone -- so next_state has identical rows and
+    the state after any history is read off its final token.  Zero-probability
+    entries of next_state carry that same synchronising state; they are never
+    reached under exact generation.
+
+        coin forward     [tails, heads]     tails --0|1-p--> tails,  tails --1|p--> heads
+                                            heads --1|1-q--> heads,  heads --2|q--> tails
+        coin backward    [0, 1, 2]          state = current token; rows of
+                                            coin_rev_transition_matrix
+        flower forward   [R, die 0..n-1]    R --i|1/n--> die i,  die i --n+j|p^i_j--> R
+        flower backward  [S, class 0..k-1]  S --n+j|pi_j--> class(j),
+                                            class c --i|P(die i | face in c)--> S
+    """
+    if mode not in ("forward", "backward"):
+        raise ValueError(f"mode must be 'forward' or 'backward', got {mode!r}")
+
+    if kind == "coin":
+        p, q = float(params["p"]), float(params["q"])
+        if mode == "forward":
+            emission = np.array([[1.0 - p, p,       0.0],
+                                 [0.0,     1.0 - q, q  ]], dtype=float)
+            sync = np.array([0, 1, 0], dtype=np.int64)
+        else:
+            emission = coin_rev_transition_matrix(p, q)
+            sync = np.array([0, 1, 2], dtype=np.int64)
+
+    elif kind == "flower":
+        n, m = int(params["n"]), int(params["m"])
+        dp = np.asarray(params["dice_probs"], dtype=float)
+        if dp.shape != (n, m):
+            raise ValueError(f"dice_probs must have shape ({n}, {m}), got {dp.shape}")
+        if mode == "forward":
+            emission = np.zeros((n + 1, n + m), dtype=float)
+            emission[0, :n]  = 1.0 / n                 # R: uniform die selection
+            emission[1:, n:] = dp                      # die i: its roll
+            sync = np.concatenate([np.arange(1, n + 1), np.zeros(m, dtype=np.int64)])
+        else:
+            cls, mass = _outcome_classes(dp, merge_tol)
+            posterior = _bayes_rev_prob(n, dp)
+            emission = np.zeros((len(mass) + 1, n + m), dtype=float)
+            emission[0, n:] = _face_marginal(n, dp)    # S: the previous cycle's outcome
+            for j in range(m):
+                if cls[j] >= 0:                        # class c: which die produced it
+                    emission[1 + cls[j], :n] = posterior[:, j]
+            # a face that never occurs has no class; it is sent to S and never reached
+            sync = np.concatenate([np.zeros(n, dtype=np.int64),
+                                   np.where(cls >= 0, 1 + cls, 0)])
+    else:
+        raise ValueError(f"unknown process {kind!r}; expected 'coin' or 'flower'")
+
+    return {"next_state": np.tile(sync, (emission.shape[0], 1)),
+            "emission_probs": emission}
 
 
 # ══════════════════════════════════════════════════════════════════════════
