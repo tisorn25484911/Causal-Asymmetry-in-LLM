@@ -49,6 +49,52 @@ def _states(tokens, kind, params):
     return np.where(tokens < n, tokens + 1, 0)    # 0 = "a roll just happened"
 
 
+def _states_bw(tokens, kind, params):
+    """Backward causal state of each position -- also a function of the token."""
+    if kind == "coin":
+        return tokens.astype(int)                 # the state IS the token
+    n = params["n"]
+    cls = P._outcome_classes(params["dice_probs"])[0]
+    return np.where(tokens < n, 0, 1 + cls[np.clip(tokens - n, 0, None)])
+
+
+def _machine_T(machine):
+    """State-to-state matrix induced by an emission-labelled machine."""
+    ns, em = machine["next_state"], machine["emission_probs"]
+    T = np.zeros((ns.shape[0], ns.shape[0]))
+    for s in range(ns.shape[0]):
+        for x in range(ns.shape[1]):
+            T[s, ns[s, x]] += em[s, x]
+    return T
+
+
+def _machine_stationary(machine):
+    T = _machine_T(machine)
+    A = T.T - np.eye(T.shape[0]); A[-1, :] = 1.0
+    b = np.zeros(T.shape[0]); b[-1] = 1.0
+    return np.linalg.solve(A, b)
+
+
+def _machine_entropy_rate(machine):
+    pi, em = _machine_stationary(machine), machine["emission_probs"]
+    return float(sum(pi[s] * P.entropy_bits(em[s]) for s in range(em.shape[0])))
+
+
+def _empirical_emissions(seqs, kind, params, mode, K, V):
+    """P(token | state) counted from the sampler, read in this arm's direction."""
+    emis = np.zeros((K, V))
+    for row in seqs:
+        if mode == "forward":
+            st = _states(row, kind, params)
+            for i in range(len(st) - 1):
+                emis[st[i], row[i + 1]] += 1          # state at t emits token t+1
+        else:
+            st = _states_bw(row, kind, params)
+            for i in range(len(st) - 1):
+                emis[st[i + 1], row[i]] += 1          # state at t+1 emits token t
+    return emis / emis.sum(1, keepdims=True)
+
+
 def check_processes(num_samples=200, seq_len=500):
     """
     Samplers vs closed forms.
@@ -76,12 +122,17 @@ def check_processes(num_samples=200, seq_len=500):
             H = P.flower_entropy_rate(params["n"], params["m"], params["dice_probs"])
             occ = P.causal_state_occupancy("flower", "forward", n=params["n"])
             V = params["n"] + params["m"]
+            T_bw = P.flower_rev_transition_matrix(params["n"], params["m"], params["dice_probs"])
+            occ_bw = P.causal_state_occupancy("flower", "backward", n=params["n"],
+                                              m=params["m"], dice_probs=params["dice_probs"])
         else:
             T_th = P.coin_transition_matrix(params["p"], params["q"])
             C = P.coin_complexity(params["p"], params["q"])[0]
             H = P.entropy_rate_coin(params["p"], params["q"])
             occ = P.causal_state_occupancy("coin", "forward", p=params["p"], q=params["q"])
             V = 3
+            T_bw = P.coin_rev_transition_matrix(params["p"], params["q"])
+            occ_bw = P.causal_state_occupancy("coin", "backward", p=params["p"], q=params["q"])
 
         seqs = P.generate(kind, params, num_samples, seq_len, 250,
                           np.random.default_rng(1))
@@ -104,6 +155,21 @@ def check_processes(num_samples=200, seq_len=500):
         Hemp = sum((emis[s].sum() / tot) * P.entropy_bits(emis[s] / emis[s].sum())
                    for s in range(K) if emis[s].sum() > 0)
         _chk(f"    H(next|state) vs entropy rate", Hemp, H, 1e-2)
+
+        # The emission-labelled machines, both arms: against the closed forms
+        # above (exactly) and against the sampler read in each direction.
+        for mode, T_ref, occ_ref in (("forward", T_th, occ), ("backward", T_bw, occ_bw)):
+            tm = P.true_machine(kind, params, mode)
+            _chk_mat(f"    true_machine {mode}: induced T vs closed form",
+                     _machine_T(tm), T_ref, 1e-9)
+            _chk_mat(f"    true_machine {mode}: stationary vs occupancy",
+                     _machine_stationary(tm), occ_ref, 1e-9)
+            _chk(f"    true_machine {mode}: H(token|state) vs entropy rate",
+                 _machine_entropy_rate(tm), H, 1e-9)
+            _chk_mat(f"    true_machine {mode}: emissions vs sampler",
+                     _empirical_emissions(seqs, kind, params, mode,
+                                          tm["next_state"].shape[0], V),
+                     tm["emission_probs"], 1e-2)
 
     # entropy(occupancy) == C is an identity, so it holds exactly
     dp = P.make_dice(2, 6, 42)
