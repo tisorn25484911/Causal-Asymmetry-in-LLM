@@ -300,7 +300,7 @@ class DiscreteCausalDecoder(_Decoder):
 
         state_logits = self.state_head(x)
         probs  = F.softmax(state_logits / self.tau, dim=-1)
-        states = state_logits.argmax(dim=-1)
+        states = probs.argmax(dim=-1)
         hard   = F.one_hot(states, num_classes=self.n_states).float()
 
         # Straight-through: forward value `hard`, gradient through `probs`.
