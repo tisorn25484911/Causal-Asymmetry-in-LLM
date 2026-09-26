@@ -949,6 +949,53 @@ def sns_vocab_size(params: dict) -> int:
     return 2
 
 ##############################################################################
+# DISCRETE-TIME RENEWAL PROCESS
+##############################################################################
+def _renewal_F(params: dict) -> np.ndarray:
+    """
+    the inter-event count distribution F(n) = P(n 0s between consecutive 1s),
+    n = 0..N-1, normalised, with trailing zeros dropped (those counts never occur).
+    """
+    F = np.asarray(params["F"], dtype=float)
+    if F.ndim != 1 or F.size == 0 or np.any(F < 0) or F.sum() <= 0:
+        raise ValueError(f"renewal: F must be a non-empty list of non-negative weights, got {params['F']!r}")
+    F = F / F.sum()
+    return F[: np.flatnonzero(F > 0)[-1] + 1]
+
+def renewal_transition(params: dict) -> np.ndarray:
+    """
+    isolated events (token 1) separated by runs of 0s whose lengths are i.i.d.
+    draws from F (Marzen & Crutchfield, Entropy 17, 4891 (2015)).  State s is the
+    number of 0s since the last 1, s = 0..N-1.  From s the event happens with the
+    hazard h(s) = F(s) / sum_{n >= s} F(n) and the count returns to 0; otherwise a
+    0 is emitted and the count moves to s + 1.  States with the same future are
+    merged by epsilon_machine, so n_causal <= N.  The intervals are i.i.d., so the
+    process reads the same backwards: M- is isomorphic to M+ and C- = C+.
+    """
+    F = _renewal_F(params)
+    N = F.size
+    hazard = F / np.cumsum(F[::-1])[::-1]
+    T = np.zeros((N, N))
+    T[:, 0] = hazard
+    for s in range(N - 1):
+        T[s, s + 1] = 1.0 - hazard[s]
+    return T
+
+def renewal_state_map(params: dict) -> np.ndarray:
+    """
+    one token per edge: back to 0 is the event, s -> s+1 a quiet step.
+    """
+    N = _renewal_F(params).size
+    E = np.zeros((N, N, renewal_vocab_size(params)))
+    E[:, 0] = [0, 1]             # s -> 0    emits 1 (the event)
+    for s in range(N - 1):
+        E[s, s + 1] = [1, 0]     # s -> s+1  emits 0
+    return E
+
+def renewal_vocab_size(params: dict) -> int:
+    return 2
+
+##############################################################################
 # ANY MACHINE AS AN EDGE LIST
 ##############################################################################
 def edges_transition(params: dict) -> np.ndarray:
@@ -1050,6 +1097,9 @@ PROCESS = {
     "sns":       {"transition": sns_transition,
                   "state_map":  sns_state_map,
                   "vocab_size": sns_vocab_size},
+    "renewal":   {"transition": renewal_transition,
+                  "state_map":  renewal_state_map,
+                  "vocab_size": renewal_vocab_size},
     "edges":     {"transition": edges_transition,
                   "state_map":  edges_state_map,
                   "vocab_size": edges_vocab_size},

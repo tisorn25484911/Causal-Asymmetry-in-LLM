@@ -1,6 +1,6 @@
 import numpy as np
 import torch
-from torch.utils.data import Dataset
+from torch.utils.data import DataLoader, Dataset, random_split
 
 class SequenceDataset(Dataset):
     """
@@ -16,6 +16,25 @@ class SequenceDataset(Dataset):
     def __getitem__(self, idx):
         x = torch.from_numpy(self.seqs[idx])
         return x[:-1], x[1:]
+
+def split_loader(dataset, batch_size: int, test_ratio: float = 0.20, seed: int = 0):
+    """
+    (train_loader, test_loader) from one dataset, with a SEEDED split by sequence.
+
+    The seed is what lets every model of a comparison -- both architectures, both
+    arms -- get the same hold-out set: `random_split` without an explicit
+    generator consumes the global torch RNG, so each call would draw a different
+    split.  The split is by index, and generator.reverse() flips each sequence in
+    place of its index, so the forward and the backward arm of one draw split
+    into the same sequences.
+    """
+    n_test  = int(len(dataset) * test_ratio)
+    n_train = len(dataset) - n_test
+    tr, te = random_split(dataset, [n_train, n_test],
+                          generator=torch.Generator().manual_seed(seed))
+    return (DataLoader(tr, batch_size=batch_size, shuffle=True,
+                       generator=torch.Generator().manual_seed(seed)),
+            DataLoader(te, batch_size=batch_size, shuffle=False))
 
 from HMM_processes import (PROCESS, tokens_from_map, stationary_dist,
                            emission_dist, entropy_rate, statistical_complexity,
