@@ -10,9 +10,10 @@ them, and reports states found / S_emp - C / CE - exact for each.  Light scoring
         --epochs 150 --variants det det+tau_const1 det+beta0 gumbel gumbel+beta0 \
         > checks/results/diagnostics/<name>.log
 
-'base' is RunConfig as it stands: Gumbel-ST for the GRUs since 2026-09-25 and for the
-transformer since 2026-09-28, K = 4V since 2026-09-28 (the gru_* logs in
-checks/results/diagnostics were made at K = 2V, 'K4V' then meaning 4V).  The oldest logs
+'base' is RunConfig as it stands: K = 4V and the deterministic argmax head for every
+model since 2026-09-28 (between 2026-09-25 and -28 the GRUs, and briefly every model,
+trained with Gumbel-ST; the gru_* logs in checks/results/diagnostics were made at K = 2V,
+'K4V' then meaning 4V).  The oldest logs
 there were made when 'base' meant the deterministic head for every architecture -- 'det'
 reproduces that.  --epochs sets the length here, not RunConfig's 1200.
 
@@ -52,8 +53,8 @@ VARIANTS = {
     "wd0":        ({"weight_decay": 0.0}, {}),
     "d32":        ({"d_model": 32}, {}),
     "clip1":      ({"gradient_clip_val": 1.0}, {}),
-    # the head's sampler, for whichever architecture is run (RunConfig's defaults:
-    # Gumbel-ST for the GRUs, the deterministic argmax for the transformer)
+    # the head's sampler, for whichever architecture is run (RunConfig's default since
+    # 2026-09-28: the deterministic argmax for every model)
     "gumbel":     ({"gumbel_transformer": True, "gumbel_gru": True}, {}),
     "det":        ({"gumbel_transformer": False, "gumbel_gru": False}, {}),
     "tau_old":    ({"tau": "geom:2.25:0.1", "tau_transformer": "geom:2.25:0.1"}, {}),   # the notebook GRU's endpoints

@@ -397,6 +397,153 @@ def stationary_distribution_from_machine(machine: dict) -> np.ndarray:
     return pi / max(pi.sum(), 1e-12)
 
 
+# ══════════════════════════════════════════════════════════════════════════
+# the notebook's merge (Experimental_pipeline/updated_pipeline_asymmetric_process.ipynb,
+# run_pipeline steps 6-7: compute_future_marginals, categorical_js,
+# pairwise_marginal_js_matrix, merge_states_by_future_distributions,
+# aggregate_machine_by_groups), ported rule for rule; checks/notebook_merge_same.py
+# holds the port to the notebook's own code on every saved machine
+# ══════════════════════════════════════════════════════════════════════════
+MERGE_HORIZON = 10          # the notebook's ExperimentConfig.merge_future_horizon
+MERGE_JS = 1e-3             # merge_js_threshold, nats
+MERGE_MIN_COUNT = 35        # min_state_count_for_merge
+
+
+def future_marginals(machine: dict, horizon: int) -> np.ndarray:
+    """(k, horizon, V): P(X_t = x | start in state s) for t = 1..horizon, by pushing the
+    machine's state distribution forward -- the notebook's compute_future_marginals."""
+    nxt = np.asarray(machine["next_state"], dtype=np.int64)
+    E = np.asarray(machine["emission_probs"], dtype=np.float64)
+    k, V = E.shape
+    out = np.zeros((k, horizon, V), dtype=np.float64)
+    for s in range(k):
+        dist = np.zeros(k, dtype=np.float64)
+        dist[s] = 1.0
+        for t in range(horizon):
+            out[s, t] = dist @ E
+            new = np.zeros(k, dtype=np.float64)
+            for x in range(V):
+                for q in range(k):
+                    if dist[q] > 0:
+                        new[nxt[q, x]] += dist[q] * E[q, x]
+            dist = new
+    return out
+
+
+def _categorical_js(p, q, eps: float = 1e-12) -> float:
+    """Jensen-Shannon divergence in NATS, each distribution clipped at eps and renormalised."""
+    p = np.clip(np.asarray(p, dtype=np.float64), eps, None)
+    q = np.clip(np.asarray(q, dtype=np.float64), eps, None)
+    p, q = p / p.sum(), q / q.sum()
+    m = 0.5 * (p + q)
+    return 0.5 * float(np.sum(p * np.log(p / m)) + np.sum(q * np.log(q / m)))
+
+
+def future_js_matrix(machine: dict, horizon: int) -> np.ndarray:
+    """(k, k): the largest per-step JS divergence between two states' next `horizon` predictions."""
+    marg = future_marginals(machine, horizon)
+    k = marg.shape[0]
+    js = np.zeros((k, k), dtype=np.float64)
+    for i in range(k):
+        for j in range(i + 1, k):
+            js[i, j] = js[j, i] = max(_categorical_js(marg[i, t], marg[j, t]) for t in range(horizon))
+    return js
+
+
+def _aggregate(next_state, emission_probs, groups, weights):
+    """Collapse `groups` of states: emission rows averaged by visit weight, each successor by a
+    visit-weighted majority vote (ties to the lower group) -- aggregate_machine_by_groups."""
+    to_group = {s: g for g, members in enumerate(groups) for s in members}
+    G, V = len(groups), emission_probs.shape[1]
+    new_next, new_emit, new_w = np.zeros((G, V), dtype=np.int64), np.zeros((G, V)), np.zeros(G)
+    for g, members in enumerate(groups):
+        w = weights[members].astype(np.float64)
+        if w.sum() <= 0:
+            w = np.ones(len(members))
+        new_w[g] = w.sum()
+        new_emit[g] = np.average(emission_probs[members], axis=0, weights=w)
+        new_emit[g] /= max(new_emit[g].sum(), 1e-12)
+        for x in range(V):
+            votes = {}
+            for wi, s in zip(w, members):
+                votes[to_group[int(next_state[s, x])]] = votes.get(to_group[int(next_state[s, x])], 0.0) + float(wi)
+            new_next[g, x] = sorted(votes.items(), key=lambda kv: (-kv[1], kv[0]))[0][0]
+    return new_next, new_emit, new_w
+
+
+def merge_equivalent_states(machine: dict, counts, horizon: int = MERGE_HORIZON,
+                            js_threshold: float = MERGE_JS, min_count: float = MERGE_MIN_COUNT):
+    """
+    The notebook's post-hoc merge: repeatedly merge the two states whose next `horizon` predictions
+    are closest (the largest per-step JS divergence, nats), while that is <= js_threshold and both
+    states have at least `min_count` visits.  A duplicated causal state costs nothing in prediction,
+    so training never removes one; this does.
+
+    Returns (merged machine, groups, log): groups[g] lists the input states merged into state g;
+    log has one (i, j, js, count_i, count_j) per merge.  The notebook then prunes states unreachable
+    from the visited ones -- a no-op here, every input state having been visited.
+    """
+    nxt = np.asarray(machine["next_state"], dtype=np.int64).copy()
+    E = np.asarray(machine["emission_probs"], dtype=np.float64).copy()
+    w = np.asarray(counts, dtype=np.float64).copy()
+    groups = [[s] for s in range(nxt.shape[0])]
+    log = []
+    while nxt.shape[0] > 1:
+        js = future_js_matrix({"next_state": nxt, "emission_probs": E}, horizon)
+        np.fill_diagonal(js, np.inf)
+        i, j = divmod(int(np.argmin(js)), js.shape[1])
+        best = float(js[i, j])
+        if not np.isfinite(best) or best > js_threshold:
+            break
+        if min(w[i], w[j]) < min_count:            # the closest pair acceptable on counts, if any
+            cand = js.copy()
+            while True:
+                i, j = divmod(int(np.argmin(cand)), cand.shape[1])
+                best = float(cand[i, j])
+                if not np.isfinite(best) or best > js_threshold or min(w[i], w[j]) >= min_count:
+                    break
+                cand[i, j] = cand[j, i] = np.inf
+            if not np.isfinite(best) or best > js_threshold:
+                break
+        log.append((int(i), int(j), best, float(w[i]), float(w[j])))
+        order = [[s] if s != i else [i, j] for s in range(nxt.shape[0]) if s != j]
+        nxt, E, w = _aggregate(nxt, E, order, w)
+        groups = [sum((groups[s] for s in members), []) for members in order]
+    return {"next_state": nxt, "emission_probs": E, "counts": w}, groups, log
+
+
+def add_merged_metrics(res: dict, full_tol: float = 0.05) -> dict:
+    """
+    Score the MERGED machine as well as the raw one (user, 2026-09-28: report both, and judge FULL
+    on the merged machine, as the notebook does).  Adds res["merged_machine"] and, to
+    res["metrics"], merged_k / merged_S_emp / merged_S_minus_C / merged_discovered /
+    merged_T_err / n_merges / full_raw, and sets `full` to the merged verdict.  Idempotent,
+    so it also fills in runs saved before it existed.
+    """
+    m = res["metrics"]
+    if "merged_k" in m:
+        return res
+    th, raw = res["theory"], res["machine"]
+    merged, groups, log = merge_equivalent_states(raw, raw["counts"])
+    occ = np.array([raw["counts"][g].sum() for g in groups], dtype=np.float64)
+    occ = occ / occ.sum()
+    p = occ[occ > 0]
+    S = float(-(p * np.log2(p)).sum()) + 0.0
+    cmp = compare_transition_matrix(machine_state_transition(merged), th["T_theory"],
+                                    merged["emission_probs"], th["true_machine"]["emission_probs"],
+                                    weights=occ)
+    discovered = th["true_k"] - len(cmp["missing"])
+    m.update({
+        "full_raw": bool(m["full"]), "n_merges": len(log), "merged_k": int(len(groups)),
+        "merged_S_emp": S, "merged_S_minus_C": S - th["C"], "merged_discovered": int(discovered),
+        "merged_T_err": float(cmp["max_error"]),
+        "full": bool(discovered == th["true_k"] and abs(S - th["C"]) < full_tol),
+    })
+    res["merged_machine"] = {**merged, "groups": groups, "log": log, "occupancy": occ,
+                             "state_ids": [list(np.asarray(raw["state_ids"])[g]) for g in groups]}
+    return res
+
+
 def symbolic_cross_entropy(machine: dict, tokens: np.ndarray, start_states, mode: str, t0: int) -> float:
     """
     Bits/token of a unifilar machine run along the model's reading order over its
@@ -569,10 +716,11 @@ def analyse_arm(model, rec, gen, ds, test_indices, test_loader, ana_loader, *,
             "exact_T_err": exact["comparison"]["max_error"],
             "exact_missing": len(exact["comparison"]["missing"]),
         })
-    return {
+    out = {
         "theory": th, "history": history, "metrics": metrics, "report": report,
         "transition": T_learned, "transition_comparison": comparison,
         "machine": machine, "minimal_stationary": minimal_stationary,
         "exact_machine": exact,
         "per_position": {"neural": neural_pp.mean(axis=0), "exact": exact_pp.mean(axis=0)},
     }
+    return add_merged_metrics(out, full_tol)

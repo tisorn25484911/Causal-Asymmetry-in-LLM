@@ -8,7 +8,7 @@ The research question is causal asymmetry: forward vs backward memory, C⁺ vs C
 ([Thompson et al. 2018](https://journals.aps.org/prx/abstract/10.1103/PhysRevX.8.031013)).
 
 The main models are the **transformer** and the **feedback GRU**. Every model trains with
-Gumbel-softmax sampling (the transformer too, since 2026-09-28). Both use one shared
+the deterministic argmax head (since 2026-09-28; Gumbel-softmax sampling is an option). Both use one shared
 causal-state head, one training loop, the same data and the same scoring. Every theoretical quantity comes from `HMM_processes.py`.
 
 ---
@@ -157,7 +157,7 @@ tokens ─► one_hot · rand_prj (fixed, V×16) + sinusoidal PE ─► 4 × [pr
 - The state is **read off** the top layer at each position and never fed back. It depends
   on the whole prefix, and unifilarity is not guaranteed; it is measured (`determinism`).
 - Size at the default K = 4V: 12,190 (renewal), 12,284 (coin), 12,760 (flower) parameters.
-  Trained with Gumbel on since 2026-09-28 (the pipeline's head is deterministic). On CPU it is
+  Trained with the deterministic argmax head, as the pipeline. On CPU it is
   verified bit-identical to `Experimental_pipeline`'s transformer (section 8); on MPS it
   carries the LayerNorm workaround (section 9).
 
@@ -165,7 +165,7 @@ tokens ─► one_hot · rand_prj (fixed, V×16) + sinusoidal PE ─► 4 × [pr
 
 ```
 h_t = GRUCell(one_hot(x_t), m_{t-1})        m_{-1} = 0 (blank start)
-s_t = shared head's state for h_t           (Gumbel sample while training)
+s_t = shared head's state for h_t           (argmax; a Gumbel sample with --gumbel-gru)
 m_t = state_matrix[s_t]                     fed back as the next hidden state
 logits_t = emission(m_t)                    predicts x_{t+1}
 ```
@@ -218,7 +218,7 @@ Or train and score one arm as `run_model.py` does:
 | usage penalty | β = 1/(batch · seq_len) |
 | length | 1200 epochs = 30,000 updates for every model (the notebook GRU's 29,850) |
 | checkpoint | best validation CE (checked every 25 steps) |
-| Gumbel | on for every model (`--no-gumbel-transformer`, `--no-gumbel-gru` for the ablations) |
+| Gumbel | off: the deterministic argmax for every model (`--gumbel-transformer`, `--gumbel-gru` to sample) |
 | MPS | LayerNorm workaround on (`Transformer.MPS_LAYERNORM_WORKAROUND`, section 9) |
 
 ### Changing the schedule, the length or the budget
@@ -257,12 +257,28 @@ Metrics for each run (`runs/*.json`, and the scorecard):
 | metric | meaning |
 |---|---|
 | **discovered** | theoretical states matched by some learned state's next-token row (nearest in total variation) |
-| **FULL** | every theoretical state discovered **and** \|S_emp − C\| < 0.05 bits |
+| **FULL** | judged on the machine **after the notebook's merge** (below): every theoretical state discovered **and** \|S_emp − C\| < 0.05 bits. `full_raw` is the same test before the merge |
+| merged_k, merged_S_emp, merged_S_minus_C, merged_discovered, merged_T_err, n_merges | the machine after the merge, scored as above |
 | S_emp | entropy of the learned states' occupancy along the data; compared with C⁺ or C⁻ |
 | emission TV | occupancy-weighted distance from each learned row to its matched theory row |
 | T err | max \|learned − theory\| of the state-to-state matrix (from free-running generation; `exact_T_err` from enumeration for `gru_feedback`) |
 | CE − exact | test cross-entropy minus the exact model's on the same tokens |
 | determinism | fraction of (state, token) visits that follow the majority successor; 1 means unifilar |
+
+**The notebook's merge** (`extraction.merge_equivalent_states`, since 2026-09-28). A duplicated
+causal state costs nothing in prediction, so no training objective removes it. The GRU notebook
+(`Experimental_pipeline/updated_pipeline_asymmetric_process.ipynb`, `run_pipeline` steps 6–7)
+removes it after training, and the modular analysis now does the same, rule for rule:
+1. for each learned state, push the machine forward 10 steps and record P(Xₜ | start there);
+2. the distance between two states is the largest per-step Jensen–Shannon divergence (nats);
+3. repeatedly merge the closest pair while it is ≤ 0.001 nats and both states were visited at
+   least 35 times: next-token rows averaged by visits, successors by visit-weighted majority.
+
+Raw and merged results are both reported (log line, `runs/*.json`, figures). For example, on
+renewal the transformer spread one causal state over four identical labels (8 states,
+S_emp − C = +0.385); the merge returns the 5 correct states (+0.001, FULL). Merged S_emp is,
+like the raw one, the entropy of the occupancy along the data (the merged groups' visits summed).
+`checks/notebook_merge_same.py` holds the port to the notebook's own code on every saved run.
 
 ## 6. Choosing another process from `HMM_processes.py`
 
@@ -392,7 +408,8 @@ It shows up in these figures:
   training batch; gradient norm. With Gumbel on, the states count includes *sampled*
   states, so it runs above the true k while training.
 - **states:** learned occupancy vs theory; learned vs true emission rows; determinism.
-- **machine:** learned vs theoretical machine graph.
+- **machine:** learned vs theoretical machine graph, with the merged machine between them
+  when the notebook's merge changed anything.
 - **per_position, transitions, complexity:** see the table above.
 - **scorecard:** every run of a seed, as a table.
 
@@ -405,12 +422,18 @@ It shows up in these figures:
 | `diagnose_one_knob.py` | one setting at a time (τ, β, K, width, clipping, Gumbel, …), combinable with `+` | `checks/results/diagnostics/` |
 | `summarise.py` | one table of every model on every arm, including the ablations, with each run's τ and epochs | `checks/results/crosscheck/summary.{md,csv,png}` |
 | `mps_layernorm_bug.py` | the MPS LayerNorm bug (section 9): `repro` compares gradients, MPS vs CPU, for a bare LayerNorm and for the transformer; `train` retrains one arm as-is, with the workaround, or on CPU; `saved` reads the `ln_attn.0` drift from saved runs | `checks/results/diagnostics/mps_layernorm_*.log` |
+| `notebook_merge_same.py` | `extraction.merge_equivalent_states` against the GRU notebook's own merge code, on every saved run's machine: the same merges, grouping, successors and rows | printed |
 
 `checks/results/ablations/` holds the runs that led to the current design:
 - `deterministic_head/`: every model with the deterministic head;
 - `gumbel_gru/`: both GRUs with Gumbel;
 - `transformer_geom800/{default,renewal_K8}/`: the transformer at the earlier standard,
-  `geom:5:0.5` for 800 epochs.
+  `geom:5:0.5` for 800 epochs;
+- `gumbel_2026-09-28/default/`: Gumbel-ST for every model at K = 4V, 1200 epochs (renewal
+  both arms, transformer coin both arms), before the switch back to the argmax head;
+- `pre_2026-09-28/{default,renewal_K4,renewal_K8}/`: the main runs at the defaults before
+  2026-09-28 (K = 2V, GRUs 800 epochs, transformer 1000 epochs without Gumbel and without
+  the MPS workaround).
 
 The finding: with a deterministic straight-through head, a state that loses early is never
 chosen again, so merged states stay merged. This is the "dead codeword" problem of

@@ -78,10 +78,10 @@ def test_train_model_applies_geomhold():
     assert np.allclose(tau[len(tau) // 2 + 1:], 0.5)          # held at 0.5 in the second
 
 
-def test_every_model_trains_with_gumbel_by_default():
-    """Since 2026-09-28 (user): Gumbel-ST for every model, as the notebook GRU."""
+def test_every_model_trains_with_the_argmax_head_by_default():
+    """Since 2026-09-28 (user): the deterministic argmax head for every model."""
     cfg = RunConfig()
-    assert cfg.gumbel_gru is True and cfg.gumbel_transformer is True
+    assert cfg.gumbel_gru is False and cfg.gumbel_transformer is False
 
 
 def test_default_state_budget_covers_the_default_processes():
@@ -95,14 +95,14 @@ def test_default_state_budget_covers_the_default_processes():
 
 def test_per_architecture_settings():
     """The standard (2026-09-28): 1200 epochs = 30,000 updates for every model (the notebook
-    GRU's 29,850), transformer geomhold:5:0.5:0.8, the GRUs geom:5:0.5, Gumbel for all;
+    GRU's 29,850), transformer geomhold:5:0.5:0.8, the GRUs geom:5:0.5, the argmax head for all;
     everything a run uses comes from run_model.arch_settings."""
     from run_model import arch_settings
     cfg = RunConfig()
     t, g, f = (arch_settings(cfg, a, 3) for a in ("transformer", "gru", "gru_feedback"))
-    assert (t["tau"], t["max_epochs"], t["gumbel"], t["n_layers"]) == ("geomhold:5:0.5:0.8", 1200, True, 4)
-    assert (g["tau"], g["max_epochs"], g["gumbel"], g["n_layers"]) == ("geom:5:0.5", 1200, True, 1)
-    assert (f["tau"], f["max_epochs"], f["gumbel"], f["state_dim"]) == ("geom:5:0.5", 1200, True, cfg.d_model)
+    assert (t["tau"], t["max_epochs"], t["gumbel"], t["n_layers"]) == ("geomhold:5:0.5:0.8", 1200, False, 4)
+    assert (g["tau"], g["max_epochs"], g["gumbel"], g["n_layers"]) == ("geom:5:0.5", 1200, False, 1)
+    assert (f["tau"], f["max_epochs"], f["gumbel"], f["state_dim"]) == ("geom:5:0.5", 1200, False, cfg.d_model)
     assert t["state_dim"] == 3 and t["accelerator"] == "auto" and g["accelerator"] == "cpu"
 
 
@@ -129,12 +129,12 @@ def test_command_line_schedule_flags(argv, want):
 
 
 @pytest.mark.parametrize("argv, want", [
-    ("", (True, True)),
-    ("--no-gumbel-transformer", (False, True)),
-    ("--no-gumbel-gru", (True, False)),
+    ("", (False, False)),
+    ("--gumbel-transformer", (True, False)),
+    ("--gumbel-gru", (False, True)),
 ])
 def test_command_line_gumbel_flags(argv, want):
-    """Gumbel is on for every model unless a --no-gumbel-* flag turns it off."""
+    """The argmax head for every model unless a --gumbel-* flag turns sampling on."""
     import shlex
     import unittest.mock as um
     import run_model

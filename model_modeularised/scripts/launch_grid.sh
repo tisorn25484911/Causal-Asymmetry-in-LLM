@@ -23,7 +23,7 @@ mkdir -p $LOGS
 for arch in $ARCHS; do
   if [[ $arch == transformer ]]; then
     $PY run_model.py --name $NAME --seed $SEED --arch transformer --process $PROCESSES --arm $ARMS \
-        --threads 2 --no-plots "$@" > $LOGS/transformer_all_s$SEED.log 2>&1 &
+        --threads 2 --no-plots "$@" > $LOGS/transformer_${(j:_:)PROCESSES}_s$SEED.log 2>&1 &   # one log per launch
     continue
   fi
   for proc in $PROCESSES; do for arm in $ARMS; do

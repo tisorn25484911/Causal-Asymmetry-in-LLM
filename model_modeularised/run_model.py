@@ -10,7 +10,7 @@ the same hold-out rows.
     python run_model.py --name default                                transformer + gru_feedback x coin, flower x both arms
     python run_model.py --name default --arch gru_feedback --process coin --arm forward   one run
     python run_model.py --name even --process even --params p=0.3     any process in HMM_processes.PROCESS
-    python run_model.py --name det --no-gumbel-gru                    a named variant of the config
+    python run_model.py --name gumbel --gumbel-gru --gumbel-transformer   a named variant of the config
     python run_model.py --name default --plots-only                   redraw every figure from the pickles
     scripts/launch_grid.sh default                                    the whole grid in parallel, one log per run
     python run_model.py --smoke                                       2 epochs on 64 sequences -> checks/results/smoke
@@ -122,12 +122,12 @@ class RunConfig:
     val_every_n_steps: int = 25
     restore_best: bool = True
     gradient_clip_val: Optional[float] = None
-    # Gumbel-ST while training, for every model (evaluation is always the deterministic
-    # argmax).  With the deterministic head a state that loses early is never chosen again,
-    # so merged states stay merged (checks/results/crosscheck); the notebook GRU always
-    # samples.  The transformer too since 2026-09-28 (user: a fair comparison).
-    gumbel_transformer: bool = True
-    gumbel_gru: bool = True                  # gru_feedback and gru
+    # The head's sampler while training.  Default (user, 2026-09-28): the deterministic
+    # straight-through ARGMAX for every model, the pipeline's head.  Gumbel-ST
+    # (--gumbel-transformer, --gumbel-gru) samples the state instead; the Gumbel runs are in
+    # checks/results/ablations/gumbel_2026-09-28.  Evaluation is always the argmax.
+    gumbel_transformer: bool = False
+    gumbel_gru: bool = False                  # gru_feedback and gru
     progress_every: int = 2500               # a progress line every this many steps (0 = none)
 
     # --- extraction ----------------------------------------------------------
@@ -286,7 +286,9 @@ def run_arm(cfg: RunConfig, arch: str, process: str, arm: str, verbose: bool = T
         "test_indices": test_indices,
     })
     m = res["metrics"]
-    say(f"[{arch} | {tag} | {arm}] {'FULL' if m['full'] else 'not full'} | discovered "
+    # FULL is judged on the machine after the notebook's merge; the raw verdict is kept beside it
+    say(f"[{arch} | {tag} | {arm}] {'FULL' if m['full'] else 'not full'} (raw: {'FULL' if m['full_raw'] else 'not full'}) | "
+        f"merged {m['k_used']} -> {m['merged_k']} states, S-C {m['merged_S_minus_C']:+.3f} | discovered "
         f"{m['discovered']}/{m['true_k']} (emission TV {m['emission_tv']:.3f}), used {m['k_used']}/{m['K']} | "
         f"S-C {m['S_minus_C']:+.3f} | "
         f"T_err {m['transition_max_err']:.3f} | gap {m['gap']:+.4f} (exact {m['gap_exact']:+.4f}, "
@@ -337,6 +339,9 @@ def redraw(run_dir: str, fig_dir: str):
     if not results:
         print(f"no results in {run_dir}")
         return []
+    from extraction import add_merged_metrics
+    for r in results:                  # runs saved before the merge was scored get it here (idempotent)
+        add_merged_metrics(r, r["cfg"].get("full_tol", 0.05))
     theories, key_of = {}, {}
     for i, r in enumerate(results):
         params, burn_in, horizon = theory_inputs(r)
@@ -417,10 +422,11 @@ def main(argv=None):
     ap.add_argument("--out", default=os.path.join(HERE, "results"), help="root of real results")
     ap.add_argument("--smoke", action="store_true",
                     help="2 epochs on 64 sequences, into checks/results/smoke/<name>/ -- never into results/")
-    ap.add_argument("--no-gumbel-transformer", action="store_true",
-                    help="train the transformer with the deterministic head (the pipeline's; an ablation)")
-    ap.add_argument("--no-gumbel-gru", action="store_true",
-                    help="train the GRUs with the deterministic head (an ablation)")
+    ap.add_argument("--gumbel-transformer", action="store_true",
+                    help="train the transformer's head with Gumbel-ST sampling (an ablation; "
+                         "the default is the deterministic argmax, the pipeline's head)")
+    ap.add_argument("--gumbel-gru", action="store_true",
+                    help="train the GRUs' head with Gumbel-ST sampling (an ablation)")
     ap.add_argument("--plots-only", action="store_true")
     ap.add_argument("--no-plots", action="store_true")
     args = ap.parse_args(argv)
@@ -439,8 +445,8 @@ def main(argv=None):
     for name in ("lightning", "lightning.pytorch", "lightning.fabric"):
         logging.getLogger(name).setLevel(logging.ERROR)
 
-    cfg = RunConfig(random_seed=args.seed, gumbel_transformer=not args.no_gumbel_transformer,
-                    gumbel_gru=not args.no_gumbel_gru,
+    cfg = RunConfig(random_seed=args.seed, gumbel_transformer= args.gumbel_transformer,
+                    gumbel_gru= args.gumbel_gru,
                     process_params=parse_params(args.params, args.process))
     if args.num_states_mult is not None:
         cfg = replace(cfg, num_states_mult=args.num_states_mult)

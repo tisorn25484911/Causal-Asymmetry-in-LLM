@@ -63,6 +63,17 @@ def _heat(ax, M, xticks, yticks, title, cmap="Blues", vmax=1.0):
     ax.set_title(title, fontsize=10)
 
 
+def _merged_labels(r):
+    """'s<id>+s<id> → <theoretical state>' for each state of the merged machine."""
+    mm, th = r["merged_machine"], r["theory"]
+    true = np.asarray(th["true_machine"]["emission_probs"])
+    out = []
+    for ids, row in zip(mm["state_ids"], mm["emission_probs"]):
+        d = 0.5 * np.abs(np.asarray(row)[None, :] - true).sum(axis=1)
+        out.append("+".join(f"s{i}" for i in ids) + f" → {th['names'][int(np.argmin(d))]}")
+    return out
+
+
 def _state_labels(r):
     """'s<id> → <theoretical state>' for each visited state, matched by its emission row."""
     machine, th = r["machine"], r["theory"]
@@ -141,7 +152,9 @@ def plot_states(r):
     ax.set_xticks(range(max(len(learned), len(theory))))
     ax.set_xlabel("state (sorted by occupancy)"); ax.set_ylabel("occupancy")
     ax.set_title(f"{_title(r)}\nS_emp {m['S_emp']:.3f} / C {th['C']:.3f} bits   k = {m['k_used']}/{m['K']} "
-                 f"(true {th['true_k']}, discovered {m['discovered']})", fontsize=10)
+                 f"(true {th['true_k']}, discovered {m['discovered']})"
+                 + (f"\nafter the notebook's merge: k = {m['merged_k']}, S_emp {m['merged_S_emp']:.3f}"
+                    if "merged_k" in m else ""), fontsize=10)
     ax.grid(axis="y", alpha=0.25); ax.legend(fontsize=8)
 
     _heat(axes[1], machine["emission_probs"], tokens, _state_labels(r), f"learned P({what} | state)")
@@ -264,15 +277,23 @@ def plot_machine_graph(r):
     successor of each (state, token) along the data, exact for the feedback GRU.
     For the backward arm the edges read one step back in original time."""
     machine, th, m = r["machine"], r["theory"], r["metrics"]
+    merged = m.get("n_merges", 0) > 0 and r.get("merged_machine") is not None
     k = max(machine["next_state"].shape[0], th["true_k"])
     scale = max(1.0, min(k, DRAWABLE_K) / 10.0)
-    fig, axes = plt.subplots(1, 2, figsize=(max(18, int(14 * scale)), max(6.5, int(5.5 * scale))))
+    ncol = 3 if merged else 2
+    fig, axes = plt.subplots(1, ncol, figsize=(max(18, int(14 * scale)) * ncol / 2, max(6.5, int(5.5 * scale))))
     _draw_machine(axes[0], machine["next_state"], machine["emission_probs"], r["minimal_stationary"],
                   _state_labels(r),
                   f"learned: {machine['next_state'].shape[0]} states, determinism {m['determinism']:.3f}\n"
                   f"symbolic CE {m['symbolic_ce']:.3f} vs neural {m['neural_ce_span']:.3f} "
-                  f"vs exact {m['exact_ce_span']:.3f}")
-    _draw_machine(axes[1], th["true_machine"]["next_state"], th["true_machine"]["emission_probs"],
+                  f"vs exact {m['exact_ce_span']:.3f}"
+                  + ("" if merged or "n_merges" not in m else "\n(the notebook's merge leaves it unchanged)"))
+    if merged:
+        mm = r["merged_machine"]
+        _draw_machine(axes[1], mm["next_state"], mm["emission_probs"], mm["occupancy"], _merged_labels(r),
+                      f"after the notebook's merge: {len(mm['groups'])} states ({m['n_merges']} merges)\n"
+                      f"S_emp {m['merged_S_emp']:.3f} vs C {th['C']:.3f} bits -> {'FULL' if m['full'] else 'not full'}")
+    _draw_machine(axes[-1], th["true_machine"]["next_state"], th["true_machine"]["emission_probs"],
                   th["occupancy"], th["names"],
                   f"theory ({r['arm']} epsilon-machine): {th['true_k']} states, C = {th['C']:.3f} bits")
     fig.suptitle(f"{_title(r)}: the machine the model became vs the theoretical one", fontsize=12)
@@ -358,13 +379,16 @@ def plot_complexity(runs):
     fig, axes = plt.subplots(1, len(arms), figsize=(4.6 * len(arms), 3.8), squeeze=False)
     for ax, arm in zip(axes.ravel(), arms):
         r = runs[arm]; m = r["metrics"]
-        ax.bar([0, 1], [m["C"], m["S_emp"]], width=0.6, color=[_GREY, ARCH_COLOR[r["arch"]]])
-        ax.set_xticks([0, 1])
+        Sm = m.get("merged_S_emp", m["S_emp"])
+        bars = ax.bar([0, 1, 2], [m["C"], m["S_emp"], Sm], width=0.6,
+                      color=[_GREY, ARCH_COLOR[r["arch"]], ARCH_COLOR[r["arch"]]])
+        bars[1].set_alpha(0.45)                                     # raw: before the merge
+        ax.set_xticks([0, 1, 2])
         ax.set_xticklabels([f"theory\nk = {m['true_k']}",
-                            f"learned\nk = {m['k_used']}" + ("" if m["within_tol"] else "\n[not converged]")],
-                           fontsize=9)
+                            f"learned, raw\nk = {m['k_used']}" + ("" if m["within_tol"] else "\n[not converged]"),
+                            f"after merge\nk = {m.get('merged_k', m['k_used'])}"], fontsize=9)
         ax.set_ylabel("bits"); ax.grid(axis="y", alpha=0.25)
-        ax.set_title(f"{arm}:  C {m['C']:.3f}  /  S_emp {m['S_emp']:.3f}", fontsize=10)
+        ax.set_title(f"{arm}:  C {m['C']:.3f}  /  S_emp {m['S_emp']:.3f} raw, {Sm:.3f} merged", fontsize=10)
     r0 = runs[arms[0]]
     fig.suptitle(f"{ARCH_LABEL[r0['arch']]} · {r0['tag']}: statistical complexity")
     fig.tight_layout()
@@ -424,28 +448,35 @@ def plot_theory_comparison(runs_by_arch, theory, tag):
     x = np.arange(len(arms))
     w = 0.8 / max(1, len(archs))
     off = lambda i: (i - (len(archs) - 1) / 2) * w                                  # noqa: E731
-    get = lambda arch, arm, key: (runs_by_arch[arch][arm]["metrics"][key]           # noqa: E731
+    get = lambda arch, arm, key: (runs_by_arch[arch][arm]["metrics"].get(key, np.nan)   # noqa: E731
                                   if arm in runs_by_arch[arch] else np.nan)
+    # after the notebook's merge, with the raw value where a run predates it
+    mget = lambda arch, arm, key: (get(arch, arm, "merged_" + key)                   # noqa: E731
+                                   if np.isfinite(get(arch, arm, "merged_" + key)) else get(arch, arm, key))
+    raw_proxy = Line2D([], [], ls="", marker="o", mfc="none", mec=_INK, label="raw (before the merge)")
     theory_proxy = Line2D([], [], color=_INK, ls=(0, (5, 2)), lw=1.5, label="theory")
     fig, axes = plt.subplots(1, 4, figsize=(22, 4.6), gridspec_kw=dict(width_ratios=[1.1, 0.9, 1.1, 1.1]))
 
     ax = axes[0]
     for i, arch in enumerate(archs):
-        ax.bar(x + off(i), [get(arch, a, "S_emp") for a in arms], width=w * 0.92,
+        ax.bar(x + off(i), [mget(arch, a, "S_emp") for a in arms], width=w * 0.92,
                color=ARCH_COLOR[arch], label=ARCH_LABEL[arch])
+        ax.plot(x + off(i), [get(arch, a, "S_emp") for a in arms], ls="", marker="o", mfc="none", mec=_INK)
     for j, arm in enumerate(arms):
         C = theory[arm]["C"]
         ax.hlines(C, j - 0.45, j + 0.45, colors=_INK, linestyles=(0, (5, 2)), lw=1.5)
         ax.text(j, C, f"C{'+' if arm == 'forward' else '−'} {C:.3f}", ha="center", va="bottom", fontsize=8, color=_INK)
     ax.set_xticks(x); ax.set_xticklabels(arms); ax.set_ylabel("bits")
-    ax.set_title("S_emp vs statistical complexity", fontsize=10); ax.grid(axis="y", alpha=0.25)
-    ax.legend(handles=ax.get_legend_handles_labels()[0] + [theory_proxy], fontsize=8,
-              loc="upper center", bbox_to_anchor=(0.5, -0.1), ncol=len(archs) + 1, frameon=False)
+    ax.set_title("S_emp after the merge vs statistical complexity", fontsize=10); ax.grid(axis="y", alpha=0.25)
+    ax.legend(handles=ax.get_legend_handles_labels()[0] + [theory_proxy, raw_proxy], fontsize=8,
+              loc="upper center", bbox_to_anchor=(0.5, -0.1), ncol=len(archs) + 2, frameon=False)
 
     ax = axes[1]
     if len(arms) == 2:
-        d = [get(a, "backward", "S_emp") - get(a, "forward", "S_emp") for a in archs]
+        d = [mget(a, "backward", "S_emp") - mget(a, "forward", "S_emp") for a in archs]
         ax.bar(np.arange(len(archs)), d, width=0.6, color=[ARCH_COLOR[a] for a in archs])
+        ax.plot(np.arange(len(archs)), [get(a, "backward", "S_emp") - get(a, "forward", "S_emp") for a in archs],
+                ls="", marker="o", mfc="none", mec=_INK, label="raw (before the merge)")
         ax.axhline(theory["C_minus"] - theory["C_plus"], color=_INK, ls=(0, (5, 2)), lw=1.5,
                    label=f"theory C− − C+ = {theory['C_minus'] - theory['C_plus']:+.3f}")
         ax.axhline(0, color=_INK, lw=0.8)
@@ -453,22 +484,24 @@ def plot_theory_comparison(runs_by_arch, theory, tag):
         ax.legend(fontsize=8)
     else:
         ax.axis("off"); ax.text(0.5, 0.5, "needs both arms", ha="center", va="center", transform=ax.transAxes)
-    ax.set_ylabel("bits"); ax.set_title("causal asymmetry: S_emp(bw) − S_emp(fw)", fontsize=10)
+    ax.set_ylabel("bits"); ax.set_title("causal asymmetry after the merge: S_emp(bw) − S_emp(fw)", fontsize=10)
     ax.grid(axis="y", alpha=0.25)
 
     ax = axes[2]
     for i, arch in enumerate(archs):
-        bars = ax.bar(x + off(i), [get(arch, a, "discovered") for a in arms], width=w * 0.92,
+        bars = ax.bar(x + off(i), [mget(arch, a, "discovered") for a in arms], width=w * 0.92,
                       color=ARCH_COLOR[arch], label=ARCH_LABEL[arch])
         for b, a in zip(bars, arms):
             if a in runs_by_arch[arch]:
+                used, after = int(get(arch, a, "k_used")), mget(arch, a, "k")
                 ax.text(b.get_x() + b.get_width() / 2, b.get_height(),
-                        f"used {int(get(arch, a, 'k_used'))}", ha="center", va="bottom", fontsize=7, color=_INK)
+                        f"used {used}" + (f"→{int(after)}" if np.isfinite(after) and int(after) != used else ""),
+                        ha="center", va="bottom", fontsize=7, color=_INK)
     for j, arm in enumerate(arms):
         k = theory[arm]["true_k"]
         ax.hlines(k, j - 0.45, j + 0.45, colors=_INK, linestyles=(0, (5, 2)), lw=1.5)
     ax.set_xticks(x); ax.set_xticklabels(arms); ax.set_ylabel("theoretical states discovered")
-    ax.set_title("states: discovered vs k (dashed)", fontsize=10); ax.grid(axis="y", alpha=0.25)
+    ax.set_title("states after the merge: discovered vs k (dashed)", fontsize=10); ax.grid(axis="y", alpha=0.25)
 
     ax = axes[3]
     for i, arch in enumerate(archs):
@@ -511,9 +544,11 @@ def scorecard_table(results):
             m = r["metrics"]
             rows.append({
                 "process": cell[0], "arm": cell[1], "arch": ARCH_LABEL[arch],
-                "FULL": m["full"], "discovered": f"{m['discovered']}/{m['true_k']}",
+                "FULL": m["full"], "FULL raw": m.get("full_raw", m["full"]),
+                "discovered": f"{m['discovered']}/{m['true_k']}",
                 "emission TV": m.get("emission_tv", float("nan")),
-                "states used": m["k_used"], "S_emp - C": m["S_minus_C"],
+                "states raw→merged": f"{m['k_used']}→{m.get('merged_k', m['k_used'])}",
+                "S_emp - C": m.get("merged_S_minus_C", m["S_minus_C"]), "S_emp - C raw": m["S_minus_C"],
                 "T max err": m["transition_max_err"],
                 "T err exact": m.get("exact_T_err", float("nan")), "CE - H_inf": m["gap"],
                 "CE - exact": m["gap_exact"], "fresh CE - H_inf": m["fresh_gap"],
@@ -536,7 +571,7 @@ def plot_scorecard(results):
     gs = fig.add_gridspec(2, 3, height_ratios=[1.0, 0.95])
     panels = [
         ("discovered / true k", lambda m: m["discovered"] / m["true_k"], (0, 1.3), None),
-        ("S_emp − C  (bits)", lambda m: m["S_minus_C"], None, 0.05),
+        ("S_emp − C after the merge (bits; ○ raw)", lambda m: m.get("merged_S_minus_C", m["S_minus_C"]), None, 0.05),
         ("test CE − exact CE  (bits)", lambda m: m["gap_exact"], None, None),
     ]
     for col, (label, fn, ylim, band) in enumerate(panels):
@@ -547,6 +582,10 @@ def plot_scorecard(results):
             vals = [fn(by[(c, arch)]["metrics"]) if (c, arch) in by else np.nan for c in cells]
             bars = ax.bar(x + (i - (len(archs) - 1) / 2) * w, vals, width=w * 0.92,
                           color=ARCH_COLOR[arch], label=ARCH_LABEL[arch])
+            if col == 1:                      # the raw S_emp - C, before the notebook's merge
+                raw = [by[(c, arch)]["metrics"]["S_minus_C"] if (c, arch) in by else np.nan for c in cells]
+                ax.plot(x + (i - (len(archs) - 1) / 2) * w, raw, ls="", marker="o", mfc="none", mec=_INK,
+                        label="raw (before the merge)" if i == len(archs) - 1 else None)
             if col == 0:
                 for b, c in zip(bars, cells):
                     if (c, arch) in by:
@@ -568,15 +607,15 @@ def plot_scorecard(results):
     ax = fig.add_subplot(gs[1, :]); ax.axis("off")
     rows = scorecard_table(results)
     if rows:
-        cols = ["process", "arm", "arch", "FULL", "discovered", "emission TV", "states used",
-                "S_emp - C", "T max err", "T err exact", "CE - H_inf", "CE - exact", "fresh CE - H_inf",
-                "determinism", "best step", "params", "minutes"]
-        fmts = {"emission TV": "{:.3f}", "S_emp - C": "{:+.3f}", "T max err": "{:.3f}",
+        cols = ["process", "arm", "arch", "FULL", "FULL raw", "discovered", "emission TV", "states raw→merged",
+                "S_emp - C", "S_emp - C raw", "T max err", "T err exact", "CE - H_inf", "CE - exact",
+                "fresh CE - H_inf", "determinism", "best step", "params", "minutes"]
+        fmts = {"emission TV": "{:.3f}", "S_emp - C": "{:+.3f}", "S_emp - C raw": "{:+.3f}", "T max err": "{:.3f}",
                 "T err exact": "{:.3f}", "CE - H_inf": "{:+.4f}",
                 "CE - exact": "{:+.4f}", "fresh CE - H_inf": "{:+.4f}", "determinism": "{:.3f}",
                 "params": "{:,}", "minutes": "{:.1f}"}
         def cell(c, v):
-            if c == "FULL":
+            if c in ("FULL", "FULL raw"):
                 return "FULL" if v else "–"
             if isinstance(v, float) and not np.isfinite(v):
                 return "–"                                   # e.g. no exact machine
