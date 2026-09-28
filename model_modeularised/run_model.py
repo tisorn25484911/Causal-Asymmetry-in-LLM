@@ -100,18 +100,21 @@ class RunConfig:
     d_model: int = 16
     n_layers_transformer: int = 4
     n_layers_gru: int = 1
-    num_states_mult: int = 2           # K = 2V (study5 round 3)
+    num_states_mult: int = 4           # K = 4V, the notebook GRU's budget (user, 2026-09-28);
+                                       # >= k for coin (3/V=3), flower (5/V=7) and renewal (5/V=2)
     state_dim_mult: int = 1            # S = V
     tau: str = "geom:5:0.5"            # the GRUs (tau_schedue.py)
-    # The transformer's schedule and length (user's standard, 2026-09-25): descend
-    # 5 -> 0.5 over the first 80% of 1000 epochs (800), then hold 0.5 for the last 200
-    # (study5's `geomhold`; the 4th number is the DESCENT fraction).
+    # The transformer's schedule (user's standard, 2026-09-25): descend 5 -> 0.5 over the
+    # first 80% of the run, then hold 0.5 (study5's `geomhold`; the 4th number is the
+    # DESCENT fraction).  At 1200 epochs: 960 descending, 240 held.
     tau_transformer: str = "geomhold:5:0.5:0.8"
     usage_beta: Optional[float] = None # None -> 1 / (batch_size * seq_len)
 
     # --- training ------------------------------------------------------------
-    max_epochs: int = 800              # the GRUs
-    max_epochs_transformer: int = 1000
+    # 25 batches x 1200 epochs = 30,000 updates for every model: the notebook GRU's 29,850
+    # (user, 2026-09-28: match its UPDATES; the data stay 1000 x 301 tokens, ~9x its 30,000).
+    max_epochs: int = 1200             # the GRUs
+    max_epochs_transformer: int = 1200
     learning_rate: float = 1e-3
     weight_decay: float = 0.01
     accelerator_transformer: str = "auto"   # MPS on a Mac, as study5
@@ -119,11 +122,11 @@ class RunConfig:
     val_every_n_steps: int = 25
     restore_best: bool = True
     gradient_clip_val: Optional[float] = None
-    # Gumbel-ST while training (evaluation is always the deterministic argmax).  The
-    # GRUs need it: with the deterministic head a state that loses early is never
-    # chosen again, so merged states stay merged (checks/results/crosscheck).  The
-    # transformer keeps the pipeline's deterministic head.
-    gumbel_transformer: bool = False
+    # Gumbel-ST while training, for every model (evaluation is always the deterministic
+    # argmax).  With the deterministic head a state that loses early is never chosen again,
+    # so merged states stay merged (checks/results/crosscheck); the notebook GRU always
+    # samples.  The transformer too since 2026-09-28 (user: a fair comparison).
+    gumbel_transformer: bool = True
     gumbel_gru: bool = True                  # gru_feedback and gru
     progress_every: int = 2500               # a progress line every this many steps (0 = none)
 
@@ -401,12 +404,12 @@ def main(argv=None):
                          "GRUs geom:5:0.5, transformer geomhold:5:0.5:0.8")
     ap.add_argument("--tau-transformer", default=None, metavar="SPEC", help="the transformer's schedule only")
     ap.add_argument("--max-epochs", type=int, default=None,
-                    help="training length for EVERY architecture (defaults: GRUs 800, transformer 1000; "
+                    help="training length for EVERY architecture (default 1200 each = 30,000 updates; "
                          "the schedule rescales with it)")
     ap.add_argument("--max-epochs-transformer", type=int, default=None, help="the transformer's length only")
     ap.add_argument("--num-states-mult", type=int, default=None,
-                    help="state budget K = this x V (RunConfig default 2); raise it when a process has "
-                         "more causal states than 2V, e.g. a binary process with k > 4")
+                    help="state budget K = this x V (RunConfig default 4); raise it when a process has "
+                         "more causal states than 4V, e.g. a binary process with k > 8")
     ap.add_argument("--seed", type=int, default=0)
     ap.add_argument("--name", default="default",
                     help="experiment name: everything goes to results/<name>/ (smoke: checks/results/smoke/<name>/)")
@@ -414,10 +417,10 @@ def main(argv=None):
     ap.add_argument("--out", default=os.path.join(HERE, "results"), help="root of real results")
     ap.add_argument("--smoke", action="store_true",
                     help="2 epochs on 64 sequences, into checks/results/smoke/<name>/ -- never into results/")
-    ap.add_argument("--gumbel-transformer", action="store_true",
-                    help="train the transformer's head with Gumbel-ST too (off by default)")
+    ap.add_argument("--no-gumbel-transformer", action="store_true",
+                    help="train the transformer with the deterministic head (the pipeline's; an ablation)")
     ap.add_argument("--no-gumbel-gru", action="store_true",
-                    help="train the GRUs with the deterministic head (the ablation)")
+                    help="train the GRUs with the deterministic head (an ablation)")
     ap.add_argument("--plots-only", action="store_true")
     ap.add_argument("--no-plots", action="store_true")
     args = ap.parse_args(argv)
@@ -436,7 +439,7 @@ def main(argv=None):
     for name in ("lightning", "lightning.pytorch", "lightning.fabric"):
         logging.getLogger(name).setLevel(logging.ERROR)
 
-    cfg = RunConfig(random_seed=args.seed, gumbel_transformer=args.gumbel_transformer,
+    cfg = RunConfig(random_seed=args.seed, gumbel_transformer=not args.no_gumbel_transformer,
                     gumbel_gru=not args.no_gumbel_gru,
                     process_params=parse_params(args.params, args.process))
     if args.num_states_mult is not None:

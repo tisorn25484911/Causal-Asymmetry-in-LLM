@@ -268,3 +268,30 @@ def test_train_model_schedules_tau_and_restores_best(arch):
     assert rec.step_tau[0] == pytest.approx(5.0) and rec.step_tau[-1] == pytest.approx(0.5)
     assert rec.restored_best and 0 < rec.best_step <= steps
     assert eval_ce(rec.model, te)[0] == pytest.approx(rec.best_val, abs=1e-5)
+
+
+@pytest.mark.skipif(not torch.backends.mps.is_available(), reason="needs an MPS device")
+def test_transformer_gradients_on_mps_match_cpu():
+    """PyTorch 2.12.1's MPS LayerNorm-backward bug (checks/mps_layernorm_bug.py): with
+    Transformer.MPS_LAYERNORM_WORKAROUND on (the default) every gradient matches CPU."""
+    import copy
+    from training import ARCHITECTURES
+    torch.manual_seed(0)
+    model = ARCHITECTURES["transformer"]("discrete", token_size=3, d_model=16, max_len=40, lr=1e-3,
+                                         mode="forward", n_layers=2, weight_decay=0.0,
+                                         n_states=6, state_dim=3, tau=1.0, usage_beta=0.0)
+    x = torch.randint(0, 3, (8, 41))
+
+    def grads(dev):
+        m = copy.deepcopy(model).to(dev).train()
+        inputs, targets = m._split((x[:, :-1].to(dev), x[:, 1:].to(dev)), m.mode)
+        cross_ent_onehot(m(inputs), targets)[0].backward()
+        return {n: p.grad.detach().cpu() for n, p in m.named_parameters() if p.grad is not None}
+
+    assert Transformer.MPS_LAYERNORM_WORKAROUND is True
+    cpu, mps = grads("cpu"), grads("mps")
+    # the key biases' true gradient is 0 (softmax ignores a shift shared by every key):
+    # both devices return rounding noise there, so a relative error means nothing
+    err = {n: float((mps[n] - cpu[n]).abs().max() / (cpu[n].abs().max() + 1e-12))
+           for n in cpu if not n.endswith("wk.bias")}
+    assert max(err.values()) < 1e-3, sorted(err.items(), key=lambda kv: -kv[1])[:3]

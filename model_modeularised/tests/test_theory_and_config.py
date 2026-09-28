@@ -78,27 +78,38 @@ def test_train_model_applies_geomhold():
     assert np.allclose(tau[len(tau) // 2 + 1:], 0.5)          # held at 0.5 in the second
 
 
-def test_the_gru_trains_with_gumbel_and_the_transformer_does_not():
+def test_every_model_trains_with_gumbel_by_default():
+    """Since 2026-09-28 (user): Gumbel-ST for every model, as the notebook GRU."""
     cfg = RunConfig()
-    assert cfg.gumbel_gru is True and cfg.gumbel_transformer is False
+    assert cfg.gumbel_gru is True and cfg.gumbel_transformer is True
+
+
+def test_default_state_budget_covers_the_default_processes():
+    """K = 4V (2026-09-28, the notebook's budget): at least k for coin, flower and renewal."""
+    cfg = RunConfig()
+    assert cfg.num_states_mult == 4
+    for process in ("coin", "flower", "renewal"):
+        gen, _ = draw(cfg, process, "backward", 2, 20, 0)
+        assert cfg.num_states_mult * gen.vocab_size >= gen.n_causal, process
 
 
 def test_per_architecture_settings():
-    """The standard (2026-09-25): transformer geomhold:5:0.5:0.8 for 1000 epochs, the GRUs
-    geom:5:0.5 for 800; everything a run uses comes from run_model.arch_settings."""
+    """The standard (2026-09-28): 1200 epochs = 30,000 updates for every model (the notebook
+    GRU's 29,850), transformer geomhold:5:0.5:0.8, the GRUs geom:5:0.5, Gumbel for all;
+    everything a run uses comes from run_model.arch_settings."""
     from run_model import arch_settings
     cfg = RunConfig()
     t, g, f = (arch_settings(cfg, a, 3) for a in ("transformer", "gru", "gru_feedback"))
-    assert (t["tau"], t["max_epochs"], t["gumbel"], t["n_layers"]) == ("geomhold:5:0.5:0.8", 1000, False, 4)
-    assert (g["tau"], g["max_epochs"], g["gumbel"], g["n_layers"]) == ("geom:5:0.5", 800, True, 1)
-    assert (f["tau"], f["max_epochs"], f["state_dim"]) == ("geom:5:0.5", 800, cfg.d_model)
+    assert (t["tau"], t["max_epochs"], t["gumbel"], t["n_layers"]) == ("geomhold:5:0.5:0.8", 1200, True, 4)
+    assert (g["tau"], g["max_epochs"], g["gumbel"], g["n_layers"]) == ("geom:5:0.5", 1200, True, 1)
+    assert (f["tau"], f["max_epochs"], f["gumbel"], f["state_dim"]) == ("geom:5:0.5", 1200, True, cfg.d_model)
     assert t["state_dim"] == 3 and t["accelerator"] == "auto" and g["accelerator"] == "cpu"
 
 
 @pytest.mark.parametrize("argv, want", [
-    ("", ("geomhold:5:0.5:0.8", 1000, "geom:5:0.5", 800)),
+    ("", ("geomhold:5:0.5:0.8", 1200, "geom:5:0.5", 1200)),
     ("--tau const:1 --max-epochs 50", ("const:1", 50, "const:1", 50)),
-    ("--tau-transformer geom:5:0.5 --max-epochs-transformer 700", ("geom:5:0.5", 700, "geom:5:0.5", 800)),
+    ("--tau-transformer geom:5:0.5 --max-epochs-transformer 700", ("geom:5:0.5", 700, "geom:5:0.5", 1200)),
 ])
 def test_command_line_schedule_flags(argv, want):
     import shlex
@@ -111,6 +122,29 @@ def test_command_line_schedule_flags(argv, want):
     def fake(cfg, arch, process, arm):
         t, g = run_model.arch_settings(cfg, "transformer", 3), run_model.arch_settings(cfg, "gru", 3)
         raise Parsed((t["tau"], t["max_epochs"], g["tau"], g["max_epochs"]))
+
+    with um.patch.object(run_model, "run_arm", fake), pytest.raises(Parsed) as e:
+        run_model.main(shlex.split(argv) + ["--no-plots", "--name", "flagtest", "--out", "/tmp/claude-flagtest"])
+    assert e.value.args[0] == want
+
+
+@pytest.mark.parametrize("argv, want", [
+    ("", (True, True)),
+    ("--no-gumbel-transformer", (False, True)),
+    ("--no-gumbel-gru", (True, False)),
+])
+def test_command_line_gumbel_flags(argv, want):
+    """Gumbel is on for every model unless a --no-gumbel-* flag turns it off."""
+    import shlex
+    import unittest.mock as um
+    import run_model
+
+    class Parsed(Exception):
+        pass
+
+    def fake(cfg, arch, process, arm):
+        raise Parsed((run_model.arch_settings(cfg, "transformer", 3)["gumbel"],
+                      run_model.arch_settings(cfg, "gru_feedback", 3)["gumbel"]))
 
     with um.patch.object(run_model, "run_arm", fake), pytest.raises(Parsed) as e:
         run_model.main(shlex.split(argv) + ["--no-plots", "--name", "flagtest", "--out", "/tmp/claude-flagtest"])

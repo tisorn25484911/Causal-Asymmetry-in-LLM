@@ -10,9 +10,11 @@ them, and reports states found / S_emp - C / CE - exact for each.  Light scoring
         --epochs 150 --variants det det+tau_const1 det+beta0 gumbel gumbel+beta0 \
         > checks/results/diagnostics/<name>.log
 
-'base' is RunConfig as it stands (Gumbel-ST for the GRUs since 2026-09-25); the logs
-already in checks/results/diagnostics were made when 'base' meant the deterministic
-head for every architecture -- 'det' reproduces that.
+'base' is RunConfig as it stands: Gumbel-ST for the GRUs since 2026-09-25 and for the
+transformer since 2026-09-28, K = 4V since 2026-09-28 (the gru_* logs in
+checks/results/diagnostics were made at K = 2V, 'K4V' then meaning 4V).  The oldest logs
+there were made when 'base' meant the deterministic head for every architecture -- 'det'
+reproduces that.  --epochs sets the length here, not RunConfig's 1200.
 
 Knobs combine with '+'.  It prints one line per variant and writes nothing else;
 keep the logs in checks/results/diagnostics/, never in results/.

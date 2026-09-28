@@ -7,9 +7,9 @@ the forward arm (predict the next token) and the backward arm (predict the previ
 The research question is causal asymmetry: forward vs backward memory, C⁺ vs C⁻
 ([Thompson et al. 2018](https://journals.aps.org/prx/abstract/10.1103/PhysRevX.8.031013)).
 
-The main models are the **transformer** and the **feedback GRU**. The feedback GRU trains
-with Gumbel-softmax sampling. Both use one shared causal-state head, one training loop, the
-same data and the same scoring. Every theoretical quantity comes from `HMM_processes.py`.
+The main models are the **transformer** and the **feedback GRU**. Every model trains with
+Gumbel-softmax sampling (the transformer too, since 2026-09-28). Both use one shared
+causal-state head, one training loop, the same data and the same scoring. Every theoretical quantity comes from `HMM_processes.py`.
 
 ---
 
@@ -40,8 +40,11 @@ Run times (Apple M-series; 25 updates per epoch):
 
 | model | device | standard length | time per run |
 |---|---|---|---|
-| transformer | MPS | 1000 epochs = 25,000 updates | ~20 min |
-| feedback GRU | CPU, 1 thread | 800 epochs = 20,000 updates | ~30–40 min |
+| transformer | MPS | 1200 epochs = 30,000 updates | ~15 min |
+| feedback GRU | CPU, 1 thread | 1200 epochs = 30,000 updates | ~60–65 min |
+
+30,000 updates matches the notebook GRU's 29,850 (`Experimental_pipeline/updated_pipeline_asymmetric_process.ipynb`).
+The data stay 1000 × 301 tokens, about 9× the notebook's 30,000.
 
 `launch_grid.sh` runs every GRU as its own process and all transformers in one lane.
 
@@ -153,8 +156,10 @@ tokens ─► one_hot · rand_prj (fixed, V×16) + sinusoidal PE ─► 4 × [pr
   [Xiong et al. 2020](https://arxiv.org/abs/2002.04745)).
 - The state is **read off** the top layer at each position and never fed back. It depends
   on the whole prefix, and unifilarity is not guaranteed; it is measured (`determinism`).
-- Size: 12,164 (coin) to 12,424 (flower) parameters. Trained with Gumbel off. This is
-  verified bit-identical to `Experimental_pipeline`'s transformer (section 8).
+- Size at the default K = 4V: 12,190 (renewal), 12,284 (coin), 12,760 (flower) parameters.
+  Trained with Gumbel on since 2026-09-28 (the pipeline's head is deterministic). On CPU it is
+  verified bit-identical to `Experimental_pipeline`'s transformer (section 8); on MPS it
+  carries the LayerNorm workaround (section 9).
 
 ### Feedback GRU (`GRU.DiscreteFeedbackGRU`, `--arch gru_feedback`)
 
@@ -173,7 +178,7 @@ logits_t = emission(m_t)                    predicts x_{t+1}
 - `model.machine()` returns the **exact** machine by enumerating every (state, token):
   `next_state[s, x]`, `emission_probs[s]`, `start_state[x]`.
 - `state_dim` must equal `d_model` (16), because the state vector *is* the hidden state.
-- Size: 1,257 (coin) to 1,781 (flower) parameters.
+- Size at the default K = 4V: 1,258 (renewal), 1,455 (coin), 2,243 (flower) parameters.
 
 ### Read-out GRU (`GRU.DiscreteCausalGRU`, `--arch gru`)
 
@@ -207,13 +212,14 @@ Or train and score one arm as `run_model.py` does:
 |---|---|
 | data | 1000 × 300 tokens, batch 32 |
 | width | `d_model` 16 |
-| states | K = 2V; S = V for the transformer, 16 for the feedback GRU |
+| states | K = 4V (the notebook GRU's budget); S = V for the transformer, 16 for the feedback GRU |
 | τ | transformer `geomhold:5:0.5:0.8`; GRUs `geom:5:0.5` (or `--tau`, below) |
 | optimiser | AdamW, lr 1e-3, weight decay 0.01 ([Loshchilov & Hutter 2019](https://arxiv.org/abs/1711.05101)) |
 | usage penalty | β = 1/(batch · seq_len) |
-| length | transformer 1000 epochs; GRUs 800 epochs |
+| length | 1200 epochs = 30,000 updates for every model (the notebook GRU's 29,850) |
 | checkpoint | best validation CE (checked every 25 steps) |
-| Gumbel | on for the GRUs, off for the transformer |
+| Gumbel | on for every model (`--no-gumbel-transformer`, `--no-gumbel-gru` for the ablations) |
+| MPS | LayerNorm workaround on (`Transformer.MPS_LAYERNORM_WORKAROUND`, section 9) |
 
 ### Changing the schedule, the length or the budget
 
@@ -236,8 +242,8 @@ the transformer. `run_model.arch_settings(cfg, arch, V)` shows what a run will u
 | `geomhold:A:B[:DESCENT]` | geometric A → B over the first DESCENT fraction of the run (default 0.5), then held at B for the rest |
 
 **The fourth number is how long the descent takes, not how long the hold lasts.** The
-transformer's standard is `geomhold:5:0.5:0.8` over 1000 epochs: τ descends 5 → 0.5
-during the first 800 epochs, then holds at 0.5 for the last 200. `geomhold` is
+transformer's standard is `geomhold:5:0.5:0.8` over 1200 epochs: τ descends 5 → 0.5
+during the first 960 epochs, then holds at 0.5 for the last 240. `geomhold` is
 `tau_experiment/study5`'s rule. On flower (3,8) backward, 5 → 0.5 descended
 over 2000 epochs and then held for 2000 more gave 9, 8, 8, 8, 7 of 9 states. The plain
 2000-epoch descent averaged 7.1. The extra updates helped only once τ was low.
@@ -273,9 +279,9 @@ python run_model.py --name mix --process even gm --params even.p=0.3 gm.p=0.7   
 - A bare `key=value` applies to every `--process` in the run; `process.key=value` to one.
 - `burn_in` is set the same way.
 - Runs are named by process only, so **use one `--name` per parameter setting**.
-- **State budget:** K = `num_states_mult` × V (default 2V) is set from the vocabulary
-  alone. A binary process (V = 2) with more than 4 causal states needs
-  `--num-states-mult 4` or more. A run prints a warning, and records `budget_below_k`,
+- **State budget:** K = `num_states_mult` × V (default 4V since 2026-09-28; 2V before)
+  is set from the vocabulary alone. A binary process (V = 2) with more than 8 causal states
+  needs `--num-states-mult 5` or more. A run prints a warning, and records `budget_below_k`,
   whenever K is below the theory's k: such a run cannot be FULL.
 
 Registered processes, with their defaults (`run_model.DEFAULT_PARAMS`, or `RunConfig` for
@@ -316,13 +322,13 @@ to M⁺, and C⁺ = C⁻ exactly (`tests/test_theory_and_config.py` checks this)
 learns an asymmetry here has learned an artefact.
 
 ```bash
-python run_model.py --name renewal_K8 --process renewal --arch transformer gru_feedback gru --num-states-mult 4
-python run_model.py --name renewal_F4 --process renewal --params 'F=[0.4,0.3,0.2,0.1]' --num-states-mult 4
+python run_model.py --name renewal --process renewal --arch transformer gru_feedback gru
+python run_model.py --name renewal_F4 --process renewal --params 'F=[0.4,0.3,0.2,0.1]'
 ```
 
-With V = 2 the default budget is K = 2V = 4, below the default F's 5 causal states.
-Raise it with `--num-states-mult`, as above. The runs in `results/renewal/` used K = 4, so
-they could not be FULL.
+With V = 2 the default budget is K = 4V = 8, which covers the default F's 5 causal states.
+Before 2026-09-28 the default was 2V = 4, below k, so those runs
+(`checks/results/ablations/pre_2026-09-28/renewal_K4/`) could not be FULL.
 
 ### Any machine from a paper, without writing code
 
@@ -413,14 +419,16 @@ Gumbel-ST fixes it for the feedback GRU on every arm tested.
 
 ## 9. Known issues
 
-- **MPS LayerNorm bug (PyTorch 2.12.1), not fixed.** On MPS, `LayerNorm`'s backward pass
+- **MPS LayerNorm bug (PyTorch 2.12.1), worked around by default since 2026-09-28.** On MPS, `LayerNorm`'s backward pass
   returns wrong weight and bias gradients when its input does not require a gradient. In the
   transformer that is `ln_attn.0`, whose input is built from buffers only. Every MPS-trained
   transformer, the pipeline's included, trains that one LayerNorm's weight and bias on
   garbage gradients. The other parameters match CPU; the key biases differ only by rounding
   noise, because their true gradient is zero. Workaround, verified: make that input require a gradient.
-  It is not applied, so as not to change results relative to earlier runs. Training on CPU
-  is correct.
+  It is ON by default (`Transformer.MPS_LAYERNORM_WORKAROUND`, MPS only): CPU is untouched and
+  still bit-identical to the pipeline, and `tests/test_models.py` checks every MPS gradient
+  against CPU. Every transformer run before 2026-09-28 trained without it; the numbers below
+  describe those runs. `checks/mps_layernorm_bug.py` switches it off to reproduce the bug.
 
   What it does to training (measured in every saved MPS run; `checks/mps_layernorm_bug.py saved`):
   AdamW turns the consistently-signed wrong gradient into a step of about the learning rate

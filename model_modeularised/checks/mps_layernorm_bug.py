@@ -23,11 +23,12 @@ on parameters, so its gradients are right.
 
 The workaround (verified by `repro`): make the positional encoding's output -- the
 one LayerNorm input that does not require grad -- require it.  Forward values are
-unchanged; only which MPS backward kernel runs changes.  It is applied here by
-patching PositionalEncoding.forward in THIS process; Transformer.py is untouched.
+unchanged; only which MPS backward kernel runs changes.  Since 2026-09-28 it is built
+into Transformer.py and ON by default (Transformer.MPS_LAYERNORM_WORKAROUND, MPS only);
+this script switches it off to reproduce the bug.
 
-Variants for `train`:   asis   MPS, as run_model runs it
-                        fix    MPS + the workaround
+Variants for `train`:   asis   MPS with the workaround switched OFF (the bug; every run before 2026-09-28)
+                        fix    MPS with the workaround (the default)
                         cpu    CPU (no MPS kernels; bit-identical to the pipeline on CPU)
 `--gumbel` trains any of them with the Gumbel-ST head (RunConfig.gumbel_transformer).
 """
@@ -52,18 +53,13 @@ import Transformer                                                   # noqa: E40
 from decoder_base import cross_ent_onehot                            # noqa: E402
 from process_generator import SequenceDataset, split_loader          # noqa: E402
 
-_PE_FORWARD = Transformer.PositionalEncoding.forward
+DEFAULT_WORKAROUND = Transformer.MPS_LAYERNORM_WORKAROUND
 RUNS = os.path.join(HERE, "results", "diagnostics", "mps_layernorm_runs")      # `train` saves its runs here
 
 
 def workaround(on: bool):
-    """Patch (or unpatch) PositionalEncoding.forward so its output requires grad."""
-    def forward(self, x):
-        out = _PE_FORWARD(self, x)
-        if torch.is_grad_enabled() and not out.requires_grad:
-            out.requires_grad_(True)          # a leaf: built from buffers only
-        return out
-    Transformer.PositionalEncoding.forward = forward if on else _PE_FORWARD
+    """Switch Transformer.py's MPS LayerNorm workaround on or off (on by default)."""
+    Transformer.MPS_LAYERNORM_WORKAROUND = bool(on)
 
 
 # ══════════════════════════════════════════════════════════════════════════
@@ -126,9 +122,9 @@ def model_grads(process="coin", arm="forward"):
         err = {n: float((mps[n] - cpu[n]).abs().max() / (cpu[n].abs().max() + 1e-12)) for n in cpu if n not in zero}
         worst = sorted(err, key=err.get, reverse=True)[:3]
         rest = max(v for n, v in err.items() if not n.startswith("ln_attn.0"))
-        print(f"   {'with the workaround' if on else 'as run_model runs it':21s}: "
+        print(f"   {'workaround on (default)' if on else 'workaround off (the bug)':23s}: "
               + "  ".join(f"{n} {err[n]:.1e}" for n in worst) + f"   | every parameter but ln_attn.0 <= {rest:.1e}")
-    workaround(False)
+    workaround(DEFAULT_WORKAROUND)
 
 
 # ══════════════════════════════════════════════════════════════════════════
@@ -172,7 +168,7 @@ def train(args):
                                progress_every=2500, gumbel_transformer=args.gumbel)
     tag = "+gumbel" if args.gumbel else ""
     for v in args.variants:
-        workaround(v == "fix")
+        workaround(v != "asis")
         cfg = replace(base, accelerator_transformer="cpu") if v == "cpu" else base
         print(f"\n######## {v}{tag}: transformer {args.process} {args.arm}, K = {args.num_states_mult}V, "
               f"{cfg.tau_transformer}, {cfg.max_epochs_transformer} epochs, seed {args.seed}", flush=True)
@@ -186,7 +182,7 @@ def train(args):
             pickle.dump(res, f)
         print(f"   saved {os.path.relpath(out)}", flush=True)
         print(f"   {(time.time() - t0) / 60:.1f} min", flush=True)
-    workaround(False)
+    workaround(DEFAULT_WORKAROUND)
 
 
 def saved(paths):

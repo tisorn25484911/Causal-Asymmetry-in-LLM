@@ -19,6 +19,15 @@ import torch.nn.functional as F
 from causal_matrix import _DiscreteHead
 from decoder_base import _Decoder, cross_ent_onehot  # noqa: F401  (re-exported)
 
+# PyTorch 2.12.1 on MPS returns WRONG weight/bias gradients from LayerNorm's backward when the
+# LayerNorm's input does not require grad.  Here that is ln_attn[0] only: its input is built from
+# buffers alone (rand_prj, the positional encoding).  Uncorrected, AdamW drives that LayerNorm's
+# gain to about 1 - lr * step and training degrades late (checks/mps_layernorm_bug.py, README
+# section 9).  With this on, _encode marks that input as requiring grad on MPS, which takes the
+# correct kernel; forward values are unchanged, and CPU is left exactly as it was (bit-identical
+# to Experimental_pipeline).  Switch it off only to reproduce the bug.
+MPS_LAYERNORM_WORKAROUND = True
+
 
 class PositionalEncoding(nn.Module):
     """Sinusoidal positional encoding, grown on demand if T exceeds max_len."""
@@ -118,6 +127,9 @@ class _TransformerStack(_Decoder):
         tokens = self._tokens(tokens)
         x = F.one_hot(tokens, num_classes=self.token_size).float() @ self.rand_prj
         x = self.pe(x)
+        if (MPS_LAYERNORM_WORKAROUND and x.device.type == "mps" and torch.is_grad_enabled()
+                and not x.requires_grad):
+            x.requires_grad_(True)       # a leaf (buffers only): see MPS_LAYERNORM_WORKAROUND
         mask = self._causal_mask(x.shape[1], x.device)
         for attn, ffn, ln1, ln2 in zip(self.attn_layers, self.ffn_layers,
                                        self.ln_attn, self.ln_ffn):
