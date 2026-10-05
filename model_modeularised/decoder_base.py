@@ -8,7 +8,9 @@ What every decoder shares, whatever turns tokens into per-position vectors.
                        (B,T) tokens -> (B,T,D) map -- the attention stack in
                        Transformer.py, the GRU in GRU.py.
 
-The discrete causal head that can sit on top of `_encode` is in causal_matrix.py.
+The discrete causal head that can sit on top of `_encode` is in causal_matrix.py.  Which
+outputs the loss counts is scoring.py's (score_start): the continuous data mode scores
+only the suffix of each row, the legacy mode every output.
 """
 import math
 
@@ -16,6 +18,8 @@ import lightning as L
 import torch
 import torch.nn.functional as F
 from torch.optim import AdamW
+
+from scoring import masked_ce_bits
 
 
 def cross_ent_onehot(logits, targets):
@@ -51,13 +55,28 @@ class _Decoder(L.LightningModule):
         lr, weight_decay   AdamW
         mode          "forward" reads left to right, "backward" right to left
         n_layers      depth of the encoder
+        score_start   the first output the loss counts (scoring.score_mask); 0 scores
+                      every output, the legacy objective
+        usage_scope   "all" or "scored": the positions the usage penalty averages over
+        learn_input_embedding   learn the token input map (transformer rand_prj as a
+                      Parameter; an identity-initialised V x V map in front of the GRUs)
+        lr_schedule, lr_min, schedule_horizon   "constant" (the legacy optimiser), or
+                      "cosine" to lr_min over schedule_horizon optimiser updates
     """
 
     def __init__(self, token_size=3, d_model=32, max_len=300, lr=1e-3,
-                 mode="forward", n_layers=2, weight_decay=0.0):
+                 mode="forward", n_layers=2, weight_decay=0.0,
+                 score_start=0, usage_scope="all", learn_input_embedding=False,
+                 lr_schedule="constant", lr_min=1e-5, schedule_horizon=None):
         super().__init__()
         if mode not in ("forward", "backward"):
             raise ValueError(f"mode must be 'forward' or 'backward', got {mode!r}")
+        if score_start < 0:
+            raise ValueError("score_start must be nonnegative")
+        if usage_scope not in ("all", "scored"):
+            raise ValueError("invalid usage scope")
+        if lr_schedule not in ("constant", "cosine"):
+            raise ValueError("invalid learning-rate schedule")
         self.mode         = mode
         self.token_size   = token_size
         self.d_model      = d_model
@@ -65,6 +84,12 @@ class _Decoder(L.LightningModule):
         self.lr           = lr
         self.n_layers     = n_layers
         self.weight_decay = weight_decay
+        self.score_start = int(score_start)
+        self.usage_scope = usage_scope
+        self.learn_input_embedding = bool(learn_input_embedding)
+        self.lr_schedule = lr_schedule
+        self.lr_min = float(lr_min)
+        self.schedule_horizon = None if schedule_horizon is None else int(schedule_horizon)
         self.last_encodings = None
 
     def _encode(self, tokens) -> torch.Tensor:
@@ -100,12 +125,26 @@ class _Decoder(L.LightningModule):
 
     def training_step(self, batch, batch_idx):
         inputs, targets = self._split(batch, self.mode)
-        loss, ppl = cross_ent_onehot(self(inputs), targets)
-        self.log("train_loss", loss, prog_bar=True, on_step=True, on_epoch=True)
-        self.log("train_perplexity", ppl, prog_bar=True, on_step=True, on_epoch=True)
-        return loss + self._extra_loss()
+        logits = self(inputs)  # includes every prefix token
+        if self.score_start == 0:
+            # Every output scored: the legacy reduction, kept so a legacy run stays bit-identical
+            # (the masked mean agrees numerically but sums in a different order).
+            ce, _ = cross_ent_onehot(logits, targets)
+            mask = None
+        else:
+            ce, mask = masked_ce_bits(logits, targets, self.score_start, self.mode)
+        extra = self._extra_loss(mask)
+        self.log("train_loss", ce, prog_bar=True, on_step=True, on_epoch=True)
+        self.log("train_perplexity", 2 ** ce, prog_bar=True, on_step=True, on_epoch=True)
+        # scored targets per row are T - score_start in either mode; arithmetic, so no device sync
+        n = targets.shape[0] * (targets.shape[1] - self.score_start)
+        return {
+            "loss": ce + extra,
+            "ce_sum": ce.detach() * n,
+            "scored_tokens": n,
+        }
 
-    def _extra_loss(self):
+    def _extra_loss(self, score_mask=None):
         """Architecture-specific loss term; 0 for a plain decoder."""
         return 0.0
 
@@ -131,5 +170,19 @@ class _Decoder(L.LightningModule):
         up (see training.diagnose_divergence); decoupled decay restores one.
         Its total effect scales with lr * weight_decay * steps, so a given lambda
         bites harder in a long run than a short one.
+
+        lr_schedule="cosine" (the continuous mode's regime, from the notebook GRU) anneals
+        the rate to lr_min over schedule_horizon UPDATES, stepped once per optimiser update.
+        The horizon may exceed the run (continuous mode: twice the budget, so the run
+        stops halfway down); training.train_model rejects one shorter than the run,
+        because CosineAnnealingLR rises again after T_max.  "constant" is the legacy optimiser.
         """
-        return AdamW(self.parameters(), lr=self.lr, weight_decay=self.weight_decay)
+        opt = AdamW(self.parameters(), lr=self.lr, weight_decay=self.weight_decay)
+        if self.lr_schedule == "constant":
+            return opt
+        if self.schedule_horizon is None or self.schedule_horizon < 2:
+            raise ValueError("a cosine learning rate needs a schedule horizon >= 2")
+        sched = torch.optim.lr_scheduler.CosineAnnealingLR(
+            opt, T_max=self.schedule_horizon, eta_min=self.lr_min)
+        return {"optimizer": opt,
+                "lr_scheduler": {"scheduler": sched, "interval": "step", "frequency": 1}}

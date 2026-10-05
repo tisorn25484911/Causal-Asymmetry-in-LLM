@@ -23,9 +23,13 @@ sequences or batches.  h[:, t] summarises tokens 0..t and is what the head reads
 to predict token t+1 -- the same context a tril-masked transformer has at t.
 
 What it deliberately does not have:
-  * a learned embedding.  The one-hot token goes straight in; the GRU's input
-    weights already are a learned linear map of it, so an Embedding in front
-    would be a second linear map (and at E < V a rank bottleneck on the tokens).
+  * a learned embedding, by default.  The one-hot token goes straight in; the GRU's
+    input weights already are a learned linear map of it, so an Embedding in front
+    is a second linear map (and at E < V a rank bottleneck on the tokens).
+    learn_input_embedding adds exactly that second map as an ablation: V x V,
+    identity at the start, so the initial computation is unchanged
+    (SHARED_TRAJECTORY_EMBEDDING_WARMUP_PLAN.md section 2).  The feedback GRU's
+    machine() reads tokens through the same map, so it stays exact.
   * a positional encoding.  Position is the order the recurrence reads in.
   * LayerNorm.  h_t is a convex blend of tanh outputs and h_{t-1}, so it stays
     in (-1, 1) by construction.
@@ -44,9 +48,15 @@ from causal_matrix import _DiscreteHead
 from decoder_base import _Decoder
 
 
+def symbol_vectors(tokens, vocab_size, embedding):
+    x = F.one_hot(tokens, num_classes=vocab_size).float()
+    return x if embedding is None else x @ embedding
+
+
 class _GRUStack(_Decoder):
     """
-    The encoder both GRU heads share: one-hot tokens -> nn.GRU -> (B,T,D).
+    The encoder both GRU heads share: one-hot tokens (through the optional learned
+    input map) -> nn.GRU -> (B,T,D).
 
     max_len is accepted and stored so a config (and training.train_model) builds
     either architecture with the same keywords; a GRU runs at any length, so
@@ -54,11 +64,22 @@ class _GRUStack(_Decoder):
     """
 
     def __init__(self, token_size=3, d_model=32, max_len=300, lr=1e-3,
-                 mode="forward", n_layers=1, weight_decay=0.0):
+                 mode="forward", n_layers=1, weight_decay=0.0,
+                 score_start=0, usage_scope="all", learn_input_embedding=False,
+                 lr_schedule="constant", lr_min=1e-5, schedule_horizon=None):
         super().__init__(token_size=token_size, d_model=d_model, max_len=max_len,
-                         lr=lr, mode=mode, n_layers=n_layers, weight_decay=weight_decay)
+                         lr=lr, mode=mode, n_layers=n_layers, weight_decay=weight_decay,
+                         score_start=score_start, usage_scope=usage_scope,
+                         learn_input_embedding=learn_input_embedding, lr_schedule=lr_schedule,
+                         lr_min=lr_min, schedule_horizon=schedule_horizon)
         self.gru = nn.GRU(input_size=token_size, hidden_size=d_model,
                           num_layers=n_layers, batch_first=True)
+        # None when off: no state-dict key, so legacy checkpoints still load
+        self.register_parameter(
+            "symbol_embedding",
+            nn.Parameter(torch.eye(token_size))
+            if self.learn_input_embedding else None,
+        )
 
     def _encode(self, tokens) -> torch.Tensor:
         """
@@ -70,7 +91,7 @@ class _GRUStack(_Decoder):
         with mode="forward"; see decoder_base._Decoder._split.)
         """
         tokens = self._tokens(tokens)
-        x = F.one_hot(tokens, num_classes=self.token_size).float()
+        x = symbol_vectors(tokens, self.token_size, self.symbol_embedding)
         if self.mode == "backward":
             x = x.flip(1)
         h, _ = self.gru(x)
@@ -137,9 +158,14 @@ class DiscreteFeedbackGRU(_DiscreteHead, _Decoder):
 
     def __init__(self, token_size=3, d_model=32, max_len=300, lr=1e-3,
                  mode="forward", n_layers=1, weight_decay=0.0,
-                 n_states=None, state_dim=None, tau=1.0, usage_beta=0.0):
+                 n_states=None, state_dim=None, tau=1.0, usage_beta=0.0,
+                 score_start=0, usage_scope="all", learn_input_embedding=False,
+                 lr_schedule="constant", lr_min=1e-5, schedule_horizon=None):
         super().__init__(token_size=token_size, d_model=d_model, max_len=max_len,
-                         lr=lr, mode=mode, n_layers=n_layers, weight_decay=weight_decay)
+                         lr=lr, mode=mode, n_layers=n_layers, weight_decay=weight_decay,
+                         score_start=score_start, usage_scope=usage_scope,
+                         learn_input_embedding=learn_input_embedding, lr_schedule=lr_schedule,
+                         lr_min=lr_min, schedule_horizon=schedule_horizon)
         if n_layers != 1:
             raise ValueError(f"DiscreteFeedbackGRU has one cell; n_layers must be 1, got {n_layers}")
         if state_dim not in (None, d_model):
@@ -147,11 +173,17 @@ class DiscreteFeedbackGRU(_DiscreteHead, _Decoder):
                              f"state, so state_dim must be d_model ({d_model}), got {state_dim}")
         self.cell = nn.GRUCell(input_size=token_size, hidden_size=d_model)
         self._init_causal_head(n_states, d_model, tau, usage_beta)
+        # None when off: no state-dict key, so legacy checkpoints still load
+        self.register_parameter(
+            "symbol_embedding",
+            nn.Parameter(torch.eye(token_size))
+            if self.learn_input_embedding else None,
+        )
         self.save_hyperparameters()
 
     def forward(self, tokens):
         tokens = self._tokens(tokens)
-        x = F.one_hot(tokens, num_classes=self.token_size).float()
+        x = symbol_vectors(tokens, self.token_size, self.symbol_embedding)
         if self.mode == "backward":
             x = x.flip(1)
         head, sampling = self.causal_head, self._sampling()
@@ -183,16 +215,18 @@ class DiscreteFeedbackGRU(_DiscreteHead, _Decoder):
             next_state[s, x]    the state after reading x in state s
             emission_probs[s]   P(next token | s)                 (= emission_table)
             start_state[x]      the state after reading x from the blank start
-        In the model's own reading order (mode="backward": right to left).
+        In the model's own reading order (mode="backward": right to left).  Tokens go
+        through the same input map as forward(), so a learned embedding is honoured.
         """
         K, V = self.n_states, self.token_size
         M = self.state_matrix
-        eye = torch.eye(V, device=M.device)
+        symbols = torch.arange(V, device=M.device)
+        vectors = symbol_vectors(symbols, V, self.symbol_embedding)
         next_state = torch.empty(K, V, dtype=torch.long)
         for x in range(V):
-            h = self.cell(eye[x].expand(K, V), M)
+            h = self.cell(vectors[x].expand(K, V), M)
             next_state[:, x] = self.causal_head.state_head(h).argmax(dim=-1).cpu()
-        h0 = self.cell(eye, torch.zeros(V, self.d_model, device=M.device))
+        h0 = self.cell(vectors, M.new_zeros(V, self.d_model))
         start = self.causal_head.state_head(h0).argmax(dim=-1).cpu()
         return {"next_state": next_state.numpy(), "start_state": start.numpy(),
                 "emission_probs": self.emission_table().cpu().numpy()}

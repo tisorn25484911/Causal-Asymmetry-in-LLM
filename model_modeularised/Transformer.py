@@ -74,20 +74,32 @@ class AttentionModel(nn.Module):
 
 class _TransformerStack(_Decoder):
     """
-    The encoder both transformer heads share: fixed random input projection, PE,
-    n_layers of pre-norm attention + FFN.  `_encode` gives (B,T,D).
+    The encoder both transformer heads share: a random input projection (fixed, or learned
+    with learn_input_embedding), PE, n_layers of pre-norm attention + FFN.  `_encode`
+    gives (B,T,D).
     """
 
     def __init__(self, token_size=3, d_model=32, max_len=300, lr=1e-3,
-                 mode="forward", n_layers=2, weight_decay=0.0):
+                 mode="forward", n_layers=2, weight_decay=0.0,
+                 score_start=0, usage_scope="all", learn_input_embedding=False,
+                 lr_schedule="constant", lr_min=1e-5, schedule_horizon=None):
         super().__init__(token_size=token_size, d_model=d_model, max_len=max_len,
-                         lr=lr, mode=mode, n_layers=n_layers, weight_decay=weight_decay)
+                         lr=lr, mode=mode, n_layers=n_layers, weight_decay=weight_decay,
+                         score_start=score_start, usage_scope=usage_scope,
+                         learn_input_embedding=learn_input_embedding, lr_schedule=lr_schedule,
+                         lr_min=lr_min, schedule_horizon=schedule_horizon)
 
-        # A BUFFER, not a Parameter: `one_hot @ rand_prj` as a Parameter is a
-        # learned embedding table, which is what this class is named for NOT
-        # being.  As a buffer, d_model varies representational capacity alone.
+        # By default a BUFFER, not a Parameter: `one_hot @ rand_prj` as a Parameter is
+        # a learned embedding table, and frozen, d_model varies representational capacity
+        # alone.  learn_input_embedding registers the SAME initial matrix as a Parameter
+        # (one draw either way, so the downstream initialisation is unchanged); the row
+        # normalisation is an initialisation only, not a constraint kept while training.
+        # Both use the state-dict key "rand_prj"; the saved hyperparameters say which.
         rand_prj = F.normalize(torch.randn(token_size, d_model), dim=1)
-        self.register_buffer("rand_prj", rand_prj)
+        if self.learn_input_embedding:
+            self.register_parameter("rand_prj", nn.Parameter(rand_prj))
+        else:
+            self.register_buffer("rand_prj", rand_prj)
 
         self.pe = PositionalEncoding(d_model=d_model, max_len=max_len)
         self.attn_layers = nn.ModuleList(
@@ -127,6 +139,8 @@ class _TransformerStack(_Decoder):
         tokens = self._tokens(tokens)
         x = F.one_hot(tokens, num_classes=self.token_size).float() @ self.rand_prj
         x = self.pe(x)
+        # A learned rand_prj already gives x a gradient (the correct kernel); the frozen
+        # buffer does not, and still needs the workaround.
         if (MPS_LAYERNORM_WORKAROUND and x.device.type == "mps" and torch.is_grad_enabled()
                 and not x.requires_grad):
             x.requires_grad_(True)       # a leaf (buffers only): see MPS_LAYERNORM_WORKAROUND

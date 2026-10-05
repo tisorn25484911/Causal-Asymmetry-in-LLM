@@ -71,12 +71,22 @@ class _learn_causal_state(nn.Module):
         self.last_causal_reps  = causal_rep
         return self.emission(causal_rep)
 
-    def usage_entropy(self):
+    def usage_entropy(self, mask=None):
         """
-        H(p_bar) in bits, p_bar the state occupancy of the last forward.
+        H(p_bar) in bits, p_bar the state occupancy of the last forward -- over every
+        position, or over the (B,T) `mask` (the scored positions, usage_scope="scored").
         Differentiable: p_bar is a mean of the straight-through one-hots.
         """
-        p_bar = self.last_state_onehot.reshape(-1, self.n_states).mean(dim=0)
+        values = self.last_state_onehot
+        if mask is None:
+            selected = values.reshape(-1, self.n_states)
+        else:
+            if mask.shape != values.shape[:-1]:
+                raise ValueError("usage mask shape mismatch")
+            selected = values[mask]
+        if selected.shape[0] == 0:
+            raise ValueError("empty usage region")
+        p_bar = selected.mean(dim=0)
         return -(p_bar * torch.log2(p_bar + 1e-12)).sum()
 
     def emission_table(self):
@@ -119,23 +129,26 @@ class _DiscreteHead:
         """Gumbel noise only while training, and only when switched on."""
         return bool(self.gumbel and self.training)
 
-    def usage_penalty(self):
+    def usage_penalty(self, mask=None):
         """
-        (H(p_bar), penalty).  H is reported rather than the KL because it is the
-        quantity directly comparable to C.
+        (H(p_bar), penalty), the penalty +beta * H, which penalises state-usage entropy.
+        H is reported rather than the KL because it is the quantity directly comparable
+        to C.  `mask` restricts p_bar to the scored positions (usage_scope="scored").
 
-        beta is 1/(batch * seq_len) -- one over the count the cross-entropy
-        itself averages over -- and is COMPUTED, never a literal: it is bounded
-        above by an optimisation cliff (~6e-4 at lr=1e-3) above which the
-        bottleneck collapses to a single state.
+        beta is a controlled coefficient passed in, not a universal optimum.  The legacy
+        runner resolves it as 1/(batch * seq_len) = 1/9600; the continuous mode fixes
+        1/9600 explicitly, because recomputing it from the new batch geometries would
+        silently strengthen it (1/1280 at GRU batch 128 is 7.5 times stronger).  Any
+        collapse threshold measured for it belongs to the experiment that measured it.
         """
-        H = self.causal_head.usage_entropy()
+        H = self.causal_head.usage_entropy(mask)
         if self.usage_beta == 0.0:
             return H, H * 0.0                      # keeps the graph
         return H, self.usage_beta * H
 
-    def _extra_loss(self):
-        H, penalty = self.usage_penalty()
+    def _extra_loss(self, score_mask=None):
+        mask = score_mask if self.usage_scope == "scored" else None
+        H, penalty = self.usage_penalty(mask)
         self.log("state_usage_entropy", H, prog_bar=True, on_step=True, on_epoch=True)
         return penalty
 

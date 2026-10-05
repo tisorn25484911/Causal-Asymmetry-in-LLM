@@ -11,6 +11,12 @@ The main models are the **transformer** and the **feedback GRU**. Every model tr
 the deterministic argmax head (since 2026-09-28; Gumbel-softmax sampling is an option). Both use one shared
 causal-state head, one training loop, the same data and the same scoring. Every theoretical quantity comes from `HMM_processes.py`.
 
+Two data modes. The **legacy** mode (the default, described in sections 1-9) trains on 1000
+independent draws. The **continuous** mode (`--data-mode continuous`, section 10; implemented
+2026-10-03 from `SHARED_TRAJECTORY_EMBEDDING_WARMUP_PLAN.md`) cuts every model's samples from one
+long trajectory, scores only predictions with enough context, and trains all three models with one
+regime, Gumbel-ST included.
+
 ---
 
 ## 1. Quick start
@@ -24,6 +30,8 @@ python run_model.py --name default               # the same grid, one run after 
 python run_model.py --name default --arch gru_feedback --process coin --arm backward   # one run
 python run_model.py --name default --plots-only  # redraw every figure from the saved runs
 python run_model.py --smoke                      # 2-epoch plumbing check -> checks/results/smoke/
+python run_model.py --name cont --data-mode continuous --process renewal --num-states-mult 8   # section 10
+python run_model.py --smoke --data-mode continuous   # 40-update plumbing check of the continuous mode
 pytest tests/ -q                                 # unit tests
 ```
 
@@ -59,6 +67,9 @@ model_modeularised/
   decoder_base.py         loss, training step, optimiser, shared by every model
   training.py             train_model, Recorder (curves, best checkpoint), CE helpers
   tau_schedue.py          the straight-through temperature schedule
+  data_views.py           continuous mode: one trajectory, its 80/10/10 split, per-architecture views,
+                          the per-epoch random shift, the canonical saved draw
+  scoring.py              which outputs are scored (score_start) and the masked cross-entropy
   extraction.py           states, transition matrices, empirical/exact machines, scoring
   theory.py               a process's closed forms, from HMM_processes.py
   plotting.py             every figure
@@ -70,9 +81,9 @@ model_modeularised/
   checks/results/         everything the checks write: smoke/, crosscheck/, diagnostics/, ablations/
 ```
 
-**What a run needs:** only the 12 `.py` files at the top level. It needs none of `tests/`,
+**What a run needs:** only the 14 `.py` files at the top level. It needs none of `tests/`,
 `checks/` or `scripts/`, and nothing outside this folder. This was verified by running from a
-copy that holds those 12 files alone. The packages are numpy, scipy, torch, lightning,
+copy that holds those 14 files alone (2026-10-03, a continuous-mode smoke run). The packages are numpy, scipy, torch, lightning,
 matplotlib and networkx (plus pytest for `tests/`).
 - `scripts/` is a convenience: it runs `run_model.py` in parallel.
 - `tests/` re-verifies the code after you change it.
@@ -91,6 +102,7 @@ figures/<process>/theory_comparison_s<seed>.png   every model against that theor
 figures/<process>/<arch>/<arm>_s<seed>_{training,states,machine}.png
 figures/<process>/<arch>/s<seed>_{per_position,transitions,complexity}.png
                                             (+ s<seed>_transitions_exact.png for gru_feedback)
+data/<process>_<hash>.npz                   continuous mode: the one saved trajectory (section 10)
 ```
 
 Rule: `results/` only ever holds runs of the real pipeline. Smoke runs, cross-checks,
@@ -486,6 +498,139 @@ Gumbel-ST fixes it for the feedback GRU on every arm tested.
   All of this is one seed.
 - The default results are **one seed**. Use `--seed` / `SEED=` for repeats before
   drawing conclusions.
+
+## 10. The continuous data mode (`--data-mode continuous`)
+
+Implemented 2026-10-03 from `SHARED_TRAJECTORY_EMBEDDING_WARMUP_PLAN.md`, which gives the reason
+for every choice; its section 0 holds the study6 evidence (`tau_experiment/study6_gru_match/`).
+
+```bash
+python run_model.py --name cont9 --data-mode continuous --process renewal \
+    --params 'F=[0.04,0.08,0.12,0.16,0.2,0.16,0.12,0.08,0.04]' --num-states-mult 8   # the 9-state renewal, K = 16
+python run_model.py --smoke --data-mode continuous                                    # 40-update plumbing check
+```
+
+### What changes
+
+| | legacy (default) | continuous |
+|---|---|---|
+| data | 1000 independent 301-token draws, seeded 80/20 split by sequence | ONE 300,000-token draw per process (`results/<name>/data/`, saved once and verified on reuse), split 80/10/10 by token range before any sample is cut |
+| transformer samples | the 301-token draws | 301-token blocks, stride 301 |
+| GRU samples | the 301-token draws | 30-token windows (20 of context + 10 scored), training stride 1, validation/test stride 10 |
+| training rows | fixed | re-cut at a random offset every epoch, so no block is ever repeated exactly (`--no-random-shift`: fixed cuts) |
+| scored outputs | every output | transformer outputs ≥ 20, GRU outputs ≥ 19: every scored prediction has ≥ 20 tokens of context; the prefix stays in the forward pass and the graph |
+| batch / width | 32 / d_model 16 | transformer 32 / 16, GRUs 128 / 32 |
+| head sampler | argmax | Gumbel-ST, all three |
+| optimiser | AdamW wd 0.01, constant lr 1e-3 | AdamW wd 5e-4, cosine lr 1e-3 → 1e-5, gradient clipping 1.0 |
+| τ | GRUs `geom:5:0.5`, transformer `geomhold:5:0.5:0.8` | `geom:2.25:0.1`, all three |
+| budget | 1200 epochs | 30,000 updates (`--max-steps`, or an explicit `--max-epochs`) |
+| schedule horizon | the run | 2 × the budget: the run stops at τ ≈ 0.474, lr ≈ 5.05e-4 |
+| usage penalty | β = 1/(batch × seq_len), every position | β = 1/9600 fixed, scored positions |
+| checkpoint | selected on the test split | selected on the validation split, scored on the test split |
+| learned input map | off; `--learn-input-embedding` | off; `--learn-input-embedding` switches all three together |
+
+An explicitly given flag always wins over the continuous defaults, and the overrides are saved with
+the run (`regime.explicit_overrides`). The flags: `--[no-]gumbel-{transformer,gru}`, `--weight-decay`,
+`--lr-schedule`, `--lr-min`, `--gradient-clip-val`, `--schedule-horizon-mult`, `--gru-d-model`,
+`--transformer-d-model`, `--[no-]random-shift`, `--usage-scope`, `--usage-beta`, `--max-steps`,
+`--total-tokens`, `--{transformer,gru}-{raw-window,stride,batch-size,score-start}`, `--gru-eval-stride`,
+`--train-fraction`, `--val-fraction`, `--generation-context`, `--[no-]final-validation`. A binary process
+with 9 causal states needs `--num-states-mult 8` (K = 16).
+
+### What is measured
+
+- **CE**: test and exact CE on the scored outputs; `test_ce_all_positions` / `exact_ce_all_positions`
+  are the explicitly labelled all-output diagnostic. Never compare a masked score with a legacy all-output one.
+- **Common profile** (`common_*`): every model is also scored on the test split cut into 301-token
+  blocks, outputs ≥ 20, so every architecture is scored on identical targets and context (user,
+  2026-10-03: study6's profile). The scorecard and the theory comparison compare architectures on it
+  when the profile ids match; otherwise their panels say "native layouts".
+- **Fresh windows**: as many native windows as the test split has rows (user, 2026-10-03), with the
+  exact model on the same windows (`fresh_gap_exact`).
+- **States and machine**: read on the scored positions of the training rows (the fixed cuts);
+  transitions only between physically adjacent scored positions. The symbolic CE on the test rows counts
+  only what the machine covers: no stand-in for an unseen start state, and an unseen transition ends the
+  rollout. `symbolic_ce` is NaN unless the whole span is covered; `symbolic_ce_covered` is the covered part.
+- **Collapse gate**: states in use on the validation split at every validation. `collapse_flagged` when
+  the selected checkpoint uses ≤ min(2, k − 1) states: at most 2, and fewer than the arm's k causal states,
+  so a 2-state process (coin forward) is collapsed only at 1 state (user, 2026-10-03). The early plateau
+  every run starts on is recorded (`first_val_above_collapse`, `n_val_collapsed`), not flagged.
+- **Overfitting monitor**: CE on a fixed subset of training rows against the exact model on the same
+  rows; `overfit_flagged` when it falls more than 0.001 bits below at some validation (user, 2026-10-03:
+  a near-exact model scatters about ±0.0002 around it by noise; study6's memorisation sat 0.006-0.025
+  below). `train_probe_min_excess` keeps the number.
+- **Transition extraction** free-runs on a 300-token context (`--generation-context`); for the
+  GRUs trained on 30-token windows that is a context-length generalisation test.
+
+Saved runs carry `schema_version: 2` and `view`, `data_manifest` (raw hash and path, splits, window
+starts, offsets drawn, view hash, common-profile id), `scoring`, `regime` (resolved values, requested and
+actual updates, horizon, τ and lr at the final update, scored-token exposure), `collapse` and
+`overfitting`. The JSON summarises long arrays; the pickle keeps them. The figures label each run's view
+and shade the unscored prefix in the per-position plots.
+
+### The full continuous rerun (2026-10-03)
+
+Every process of the legacy result sets in the continuous mode: all three models, both arms, seeds 0-2,
+72 runs (`scripts/schedule_continuous.sh` -> `results/cont_default/`: coin, flower(3,4), the 5-state
+renewal at K = 4V; `results/cont_renewal9/`: the 9-state renewal at K = 16). It took 3 h 44 min. Runs
+that recovered every causal state, of 3 seeds:
+
+| process (k fw/bw) | arm | transformer | feedback GRU | read-out GRU |
+|---|---|---|---|---|
+| coin (2/3) | fw / bw | 3/3 / 3/3 | 3/3 / 3/3 | 3/3 / 3/3 |
+| flower(3,4) (4/5) | fw / bw | 1/3 / 1/3 | 3/3 / 2/3 | 3/3 / 2/3 |
+| 5-state renewal (5/5) | fw / bw | 0/3 / 3/3 | 3/3 / 3/3 | 3/3 / 3/3 |
+| 9-state renewal (9/9) | fw / bw | 0/3 / 0/3 | 3/3 / 3/3 | 3/3 / 3/3 |
+
+- The GRUs recover every state in 46 of 48 runs, the 9-state renewal included. Every such run is within
+  +0.0005 bits of the exact model on the common profile.
+- The transformer does so in 11 of 24 runs.
+- Every miss (13 transformer runs, 2 GRU runs on flower backward) is a collapse to 2 states, flagged by the
+  collapse gate. This is the early plateau of the plan's Experiment D.
+- No run is flagged for overfitting.
+
+### Safety rails
+
+- A run directory that already holds a run with a different configuration is refused: use another `--name`.
+- A stored trajectory whose metadata or hash differs is refused, never replaced.
+- `--max-steps` together with `--max-epochs` is refused, and so is a schedule horizon shorter than the budget.
+
+### The legacy mode is unchanged
+
+Checked on 2026-10-03 against the committed code (git HEAD): tiny legacy trainings of every
+architecture, argmax and Gumbel, are bit-identical (losses, validation, τ, state counts, checkpoint,
+weights), and a full legacy `run_arm` (training and analysis) of every architecture and arm gives
+identical values for every metric, history entry, weight and machine; it only adds five collapse
+diagnostics. The one deliberate change: the final step is validated when the validation cadence misses
+it. `--no-final-validation` restores the old cadence. The standard 30,000-update runs are unaffected,
+because their last step is on the cadence.
+
+### Tests
+
+`tests/test_scoring.py` (which outputs are scored, masked CE), `tests/test_data_views.py` (split,
+views, both arms, the random shift under a real Lightning fit, the saved trajectory),
+`tests/test_continuous.py` (masked gradients, learned input maps, budgets and horizons, the
+learning-rate schedule, the regime and its flags, collapse and overfitting, adjacency and symbolic
+coverage, collisions, checkpoints, MPS against CPU) and `tests/test_plot_compatibility.py` (both
+schemas redrawn from their pickles). `pytest tests/ -q`: 445 passed on 2026-10-03.
+
+### Verified end to end against study6 (2026-10-03)
+
+The 9-state renewal (F = 0.04, 0.08, 0.12, 0.16, 0.20, 0.16, 0.12, 0.08, 0.04), forward arm, K = 16,
+30,000 updates, all continuous defaults (`checks/results/verify_cont9*/`). The canonical trajectory
+is bit-identical to study6's (`tau_experiment/study6_gru_match/data/renewal9_seed1.npz`).
+
+| model | seeds | all 9 states found | CE − exact, test / common profile (bits) | study6, same settings |
+|---|---|---|---|---|
+| feedback GRU | 0, 1 | 2/2 | +0.0002 / +0.0002 | 2/2, +0.0002 |
+| read-out GRU | 0, 1 | 2/2 | +0.0002, +0.0001 / +0.0002, +0.0000 | 2/2, +0.0004 / +0.0001 |
+| transformer, frozen input map | 0, 1 | 0/2 (both stayed at 2 states) | +0.084 | – |
+| transformer, learned input map | 0-3 | 1/4 (seed 3: 9 states, −0.0000; seeds 0-2 at 2 states) | −0.0000 (seed 3), +0.084 | 1/2 left the plateau (8 states, +0.0011) |
+
+The GRUs reproduce study6, here with β = 1/9600 (study6's GRUs used β = 0). The transformer can
+recover every state, but whether a seed leaves the early 2-state plateau is chance: that is the
+open problem of the plan's Experiment D.
+
 
 ## References
 

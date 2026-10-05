@@ -25,6 +25,7 @@ Every theoretical quantity comes from HMM_processes.py (theory.process_theory, a
 extraction.theory_from_generator for the per-arm machine stored in each result).
 """
 import os
+import textwrap
 
 import matplotlib.pyplot as plt
 import numpy as np
@@ -44,6 +45,58 @@ def _title(r) -> str:
     return f"{ARCH_LABEL[r['arch']]} · {r['tag']} · {r['arm']}"
 
 
+def view_label(r):
+    """What a run trained and was scored on: its own view (continuous mode), or the legacy
+    shared geometry."""
+    v = r.get("view")
+    if v is None:
+        return f"{r['cfg']['num_samples']} x {r['cfg']['seq_len']} (legacy)"
+    return (
+        f"input {v['input_len']}, skip {v['score_start']}, "
+        f"stride {v['stride']}, batch {v['batch_size']}, "
+        f"{r['metrics']['n_steps']} updates"
+    )
+
+
+def _view_cell(r):
+    """view_label, compacted for a table cell."""
+    v = r.get("view")
+    if v is None:
+        return view_label(r)
+    return f"{v['input_len']}+1 · skip {v['score_start']} · stride {v['stride']} · b{v['batch_size']} · " \
+           f"{r['metrics']['n_steps']} upd"
+
+
+def _matched_cells(results):
+    """True when, in every (process, arm) cell, the runs share one common-profile id: their
+    cross-architecture CE is then a matched comparison (run_model.COMMON_EVAL).  Cells, not the
+    whole page: different processes have different data, hence different ids."""
+    cells = {}
+    for r in results:
+        cells.setdefault((r["tag"], r["arm"]), set()).add(r["metrics"].get("common_manifest_id"))
+    return bool(cells) and all(len(ids) == 1 and None not in ids for ids in cells.values())
+
+
+def _ce_gap_panel(results):
+    """(metric key, panel title) for the CE comparison across runs: the common profile when
+    every cell's runs share one, else each run's native layout, labelled as such when the views
+    differ (never ranked as a matched comparison)."""
+    if _matched_cells(results):
+        return "common_gap_exact", "CE − exact, common profile (test blocks of 301, outputs ≥ 20)"
+    if len({view_label(r).split(", ")[0] if r.get("view") else "legacy" for r in results}) > 1:
+        return "gap_exact", "test CE − exact (native layouts: different contexts/targets)"
+    return "gap_exact", "test CE − exact model CE (same tokens)"
+
+
+def _symbolic(m) -> str:
+    """The symbolic CE, or why it is unavailable (never shown as 0)."""
+    if np.isfinite(m.get("symbolic_ce", np.nan)):
+        return f"{m['symbolic_ce']:.3f}"
+    if "symbolic_n_span" in m:
+        return f"unavailable (coverage {m['symbolic_n_covered']}/{m['symbolic_n_span']})"
+    return "unavailable"
+
+
 def _what(arm: str) -> str:
     return "next token" if arm == "forward" else "previous token"
 
@@ -61,6 +114,11 @@ def _heat(ax, M, xticks, yticks, title, cmap="Blues", vmax=1.0):
     ax.set_xticks(range(V)); ax.set_xticklabels([str(t) for t in xticks], fontsize=7)
     ax.set_yticks(range(K)); ax.set_yticklabels([str(t) for t in yticks], fontsize=7)
     ax.set_title(title, fontsize=10)
+
+
+def _tick(tag: str, arm: str, width: int = 16) -> str:
+    """A (process tag, arm) axis label, the tag wrapped at its commas so long ones do not collide."""
+    return "\n".join(textwrap.wrap(tag.replace(",", ", "), width, break_long_words=False)) + f"\n{arm}"
 
 
 def _merged_labels(r):
@@ -99,6 +157,8 @@ def plot_training(r):
     ax.axhspan(H - tol, H + tol, color=_GREY, alpha=0.55, lw=0, label="H_inf ± conv_tol")
     ax.axhline(H, color=_INK, lw=1.2, ls=(0, (5, 2)))
     ax.plot(h["step_at"], h["step_loss"], color=_BLUE, lw=0.7, alpha=0.5, label="train objective")
+    if h.get("step_ce"):                      # the prediction CE alone, without the usage penalty
+        ax.plot(h["step_at"], h["step_ce"], color=_TEAL, lw=1.0, alpha=0.6, label="train prediction CE")
     if h["val_at"]:
         ax.plot(h["val_at"], h["val_loss"], color=_ORNG, lw=2.0, label="validation CE")
     if h.get("best_step", -1) >= 0:
@@ -118,12 +178,18 @@ def plot_training(r):
     ax.set_title(f"tau  ({cfg['tau']})", fontsize=10); ax.grid(alpha=0.25)
 
     ax = axes[2]
-    n = min(len(h["val_at"]), len(h["states_used"]))
-    ax.plot(h["val_at"][:n], h["states_used"][:n], color=_BLUE, lw=1.2, drawstyle="steps-post")
+    at = h.get("states_at") or h["val_at"]             # legacy records: the validation steps
+    n = min(len(at), len(h["states_used"]))
+    ax.plot(at[:n], h["states_used"][:n], color=_BLUE, lw=1.2, drawstyle="steps-post",
+            label="training batch")
+    if h.get("val_states_in_use"):                     # the collapse gate's count
+        ax.plot(h["val_at"], h["val_states_in_use"], color=_ORNG, lw=1.2, drawstyle="steps-post",
+                label="validation, scored positions")
     ax.axhline(m["true_k"], color=_INK, lw=1.2, ls=(0, (5, 2)), label=f"true k = {m['true_k']}")
     ax.set_ylim(0, m["K"] + 0.5)
-    ax.set_xlabel("gradient step"); ax.set_ylabel("states in the training batch")
-    ax.set_title(f"states used  (budget K = {m['K']})", fontsize=10)
+    ax.set_xlabel("gradient step"); ax.set_ylabel("states in use")
+    flag = "  — COLLAPSED at the selected checkpoint" if m.get("collapse_flagged") else ""
+    ax.set_title(f"states used  (budget K = {m['K']}){flag}", fontsize=10)
     ax.grid(alpha=0.25); ax.legend(fontsize=8)
 
     ax = axes[3]
@@ -285,7 +351,7 @@ def plot_machine_graph(r):
     _draw_machine(axes[0], machine["next_state"], machine["emission_probs"], r["minimal_stationary"],
                   _state_labels(r),
                   f"learned: {machine['next_state'].shape[0]} states, determinism {m['determinism']:.3f}\n"
-                  f"symbolic CE {m['symbolic_ce']:.3f} vs neural {m['neural_ce_span']:.3f} "
+                  f"symbolic CE {_symbolic(m)} vs neural {m['neural_ce_span']:.3f} "
                   f"vs exact {m['exact_ce_span']:.3f}"
                   + ("" if merged or "n_merges" not in m else "\n(the notebook's merge leaves it unchanged)"))
     if merged:
@@ -319,6 +385,12 @@ def plot_per_position(runs, theory=None):
         r = runs[arm]
         pp, H = r["per_position"], r["metrics"]["entropy_rate"]
         t = np.arange(1, len(pp["neural"]) + 1)
+        mask = np.asarray(pp.get("score_mask", np.ones(len(t), dtype=bool)))
+        excluded = np.flatnonzero(~mask)
+        if excluded.size:
+            # New runner: one contiguous excluded prefix in reading order.
+            ax.axvspan(1, t[excluded[-1]] + 0.5, color="grey", alpha=0.15,
+                       label="context only (excluded from primary CE)")
         ax.plot(t, pp["neural"], color=ARCH_COLOR[r["arch"]], lw=2.0, label=ARCH_LABEL[r["arch"]])
         ax.plot(t, pp["exact"], color=_INK, lw=1.2, label="exact model, these sequences")
         if theory is not None:
@@ -504,12 +576,14 @@ def plot_theory_comparison(runs_by_arch, theory, tag):
     ax.set_title("states after the merge: discovered vs k (dashed)", fontsize=10); ax.grid(axis="y", alpha=0.25)
 
     ax = axes[3]
+    gap_key, gap_title = _ce_gap_panel([runs_by_arch[a][arm] for a in archs for arm in arms
+                                        if arm in runs_by_arch[a]])
     for i, arch in enumerate(archs):
-        ax.bar(x + off(i), [get(arch, a, "gap_exact") for a in arms], width=w * 0.92,
+        ax.bar(x + off(i), [get(arch, a, gap_key) for a in arms], width=w * 0.92,
                color=ARCH_COLOR[arch], label=ARCH_LABEL[arch])
     ax.axhline(0, color=_INK, lw=0.8)
     ax.set_xticks(x); ax.set_xticklabels(arms); ax.set_ylabel("bits / token")
-    ax.set_title("test CE − exact model CE (same tokens)", fontsize=10); ax.grid(axis="y", alpha=0.25)
+    ax.set_title("\n".join(textwrap.wrap(gap_title, 46)), fontsize=10); ax.grid(axis="y", alpha=0.25)
 
     note = ("\n" + "   ".join("⚠ " + w_ for w_ in theory["warnings"])) if theory["warnings"] else ""
     fig.suptitle(f"{tag}: learned vs theory (HMM_processes)   {_theory_line(theory)}{note}", fontsize=11)
@@ -552,9 +626,13 @@ def scorecard_table(results):
                 "T max err": m["transition_max_err"],
                 "T err exact": m.get("exact_T_err", float("nan")), "CE - H_inf": m["gap"],
                 "CE - exact": m["gap_exact"], "fresh CE - H_inf": m["fresh_gap"],
+                "CE - exact common": m.get("common_gap_exact", float("nan")),
                 "determinism": m["determinism"], "best step": f"{m['best_step']}/{m['n_steps']}",
                 "params": r.get("n_params", float("nan")),
                 "minutes": r.get("train_seconds", float("nan")) / 60.0,
+                "view": _view_cell(r),
+                "input map": "learned" if r["cfg"].get("learn_input_embedding") else "frozen",
+                "usage scope": r.get("scoring", {}).get("usage_scope", "all"),
             })
     return rows
 
@@ -567,12 +645,14 @@ def plot_scorecard(results):
     archs = [a for a in ARCH_COLOR if any((c, a) in by for c in cells)]
     x = np.arange(len(cells))
     w = 0.8 / max(1, len(archs))
-    fig = plt.figure(figsize=(19, 8.8))
+    continuous = any(r.get("view") is not None for r in results)
+    fig = plt.figure(figsize=(23 if continuous else 19, 8.8))       # wider: the per-row view column
     gs = fig.add_gridspec(2, 3, height_ratios=[1.0, 0.95])
+    gap_key, gap_title = _ce_gap_panel(results)
     panels = [
         ("discovered / true k", lambda m: m["discovered"] / m["true_k"], (0, 1.3), None),
         ("S_emp − C after the merge (bits; ○ raw)", lambda m: m.get("merged_S_minus_C", m["S_minus_C"]), None, 0.05),
-        ("test CE − exact CE  (bits)", lambda m: m["gap_exact"], None, None),
+        ("\n".join(textwrap.wrap(gap_title + "  (bits)", 60)), lambda m: m.get(gap_key, np.nan), None, None),
     ]
     for col, (label, fn, ylim, band) in enumerate(panels):
         ax = fig.add_subplot(gs[0, col])
@@ -594,7 +674,7 @@ def plot_scorecard(results):
                                 f"{mm['discovered']}/{mm['true_k']}" + (" ✓" if mm["full"] else ""),
                                 ha="center", va="bottom", fontsize=8, color=_INK)
         ax.axhline(0, color=_INK, lw=0.8)
-        ax.set_xticks(x); ax.set_xticklabels([f"{c[0]}\n{c[1]}" for c in cells], fontsize=8)
+        ax.set_xticks(x); ax.set_xticklabels([_tick(*c) for c in cells], fontsize=7)
         if ylim:
             ax.set_ylim(*ylim)
         ax.set_title(label, fontsize=10); ax.grid(axis="y", alpha=0.25)
@@ -610,10 +690,13 @@ def plot_scorecard(results):
         cols = ["process", "arm", "arch", "FULL", "FULL raw", "discovered", "emission TV", "states raw→merged",
                 "S_emp - C", "S_emp - C raw", "T max err", "T err exact", "CE - H_inf", "CE - exact",
                 "fresh CE - H_inf", "determinism", "best step", "params", "minutes"]
+        if continuous:                        # schema-2 runs: each row's own view, and the matched CE
+            cols[cols.index("fresh CE - H_inf")] = "CE - exact common"
+            cols.insert(3, "view")
         fmts = {"emission TV": "{:.3f}", "S_emp - C": "{:+.3f}", "S_emp - C raw": "{:+.3f}", "T max err": "{:.3f}",
                 "T err exact": "{:.3f}", "CE - H_inf": "{:+.4f}",
-                "CE - exact": "{:+.4f}", "fresh CE - H_inf": "{:+.4f}", "determinism": "{:.3f}",
-                "params": "{:,}", "minutes": "{:.1f}"}
+                "CE - exact": "{:+.4f}", "fresh CE - H_inf": "{:+.4f}", "CE - exact common": "{:+.4f}",
+                "determinism": "{:.3f}", "params": "{:,}", "minutes": "{:.1f}"}
         def cell(c, v):
             if c in ("FULL", "FULL raw"):
                 return "FULL" if v else "–"
@@ -635,11 +718,22 @@ def plot_scorecard(results):
     r0 = results[0]
     per_arch = {}
     for r in results:                         # schedule and length can differ by architecture
-        per_arch.setdefault(ARCH_LABEL[r["arch"]], f"tau {r['cfg']['tau']}, {r['cfg']['max_epochs']} ep")
-    fig.suptitle("Discrete models on one data draw per process — "
-                 + "; ".join(f"{k}: {v}" for k, v in per_arch.items())
-                 + f" | K = {r0['cfg']['num_states_mult']}V, {r0['cfg']['num_samples']} x {r0['cfg']['seq_len']} "
-                   f"tokens, seed {r0['cfg']['random_seed']}", fontsize=11)
+        if r.get("regime"):
+            per_arch.setdefault(ARCH_LABEL[r["arch"]], f"tau {r['regime']['tau']}, {r['regime']['update_budget']} "
+                                f"updates (horizon {r['regime']['schedule_horizon']})")
+        else:
+            per_arch.setdefault(ARCH_LABEL[r["arch"]], f"tau {r['cfg']['tau']}, {r['cfg']['max_epochs']} ep")
+    if continuous:
+        maps = sorted({row["input map"] for row in rows})
+        scopes = sorted({row["usage scope"] for row in rows})
+        data = (f"one {r0['cfg'].get('total_tokens', 0):,}-token trajectory per process, views per row, "
+                f"input map {'/'.join(maps)}, usage scope {'/'.join(scopes)}")
+    else:
+        data = f"{r0['cfg']['num_samples']} x {r0['cfg']['seq_len']} tokens"
+    title = ("Discrete models on one data draw per process — "
+             + "; ".join(f"{k}: {v}" for k, v in per_arch.items())
+             + f" | K = {r0['cfg']['num_states_mult']}V, {data}, seed {r0['cfg']['random_seed']}")
+    fig.suptitle("\n".join(textwrap.wrap(title, 190)), fontsize=11)
     fig.tight_layout()
     return fig
 

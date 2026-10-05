@@ -8,10 +8,16 @@ Experimental_pipeline/training.py; the learning-rate schedules were left there).
     Recorder      training / validation curves, the tau and gradient-norm traces,
                   and the best-validation snapshot
     eval_ce, per_position_ce   cross-entropy in bits
+
+The budget is either epochs (legacy) or an exact number of optimiser updates
+(`max_steps`, the continuous mode's 30,000), and the tau and learning-rate schedules
+are indexed to a declared horizon that may exceed it (SHARED_TRAJECTORY_EMBEDDING_
+WARMUP_PLAN.md section 6).
 """
 import contextlib
 import gc
 import json
+import math
 import os
 import pickle
 import random
@@ -24,6 +30,7 @@ import torch.utils.data as tud
 import GRU
 import Transformer
 from decoder_base import cross_ent_onehot
+from scoring import masked_ce_bits, score_mask
 from tau_schedue import TauSchedule, is_scheduled, parse_tau
 
 # The ONLY place that maps an architecture name to its builder.
@@ -126,33 +133,53 @@ def quiet(enabled: bool = True):
 # ══════════════════════════════════════════════════════════════════════════
 # EVALUATION / DIAGNOSTICS
 # ══════════════════════════════════════════════════════════════════════════
-def eval_ce(model, loader) -> tuple[float, float]:
+def eval_ce(model, loader, score_start=None, count_states=False):
     """
-    (dataset-level cross-entropy in bits, matching perplexity 2**CE).
+    (dataset-level cross-entropy in bits, matching perplexity 2**CE) over the outputs
+    the model's scoring policy counts (scoring.score_mask with model.score_start; 0, the
+    legacy policy, counts every output).  `score_start` overrides the policy for this one
+    evaluation -- the all-position diagnostic, a common-context probe -- without touching
+    the model's stored one.  count_states=True appends the number of distinct states the
+    model used on those scored positions (the collapse gate), or None for a model with no
+    explicit states.
 
     Token-weighted, and the perplexity is taken from the AGGREGATED CE, so
     PPL = 2**CE holds by construction (mean(2**CE_batch) is biased high).
     """
+    s0 = int(getattr(model, "score_start", 0) if score_start is None else score_start)
+    mode = getattr(model, "mode", "forward")
     was_training = model.training
     model.eval()
     device = next(model.parameters()).device
     total_ce, total_tok = 0.0, 0
+    K = int(getattr(model, "n_states", 0) or 0) if count_states else 0
+    used = torch.zeros(K, dtype=torch.bool, device=device) if K else None
 
     with torch.no_grad():
         for batch in loader:
-            inputs, targets = model._split(batch, getattr(model, "mode", "forward"))
+            inputs, targets = model._split(batch, mode)
             inputs, targets = inputs.to(device), targets.to(device)
-            loss, _ = cross_ent_onehot(model(inputs), targets)
-            n = targets.numel()
+            logits = model(inputs)
+            if s0 == 0:
+                loss, _ = cross_ent_onehot(logits, targets)
+                mask = None
+                n = targets.numel()
+            else:
+                loss, mask = masked_ce_bits(logits, targets, s0, mode)
+                n = targets.shape[0] * (targets.shape[1] - s0)
             total_ce  += loss.item() * n
             total_tok += n
+            if used is not None:
+                st = model.last_states
+                used[(st if mask is None else st[mask]).reshape(-1)] = True
 
     if was_training:
         model.train()
-    if total_tok == 0:
-        return float("nan"), float("nan")
-    ce = total_ce / total_tok
-    return ce, 2.0 ** ce
+    ce = float("nan") if total_tok == 0 else total_ce / total_tok
+    out = (ce, 2.0 ** ce)
+    if count_states:
+        return out + ((int(used.sum().item()) if used is not None else None),)
+    return out
 
 
 def per_position_ce(model, loader) -> np.ndarray:
@@ -205,32 +232,82 @@ class Recorder(L.Callback):
     With `keep_best` the weights are snapshotted at every validation point that
     improves on the best so far, so train_model can hand back the model at its
     validation minimum.  The snapshot is selected on `val_loader`, so a CE
-    reported on that same loader is a selected quantity; score a fresh draw of
-    the process for an unbiased one.
+    reported on that same loader is a selected quantity; score a held-out split
+    or a fresh draw of the process for an unbiased one.
+
+    Also recorded (the continuous mode reads them; plan sections 8 and 12.7):
+        step_ce, step_scored_tokens, epoch_ce   the masked PREDICTION CE, token-weighted,
+                         apart from the objective (step_loss, epoch_loss), which adds the
+                         usage penalty
+        states_at        the step of each training-batch state count in step_states_used
+                         (counted on the scored positions)
+        val_states_in_use   distinct states on the scored validation positions, at every
+                         validation (the collapse gate)
+        step_lr          the learning rate after each validated step (the next update's);
+                         lr_last_used is the rate the final update itself used
+        step_train_probe_ce   with train_probe_loader: CE on a fixed subset of TRAINING rows,
+                         beside probe_exact_ce, the exact model's CE on them -- a model below
+                         the exact model on rows it trained on is memorising (gate 17)
+    With final_validation the last step is validated (and can be the selected
+    checkpoint) when the cadence did not land on it.
     """
 
     def __init__(self, val_loader=None, val_every_n_steps: int = 25, keep_best: bool = False,
-                 progress_every: int = 0):
+                 progress_every: int = 0, final_validation: bool = True,
+                 train_probe_loader=None, probe_exact_ce=None):
         super().__init__()
         self.val_loader        = val_loader
         self.val_every_n_steps = max(1, int(val_every_n_steps))
         self.keep_best         = bool(keep_best)
         self.progress_every    = int(progress_every)     # 0 = silent
+        self.final_validation  = bool(final_validation)
+        self.train_probe_loader = train_probe_loader
+        self.probe_exact_ce    = probe_exact_ce
         self._t0 = None
         self.step_loss, self.step_at         = [], []
         self.step_val_loss, self.step_val_at = [], []
         self.step_tau, self.step_grad_norm   = [], []
         self.step_states_used                = []    # on the validation cadence
+        self.states_at                       = []    # ... at these steps
         self.epoch_loss = []
+        self.step_ce, self.step_scored_tokens, self.epoch_ce = [], [], []
+        self.val_states_in_use, self.step_lr, self.step_train_probe_ce = [], [], []
+        self.lr_last_used = float("nan")
+        self.final_validation_done = False
         self.model = None
         self.best_val, self.best_step, self.best_state = float("inf"), -1, None
         self.restored_best = False
         self._sum, self._count = 0.0, 0
+        self._ce_sum, self._ce_count = 0.0, 0
 
     def on_before_optimizer_step(self, trainer, pl_module, optimizer):
         sq = [p.grad.detach().float().pow(2).sum() for p in pl_module.parameters()
               if p.grad is not None]
         self.step_grad_norm.append(float(torch.stack(sq).sum().sqrt()) if sq else 0.0)
+        self.lr_last_used = float(optimizer.param_groups[0]["lr"])
+
+    @staticmethod
+    def _states_used(pl_module, states) -> int:
+        """Distinct states of the training batch, on the positions the loss scores."""
+        s0 = int(getattr(pl_module, "score_start", 0))
+        if s0 == 0:
+            return int(torch.unique(states).numel())
+        return int(torch.unique(states[score_mask(states, s0, pl_module.mode)]).numel())
+
+    def _validate(self, trainer, pl_module, step: int):
+        val_ce, _, k_used = eval_ce(pl_module, self.val_loader, count_states=True)
+        self.step_val_loss.append(val_ce)
+        self.step_val_at.append(step)
+        self.val_states_in_use.append(-1 if k_used is None else k_used)
+        if trainer.optimizers:
+            self.step_lr.append(float(trainer.optimizers[0].param_groups[0]["lr"]))
+        if self.train_probe_loader is not None:
+            self.step_train_probe_ce.append(eval_ce(pl_module, self.train_probe_loader)[0])
+        if self.keep_best and val_ce < self.best_val:
+            self.best_val, self.best_step = float(val_ce), int(step)
+            self.best_state = {k: v.detach().clone()
+                               for k, v in pl_module.state_dict().items()}
+        pl_module.train()
 
     def on_train_batch_end(self, trainer, pl_module, outputs, batch, batch_idx):
         loss = (outputs["loss"] if isinstance(outputs, dict) else outputs)
@@ -239,6 +316,13 @@ class Recorder(L.Callback):
         loss = float(loss.detach().float().cpu().item())
         self._sum += loss
         self._count += 1
+        if isinstance(outputs, dict) and "ce_sum" in outputs:
+            n = int(outputs["scored_tokens"])
+            ce_sum = float(outputs["ce_sum"].detach().float().cpu().item())
+            self.step_scored_tokens.append(n)
+            self.step_ce.append(ce_sum / n)
+            self._ce_sum += ce_sum
+            self._ce_count += n
 
         step = trainer.global_step
         self.step_loss.append(loss)
@@ -247,16 +331,10 @@ class Recorder(L.Callback):
 
         if self.val_loader is not None and step % self.val_every_n_steps == 0:
             states = getattr(pl_module, "last_states", None)     # the training batch's
-            if states is not None:
-                self.step_states_used.append(int(torch.unique(states).numel()))
-            val_ce, _ = eval_ce(pl_module, self.val_loader)
-            self.step_val_loss.append(val_ce)
-            self.step_val_at.append(step)
-            if self.keep_best and val_ce < self.best_val:
-                self.best_val, self.best_step = float(val_ce), int(step)
-                self.best_state = {k: v.detach().clone()
-                                   for k, v in pl_module.state_dict().items()}
-            pl_module.train()
+            if states is not None:                               # before validation overwrites it
+                self.step_states_used.append(self._states_used(pl_module, states))
+                self.states_at.append(int(step))
+            self._validate(trainer, pl_module, step)
 
         if self.progress_every and step % self.progress_every == 0:
             # sys.__stderr__, not sys.stderr: this has to get past quiet()'s redirect.
@@ -277,7 +355,21 @@ class Recorder(L.Callback):
     def on_train_epoch_end(self, trainer, pl_module):
         if self._count:
             self.epoch_loss.append(self._sum / self._count)
+        if self._ce_count:
+            self.epoch_ce.append(self._ce_sum / self._ce_count)
         self._sum, self._count = 0.0, 0
+        self._ce_sum, self._ce_count = 0.0, 0
+
+    def on_train_end(self, trainer, pl_module):
+        # Validate the final step when the cadence did not land on it, BEFORE train_model's
+        # restoration, so it can be the selected checkpoint.  No training-batch state count
+        # is appended for it: none was observed.
+        step = int(trainer.global_step)
+        if self.final_validation and self.val_loader is not None and (
+            not self.step_val_at or self.step_val_at[-1] != step
+        ):
+            self._validate(trainer, pl_module, step)
+            self.final_validation_done = True
 
 
 def train_model(train_loader, arch: str, embed_type: str = "discrete", val_loader=None, *,
@@ -287,7 +379,11 @@ def train_model(train_loader, arch: str, embed_type: str = "discrete", val_loade
                 n_states=None, state_dim=None, tau: float | str = 1.0,
                 usage_beta: float = 0.0, restore_best: bool = False,
                 gradient_clip_val=None, progress_every: int = 0,
-                gumbel: bool = False) -> Recorder:
+                gumbel: bool = False, score_start: int = 0, usage_scope: str = "all",
+                learn_input_embedding: bool = False, max_steps=None,
+                lr_schedule: str = "constant", lr_min: float = 1e-5, schedule_horizon=None,
+                final_validation: bool = True, train_probe_loader=None,
+                probe_exact_ce=None) -> Recorder:
     """
     Train one model and return the Recorder holding its curves and the model.
 
@@ -311,30 +407,60 @@ def train_model(train_loader, arch: str, embed_type: str = "discrete", val_loade
     `gumbel` (discrete head only, off by default) trains with Gumbel-softmax
     straight-through instead of the deterministic argmax; evaluation is always
     the deterministic argmax.  See causal_matrix._learn_causal_state.forward.
+
+    The budget: `max_steps` optimiser updates exactly when given (the epochs run are
+    then ceil(max_steps / len(train_loader)) and the last may stop part-way), else
+    `max_epochs` full epochs.  `schedule_horizon` (default: the budget) is the number of
+    updates the tau and learning-rate schedules are indexed to; it may exceed the budget
+    (the continuous mode uses twice it, so the run stops halfway down both schedules)
+    and must not fall short of it.  `score_start`, `usage_scope`, `learn_input_embedding`,
+    `lr_schedule`, `lr_min` go to the model (decoder_base._Decoder).  `train_probe_loader`
+    and `probe_exact_ce` feed the Recorder's overfitting monitor.  The returned Recorder
+    also carries update_budget, schedule_horizon, actual_steps and tau_at_final_update.
     """
     if arch not in ARCHITECTURES:
         raise ValueError(f"arch must be one of {sorted(ARCHITECTURES)}, got {arch!r}")
     if restore_best and val_loader is None:
         raise ValueError("restore_best needs a val_loader to select the checkpoint on")
+    if len(train_loader) == 0:
+        raise ValueError("empty training loader")
+    if max_steps is not None:
+        if max_steps <= 0:
+            raise ValueError("max_steps must be positive")
+        trainer_epochs = math.ceil(max_steps / len(train_loader))
+        total_steps = int(max_steps)
+    else:
+        trainer_epochs = max_epochs
+        total_steps = len(train_loader) * max_epochs
+    # tau and the learning rate are indexed to the horizon; the run stops at total_steps
+    horizon = total_steps if schedule_horizon is None else int(schedule_horizon)
+    if horizon < total_steps:
+        raise ValueError("the schedule horizon must cover the update budget")
     _, tau_fn = parse_tau(tau)
     # build_model needs a FLOAT: the head divides the state logits by it.
     model = ARCHITECTURES[arch](
         embed_type, token_size=token_size, d_model=d_model, max_len=max_len,
         lr=lr, mode=mode, n_layers=n_layers, weight_decay=weight_decay,
         n_states=n_states, state_dim=state_dim, tau=tau_fn(0.0),
-        usage_beta=usage_beta)
+        usage_beta=usage_beta, score_start=score_start, usage_scope=usage_scope,
+        learn_input_embedding=learn_input_embedding, lr_schedule=lr_schedule,
+        lr_min=lr_min, schedule_horizon=horizon)
     if gumbel:
         if embed_type != "discrete":
             raise ValueError("gumbel applies to the discrete head only")
         model.gumbel = True
 
     rec = Recorder(val_loader=val_loader, val_every_n_steps=val_every_n_steps,
-                   keep_best=restore_best, progress_every=progress_every)
+                   keep_best=restore_best, progress_every=progress_every,
+                   final_validation=final_validation, train_probe_loader=train_probe_loader,
+                   probe_exact_ce=probe_exact_ce)
     callbacks = [rec]
     if embed_type == "discrete" and is_scheduled(tau):
-        callbacks.append(TauSchedule(tau_fn, len(train_loader) * max_epochs))
+        callbacks.append(TauSchedule(tau_fn, horizon))
     trainer = L.Trainer(
-        max_epochs=max_epochs, accelerator=accelerator, devices="auto",
+        max_epochs=trainer_epochs,
+        max_steps=max_steps if max_steps is not None else -1,
+        accelerator=accelerator, devices="auto",
         log_every_n_steps=5, callbacks=callbacks, gradient_clip_val=gradient_clip_val,
         logger=False, enable_checkpointing=False,
         enable_progress_bar=False, enable_model_summary=False,
@@ -344,4 +470,9 @@ def train_model(train_loader, arch: str, embed_type: str = "discrete", val_loade
         model.load_state_dict(rec.best_state)
         rec.restored_best = True
     rec.model = model
+    rec.update_budget, rec.schedule_horizon = int(total_steps), int(horizon)
+    rec.actual_steps = int(trainer.global_step)
+    # the tau the final update used: TauSchedule sets fn(step / (horizon - 1)) before update `step`
+    rec.tau_at_final_update = float(tau_fn((total_steps - 1) / max(1, horizon - 1))
+                                    if embed_type == "discrete" and is_scheduled(tau) else tau_fn(0.0))
     return rec

@@ -119,7 +119,7 @@ def test_command_line_schedule_flags(argv, want):
     class Parsed(Exception):
         pass
 
-    def fake(cfg, arch, process, arm):
+    def fake(cfg, arch, process, arm, **kw):
         t, g = run_model.arch_settings(cfg, "transformer", 3), run_model.arch_settings(cfg, "gru", 3)
         raise Parsed((t["tau"], t["max_epochs"], g["tau"], g["max_epochs"]))
 
@@ -132,9 +132,13 @@ def test_command_line_schedule_flags(argv, want):
     ("", (False, False)),
     ("--gumbel-transformer", (True, False)),
     ("--gumbel-gru", (False, True)),
+    ("--data-mode continuous", (True, True)),                    # the continuous regime samples
+    ("--data-mode continuous --no-gumbel-transformer", (False, True)),
+    ("--data-mode continuous --no-gumbel-gru", (True, False)),
 ])
 def test_command_line_gumbel_flags(argv, want):
-    """The argmax head for every model unless a --gumbel-* flag turns sampling on."""
+    """Legacy: the argmax head for every model unless a --gumbel-* flag turns sampling on.
+    Continuous: Gumbel-ST for every model unless a --no-gumbel-* flag turns it off."""
     import shlex
     import unittest.mock as um
     import run_model
@@ -142,7 +146,7 @@ def test_command_line_gumbel_flags(argv, want):
     class Parsed(Exception):
         pass
 
-    def fake(cfg, arch, process, arm):
+    def fake(cfg, arch, process, arm, **kw):
         raise Parsed((run_model.arch_settings(cfg, "transformer", 3)["gumbel"],
                       run_model.arch_settings(cfg, "gru_feedback", 3)["gumbel"]))
 

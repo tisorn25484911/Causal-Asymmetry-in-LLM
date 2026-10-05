@@ -26,6 +26,7 @@ import numpy as np
 import torch
 
 from HMM_processes import entropy_bits, joint_map
+from scoring import position_mask, score_mask
 
 
 # ══════════════════════════════════════════════════════════════════════════
@@ -81,10 +82,20 @@ def kept_positions(mode: str, T: int, min_pos: int) -> slice:
     return slice(min_pos, None) if mode == "forward" else slice(0, max(T - min_pos, 1))
 
 
-def causal_state_report(model, data_loader, min_pos: int = 5, device=None):
+def _analysed_positions(mode: str, T: int, min_pos: int, analysis_start):
+    """The positions a state is read from: legacy `min_pos` (kept_positions), or, given
+    `analysis_start` (the continuous mode), exactly the scored positions (scoring)."""
+    if analysis_start is None:
+        return kept_positions(mode, T, min_pos)
+    return torch.as_tensor(position_mask(T, analysis_start, mode))
+
+
+def causal_state_report(model, data_loader, min_pos: int = 5, device=None, analysis_start=None):
     """
     Assign every token position to a causal state and summarise.  Returns None
-    for a model with no explicit states (the onehot decoders).
+    for a model with no explicit states (the onehot decoders).  `analysis_start`
+    reads states on the scored positions only (the continuous mode's analysis mask)
+    instead of from `min_pos` on.
     """
     K = int(getattr(model, "n_states", 0) or 0)
     if K <= 0:
@@ -104,8 +115,8 @@ def causal_state_report(model, data_loader, min_pos: int = 5, device=None):
             inputs, _ = model._split(batch, model.mode)
             model(inputs.to(device))
             st = model.last_states
-            keep = kept_positions(model.mode, st.shape[1], min_pos)
-            st = st[:, keep].reshape(-1).cpu()
+            keep = _analysed_positions(model.mode, st.shape[1], min_pos, analysis_start)
+            st = st[:, keep.to(st.device) if torch.is_tensor(keep) else keep].reshape(-1).cpu()
             counts += torch.bincount(st, minlength=K)
             tk = inputs[:, keep].reshape(-1).cpu()
             joint += torch.bincount(tk * K + st, minlength=V * K).reshape(V, K)
@@ -319,7 +330,7 @@ def hard_state_trajectories(model, loader):
     return np.concatenate(states, axis=0), np.concatenate(tokens, axis=0)
 
 
-def empirical_symbolic_machine(model, loader, min_pos: int) -> dict:
+def empirical_symbolic_machine(model, loader, min_pos: int, analysis_start=None) -> dict:
     """
     The unifilar machine the discrete model has BECOME, read off its state
     trajectories.
@@ -331,20 +342,35 @@ def empirical_symbolic_machine(model, loader, min_pos: int) -> dict:
     the model's reading order (mode="backward": one step back, (s_t, x_{t-1}) ->
     s_{t-1}).  Visited states are relabelled 0..k-1; `state_ids` maps back to the
     bottleneck's indices and `relabel` the other way.
+
+    `analysis_start` (the continuous mode) counts states on the scored positions only
+    and pairs only PHYSICALLY adjacent positions that are both scored, within a row, so
+    no transition is invented by joining non-adjacent positions or crossing rows.  A
+    (state, token) pair never observed keeps determinism NaN: symbolic_trace treats it
+    as unsupported.
     """
     states, tokens = hard_state_trajectories(model, loader)
     K, V = int(model.n_states), int(model.token_size)
-    keep = kept_positions(model.mode, states.shape[1], min_pos)
-    states, tokens = states[:, keep], tokens[:, keep]
-
-    if model.mode == "forward":
-        s_from, x, s_to = states[:, :-1], tokens[:, 1:], states[:, 1:]
+    if analysis_start is None:
+        keep = kept_positions(model.mode, states.shape[1], min_pos)
+        states, tokens = states[:, keep], tokens[:, keep]
+        if model.mode == "forward":
+            s_from, x, s_to = states[:, :-1], tokens[:, 1:], states[:, 1:]
+        else:
+            s_from, x, s_to = states[:, 1:], tokens[:, :-1], states[:, :-1]
+        s_from, x, s_to, visited_states = s_from.ravel(), x.ravel(), s_to.ravel(), states.ravel()
     else:
-        s_from, x, s_to = states[:, 1:], tokens[:, :-1], states[:, :-1]
+        keep = np.broadcast_to(position_mask(states.shape[1], analysis_start, model.mode), states.shape)
+        pair = keep[:, :-1] & keep[:, 1:]
+        if model.mode == "forward":
+            s_from, x, s_to = states[:, :-1][pair], tokens[:, 1:][pair], states[:, 1:][pair]
+        else:
+            s_from, x, s_to = states[:, 1:][pair], tokens[:, :-1][pair], states[:, :-1][pair]
+        visited_states = states[keep]
     triples = np.zeros((K, V, K), dtype=np.float64)
-    np.add.at(triples, (s_from.ravel(), x.ravel(), s_to.ravel()), 1.0)
+    np.add.at(triples, (s_from, x, s_to), 1.0)
 
-    counts = np.bincount(states.ravel(), minlength=K).astype(np.float64)
+    counts = np.bincount(visited_states, minlength=K).astype(np.float64)
     visited = np.flatnonzero(counts > 0)
     relabel = np.full(K, -1, dtype=np.int64)
     relabel[visited] = np.arange(len(visited))
@@ -563,6 +589,46 @@ def symbolic_cross_entropy(machine: dict, tokens: np.ndarray, start_states, mode
     return total_bits / max(total_steps, 1)
 
 
+def symbolic_trace(machine: dict, tokens: np.ndarray, start_states, t0: int) -> dict:
+    """
+    The empirical machine run along each row of a mode="forward" model's input tokens from
+    position t0, with its COVERAGE (the continuous mode; plan section 12.9):
+
+        losses   (N, T) bits; output position t0+j holds -log2 P(tokens[t0+1+j] | state),
+                 NaN where unscored or unsupported
+        valid    (N, T) bool, where the machine's prediction is supported
+        unknown_start      rows whose start state was never seen when the machine was
+                           fitted (start < 0): unsupported throughout, never replaced by
+                           a stand-in state
+        unseen_transition  rows that met a (state, token) pair never observed: the
+                           prediction there is scored, every later position is not
+
+    No synthetic state or fallback self-loop counts as covered.
+    """
+    next_state = np.asarray(machine["next_state"], dtype=np.int64)
+    emission_probs = np.asarray(machine["emission_probs"], dtype=np.float64)
+    observed = np.isfinite(np.asarray(machine["determinism"], dtype=np.float64))
+    tokens = np.asarray(tokens, dtype=np.int64)
+    N, T = tokens.shape
+    losses, valid = np.full((N, T), np.nan), np.zeros((N, T), dtype=bool)
+    unknown_start = unseen = 0
+    for i, (row, s0) in enumerate(zip(tokens, start_states)):
+        if s0 < 0:
+            unknown_start += 1
+            continue
+        s = int(s0)
+        for j, x in enumerate(row[t0 + 1:]):
+            p = t0 + j
+            losses[i, p] = -math.log2(max(float(emission_probs[s, int(x)]), 1e-12))
+            valid[i, p] = True
+            if not observed[s, int(x)]:
+                unseen += 1
+                break
+            s = int(next_state[s, int(x)])
+    return {"losses": losses, "valid": valid, "unknown_start": int(unknown_start),
+            "unseen_transition": int(unseen)}
+
+
 def exact_machine_report(model, report, empirical, th) -> dict:
     """
     For a model whose machine is exact by construction (GRU.DiscreteFeedbackGRU):
@@ -596,6 +662,46 @@ def exact_machine_report(model, report, empirical, th) -> dict:
 # ══════════════════════════════════════════════════════════════════════════
 # 4. Everything for one trained model
 # ══════════════════════════════════════════════════════════════════════════
+def collapse_record(val_at, val_states, best_step, true_k=None) -> dict:
+    """
+    The collapse gate (plan section 8, test 15) from the states in use at every validation.
+    Collapsed = at most min(2, true_k - 1) states (user, 2026-10-03): at most 2, and fewer than
+    the process needs -- so a 2-state process is collapsed only at 1 state.  Flagged on the
+    SELECTED checkpoint only (user, 2026-10-03): every run starts collapsed, so the early plateau
+    is recorded -- the first validation above the threshold, and how many validations sat at or
+    below it -- rather than flagged.  {} when no counts were recorded.
+    """
+    val_at, vs = np.asarray(val_at, dtype=int), np.asarray(val_states, dtype=int)
+    if not vs.size or (vs < 0).any():
+        return {}
+    threshold = 2 if true_k is None else min(2, int(true_k) - 1)
+    sel = int(best_step) if best_step >= 0 else int(val_at[-1])
+    k_sel = int(vs[np.flatnonzero(val_at == sel)[0]]) if (val_at == sel).any() else int(vs[-1])
+    above = np.flatnonzero(vs > threshold)
+    return {"states_at_first_val": int(vs[0]), "states_at_selected": k_sel,
+            "collapse_threshold": threshold, "collapse_flagged": bool(k_sel <= threshold),
+            "first_val_above_collapse": int(val_at[above[0]]) if above.size else -1,
+            "n_val_collapsed": int((vs <= threshold).sum())}
+
+
+# Overfitting tolerance, bits/token (user, 2026-10-03).  A near-exact model's training-probe
+# excess scatters around 0 by about +-0.0002 (a 30,000-target probe), and the minimum over ~1,200
+# validations dips below 0 by noise alone; study6's memorisation sat 0.006-0.025 below.
+OVERFIT_TOL = 1e-3
+
+
+def overfit_record(probe_ce, probe_exact_ce, tol: float = OVERFIT_TOL) -> dict:
+    """The overfitting monitor (plan section 8, test 17): CE on a fixed subset of TRAINING
+    rows against the exact model's on the same rows.  Below it is only reachable by
+    memorising the rows; a run is flagged when some validation falls more than `tol` below
+    (OVERFIT_TOL: noise alone stays within it).  {} without a probe."""
+    if not probe_ce or probe_exact_ce is None:
+        return {}
+    excess = np.asarray(probe_ce, dtype=float) - float(probe_exact_ce)
+    return {"train_probe_min_excess": float(excess.min()), "train_probe_final_excess": float(excess[-1]),
+            "overfit_flagged": bool(excess.min() < -tol)}
+
+
 def exact_per_position_ce(gen, seqs) -> np.ndarray:
     """(N, T) bits of the EXACT model on every scored token of `seqs`, which are
     in the generator's current reading order (generator.ideal_probs)."""
@@ -607,16 +713,32 @@ def exact_per_position_ce(gen, seqs) -> np.ndarray:
 
 def analyse_arm(model, rec, gen, ds, test_indices, test_loader, ana_loader, *,
                 fresh_loader, seed_tokens, min_pos: int, total_run: int,
-                conv_tol: float, full_tol: float = 0.05, rng=None) -> dict:
+                conv_tol: float, full_tol: float = 0.05, rng=None,
+                analysis_start=None, generation_context=None, fresh_seqs=None,
+                common=None) -> dict:
     """
     Score one trained discrete model against the theory of `gen`'s current view.
 
     `ds` holds the sequences the model was trained and tested on, in the view's
     reading order; `test_indices` are the held-out rows; `fresh_loader` is a
-    fresh draw of the process (the checkpoint was selected on the test split, so
-    only the fresh CE is unbiased); `seed_tokens` seeds the free-running
-    generation.  FULL follows tau_experiment/study5: every theoretical state
-    discovered and |S_emp - C| < full_tol.
+    fresh draw of the process (in the legacy mode the checkpoint was selected on
+    the test split, so only the fresh CE is unbiased there); `seed_tokens` seeds
+    the free-running generation.  FULL follows tau_experiment/study5: every
+    theoretical state discovered and |S_emp - C| < full_tol.
+
+    Every cross-entropy counts the outputs the model's scoring policy counts
+    (model.score_start, scoring.score_mask), the exact model's included, and the full
+    per-position arrays are kept with their mask.  The continuous mode also passes:
+        analysis_start      states, occupancy and the empirical machine are read on the
+                            scored positions of the (training-row) analysis loader, with
+                            physical adjacency; the symbolic CE on the test rows is
+                            coverage-aware (symbolic_trace), with no start-state fallback
+        generation_context  the context the free-running transition extraction rolls on
+                            (default: the training length)
+        fresh_seqs          the fresh draw itself, for an exact baseline on the same windows
+        common              {"loader", "seqs", "score_start", "manifest_id"}: the shared
+                            evaluation profile, identical targets and context for every
+                            architecture, so their CE can be compared
     """
     # Imported here, not at the top: Experimental_pipeline has a `training` module
     # too, and a cross-check that loads both must still be able to import the
@@ -626,23 +748,47 @@ def analyse_arm(model, rec, gen, ds, test_indices, test_loader, ana_loader, *,
     th = theory_from_generator(gen)
     H = th["entropy_rate"]
     mode = model.mode
+    s0 = int(getattr(model, "score_start", 0))
+    extra = {}
 
     # --- cross-entropy -------------------------------------------------------
     test_ce, test_ppl = eval_ce(model, test_loader)
     fresh_ce, _ = eval_ce(model, fresh_loader)
     test_seqs = ds.seqs[test_indices]
-    neural_pp = per_position_ce(model, test_loader)                 # (N_test, T)
+    neural_pp = per_position_ce(model, test_loader)                 # (N_test, T), every position
     exact_pp = exact_per_position_ce(gen, test_seqs)                # same tokens
-    exact_ce = float(exact_pp.mean())
+    ce_mask = score_mask(torch.from_numpy(test_seqs[:, 1:]), s0, mode).numpy()
+    exact_ce = float(exact_pp.mean()) if s0 == 0 else float(exact_pp[ce_mask].mean())
+    if s0 > 0:                                  # the explicitly labelled all-position diagnostic
+        extra["test_ce_all_positions"] = eval_ce(model, test_loader, score_start=0)[0]
+        extra["exact_ce_all_positions"] = float(exact_pp.mean())
+    if fresh_seqs is not None:                  # the exact model on the same fresh windows
+        fresh_seqs = np.asarray(fresh_seqs, dtype=np.int64)
+        fresh_mask = score_mask(torch.from_numpy(fresh_seqs[:, 1:]), s0, mode).numpy()
+        extra["fresh_exact_ce"] = float(exact_per_position_ce(gen, fresh_seqs)[fresh_mask].mean())
+        extra["fresh_gap_exact"] = fresh_ce - extra["fresh_exact_ce"]
+    per_position_common = None
+    if common is not None:                      # identical targets and context for every architecture
+        cseqs = np.asarray(common["seqs"], dtype=np.int64)
+        c_exact_pp = exact_per_position_ce(gen, cseqs)
+        c_mask = score_mask(torch.from_numpy(cseqs[:, 1:]), common["score_start"], mode).numpy()
+        c_ce = eval_ce(model, common["loader"], score_start=common["score_start"])[0]
+        extra.update(common_ce=c_ce, common_exact_ce=float(c_exact_pp[c_mask].mean()),
+                     common_manifest_id=common["manifest_id"])
+        extra["common_gap_exact"] = c_ce - extra["common_exact_ce"]
+        per_position_common = {"neural": per_position_ce(model, common["loader"]).mean(axis=0),
+                               "exact": c_exact_pp.mean(axis=0), "score_mask": c_mask[0].copy(),
+                               "manifest_id": common["manifest_id"]}
     divergence = diagnose_divergence(rec.step_loss)
 
     # --- states --------------------------------------------------------------
-    report = causal_state_report(model, ana_loader, min_pos=min_pos)
+    report = causal_state_report(model, ana_loader, min_pos=min_pos, analysis_start=analysis_start)
     report["S_emp"] = float(report["S_emp"]) + 0.0                  # a single state gives -0.0
 
     # --- transition matrix against the closed form ----------------------------
     T_learned = transition_matrix_extraction(
-        model, seed_tokens, total_run=total_run, window_size=ds.seq_len, rng=rng)
+        model, seed_tokens, total_run=total_run,
+        window_size=ds.seq_len if generation_context is None else generation_context, rng=rng)
     comparison = compare_transition_matrix(
         T_learned, th["T_theory"], report["emissions"], th["true_machine"]["emission_probs"],
         weights=report["occupancy"])
@@ -658,20 +804,48 @@ def analyse_arm(model, rec, gen, ds, test_indices, test_loader, ana_loader, *,
                    else float("nan"))
 
     # --- the empirical machine, scored on the test sequences ------------------
-    machine = empirical_symbolic_machine(model, ana_loader, min_pos)
+    machine = empirical_symbolic_machine(model, ana_loader, min_pos, analysis_start=analysis_start)
     det = machine["determinism"]
     weighted = machine["pair_counts"] / machine["pair_counts"].sum()
     det_weighted = float(np.nansum(np.where(np.isfinite(det), det * weighted, 0.0)))
     minimal_stationary = stationary_distribution_from_machine(machine)
     states_te, tokens_te = hard_state_trajectories(model, test_loader)
     Tn = tokens_te.shape[1]
-    t0 = min_pos if mode == "forward" else Tn - 1 - min_pos
-    start = machine["relabel"][states_te[:, t0]]
-    start = np.where(start >= 0, start, 0)
-    symbolic_ce = symbolic_cross_entropy(machine, tokens_te, start, mode, t0)
-    # the neural and exact models on exactly the tokens the symbolic scorer read
-    span = slice(t0, Tn - 1) if mode == "forward" else slice(0, t0)
-    neural_ce_span, exact_ce_span = float(neural_pp[:, span].mean()), float(exact_pp[:, span].mean())
+    symbolic = None
+    if analysis_start is None:
+        t0 = min_pos if mode == "forward" else Tn - 1 - min_pos
+        start = machine["relabel"][states_te[:, t0]]
+        start = np.where(start >= 0, start, 0)
+        symbolic_ce = symbolic_cross_entropy(machine, tokens_te, start, mode, t0)
+        # the neural and exact models on exactly the tokens the symbolic scorer read
+        span = slice(t0, Tn - 1) if mode == "forward" else slice(0, t0)
+        neural_ce_span, exact_ce_span = float(neural_pp[:, span].mean()), float(exact_pp[:, span].mean())
+    else:
+        # coverage-aware: no start-state fallback, and unseen transitions end a rollout
+        if mode != "forward":
+            raise NotImplementedError("the coverage-aware symbolic scoring is defined for mode='forward', "
+                                      "the runner's convention (the backward arm comes from reversed data)")
+        t0 = int(analysis_start)
+        tr = symbolic_trace(machine, tokens_te, machine["relabel"][states_te[:, t0]], t0)
+        span = np.zeros_like(ce_mask)
+        span[:, t0:Tn - 1] = True
+        span &= ce_mask
+        common_mask = span & tr["valid"]                   # where all three CEs are defined
+        n_span, n_cov = int(span.sum()), int(common_mask.sum())
+        complete = n_span > 0 and n_cov == n_span
+        # the PRIMARY symbolic CE needs the whole span covered; the covered part is a diagnostic
+        symbolic_ce = float(tr["losses"][span].mean()) if complete else float("nan")
+        neural_ce_span = float(neural_pp[common_mask].mean()) if n_cov else float("nan")
+        exact_ce_span = float(exact_pp[common_mask].mean()) if n_cov else float("nan")
+        symbolic = {
+            "t0": t0, "span_mask": span, "valid": tr["valid"], "complete": bool(complete),
+            "n_span": n_span, "n_covered": n_cov,
+            "unknown_start": tr["unknown_start"], "unseen_transition": tr["unseen_transition"],
+            "symbolic_ce_covered": float(tr["losses"][common_mask].mean()) if n_cov else float("nan"),
+            "reason": ("" if complete else
+                       f"{n_span - n_cov} of {n_span} span positions unsupported: {tr['unknown_start']} rows "
+                       f"start in a state unseen in training, {tr['unseen_transition']} meet an unseen transition"),
+        }
     # a model with an exact machine (the feedback GRU): read it off, no estimation
     exact = (exact_machine_report(model, report, machine, th)
              if callable(getattr(model, "machine", None)) else None)
@@ -691,7 +865,27 @@ def analyse_arm(model, rec, gen, ds, test_indices, test_loader, ana_loader, *,
         "epoch_loss": [float(v) for v in rec.epoch_loss],
         "best_step": int(rec.best_step) if rec.restored_best else -1,
         "best_val": float(rec.best_val) if rec.restored_best else float("nan"),
+        # plan section 12.7: kept in the saved history so --plots-only can redraw them
+        "step_ce": [float(v) for v in rec.step_ce],
+        "step_scored_tokens": [int(v) for v in rec.step_scored_tokens],
+        "cumulative_scored_tokens": np.cumsum(rec.step_scored_tokens).astype(int).tolist(),
+        "epoch_ce": [float(v) for v in rec.epoch_ce],
+        "states_at": [int(v) for v in rec.states_at],
+        "val_states_in_use": [int(v) for v in rec.val_states_in_use],
+        "step_lr": [float(v) for v in rec.step_lr],
+        "train_probe_ce": [float(v) for v in rec.step_train_probe_ce],
+        "probe_exact_ce": (float(rec.probe_exact_ce) if rec.probe_exact_ce is not None else float("nan")),
+        "final_validation": bool(rec.final_validation), "final_validation_done": bool(rec.final_validation_done),
     }
+
+    # --- collapse gate (gate 15) and overfitting monitor (gate 17) ------------
+    extra.update(collapse_record(val_at, rec.val_states_in_use, history["best_step"], th["true_k"]))
+    extra.update(overfit_record(rec.step_train_probe_ce, rec.probe_exact_ce))
+    if symbolic is not None:
+        extra.update(symbolic_ce_covered=symbolic["symbolic_ce_covered"], symbolic_complete=symbolic["complete"],
+                     symbolic_n_span=symbolic["n_span"], symbolic_n_covered=symbolic["n_covered"],
+                     symbolic_unknown_start=symbolic["unknown_start"],
+                     symbolic_unseen_transition=symbolic["unseen_transition"])
     metrics = {
         "test_ce": test_ce, "test_ppl": test_ppl, "fresh_ce": fresh_ce, "exact_ce": exact_ce,
         "entropy_rate": H, "gap": test_ce - H, "gap_exact": test_ce - exact_ce,
@@ -709,6 +903,7 @@ def analyse_arm(model, rec, gen, ds, test_indices, test_loader, ana_loader, *,
         "machine_size": int(machine["next_state"].shape[0]), "determinism": det_weighted,
         "symbolic_ce": symbolic_ce, "neural_ce_span": neural_ce_span, "exact_ce_span": exact_ce_span,
         "max_grad_norm": float(max(rec.step_grad_norm)) if rec.step_grad_norm else float("nan"),
+        **extra,
     }
     if exact is not None:
         metrics.update({
@@ -716,11 +911,18 @@ def analyse_arm(model, rec, gen, ds, test_indices, test_loader, ana_loader, *,
             "exact_T_err": exact["comparison"]["max_error"],
             "exact_missing": len(exact["comparison"]["missing"]),
         })
+    per_position = {"neural": neural_pp.mean(axis=0), "exact": exact_pp.mean(axis=0)}
+    if s0 > 0 or analysis_start is not None:
+        per_position["score_mask"] = ce_mask[0].copy()     # one row: the prefix to shade
     out = {
         "theory": th, "history": history, "metrics": metrics, "report": report,
         "transition": T_learned, "transition_comparison": comparison,
         "machine": machine, "minimal_stationary": minimal_stationary,
         "exact_machine": exact,
-        "per_position": {"neural": neural_pp.mean(axis=0), "exact": exact_pp.mean(axis=0)},
+        "per_position": per_position,
     }
+    if per_position_common is not None:
+        out["per_position_common"] = per_position_common
+    if symbolic is not None:
+        out["symbolic_coverage"] = symbolic
     return add_merged_metrics(out, full_tol)
