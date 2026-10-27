@@ -1,0 +1,2 @@
+excess_transformer_future,excess_transformer_all,transformer_states_used,transformer_information,transformer_determinism,excess_gru_from_handoff_future,gru_from_handoff_states_used,gru_from_handoff_information,gru_from_handoff_determinism,handoff_margin_median,handoff_codes,copy_agree,update,tau,seconds
+1.3049254325704918,1.3056460888433912,13,0.12259197627169988,0.69736328125,1.3049249557333336,4,0.07776097748833892,1.0,0.24676895141601562,2,0.0,0,2.5,0.4525395000819117

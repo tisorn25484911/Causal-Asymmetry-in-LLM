@@ -1,0 +1,17 @@
+{
+  "excess_transformer_future": 1.3049254325704918,
+  "excess_transformer_all": 1.3056460888433912,
+  "transformer_states_used": 13,
+  "transformer_information": 0.12259197627169988,
+  "transformer_determinism": 0.69736328125,
+  "excess_gru_from_handoff_future": 1.3049249557333336,
+  "gru_from_handoff_states_used": 4,
+  "gru_from_handoff_information": 0.07776097748833892,
+  "gru_from_handoff_determinism": 1.0,
+  "handoff_margin_median": 0.24676895141601562,
+  "handoff_codes": 2,
+  "copy_agree": 0.0,
+  "update": 0,
+  "tau": 2.5,
+  "seconds": 0.4525395000819117
+}

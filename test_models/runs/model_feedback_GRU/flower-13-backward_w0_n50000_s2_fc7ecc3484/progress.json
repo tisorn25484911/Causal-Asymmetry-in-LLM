@@ -1,0 +1,15 @@
+{
+  "excess_gru_from_start_future": 0.02485798872283551,
+  "excess_gru_from_start_all": 0.023826983695075743,
+  "gru_from_start_states_used": 11,
+  "gru_from_start_information": 0.9301645484549438,
+  "gru_from_start_determinism": 1.0,
+  "handoff_margin_median": 15.00951099395752,
+  "handoff_codes": 11,
+  "update": 50000,
+  "tau": 0.5,
+  "seconds": 2696.212052499992,
+  "grad_cell": 0.0005539801204577088,
+  "grad_state_head": 0.00045008567394688725,
+  "grad_causal_head": 0.07062600553035736
+}

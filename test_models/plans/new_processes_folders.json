@@ -1,0 +1,53 @@
+{
+ "0": [
+  "/Users/tisornnaphattalung/Desktop/Quantum/URECA/LLM_final_version/test_models/runs/model_C/flower-9_w0.01_n50000_s0_25892ed7cb",
+  "/Users/tisornnaphattalung/Desktop/Quantum/URECA/LLM_final_version/test_models/runs/model_C/flower-13-backward_w0.01_n50000_s0_e9cce1b147",
+  "/Users/tisornnaphattalung/Desktop/Quantum/URECA/LLM_final_version/test_models/runs/model_B/renewal-60_w3_n50000_s0_3e8e990903",
+  "/Users/tisornnaphattalung/Desktop/Quantum/URECA/LLM_final_version/test_models/runs/model_C/renewal-60_w0.01_n50000_s0_452166e79e",
+  "/Users/tisornnaphattalung/Desktop/Quantum/URECA/LLM_final_version/test_models/runs/model_5b/renewal-60_w0.1_n50000_s0_9b29ef1bcb",
+  "/Users/tisornnaphattalung/Desktop/Quantum/URECA/LLM_final_version/test_models/runs/model_discrete_Transformer/renewal-60_w0_n50000_s0_5c350c620b",
+  "/Users/tisornnaphattalung/Desktop/Quantum/URECA/LLM_final_version/test_models/runs/model_feedback_GRU/renewal-60_w0_n50000_s0_437fdab7bd",
+  "/Users/tisornnaphattalung/Desktop/Quantum/URECA/LLM_final_version/test_models/runs/model_5b/flower-9_w0.1_n50000_s0_8f7ce694be",
+  "/Users/tisornnaphattalung/Desktop/Quantum/URECA/LLM_final_version/test_models/runs/model_B/flower-9_w3_n50000_s0_d0b1824b3e",
+  "/Users/tisornnaphattalung/Desktop/Quantum/URECA/LLM_final_version/test_models/runs/model_feedback_GRU/flower-9_w0_n50000_s0_f64bcedf89",
+  "/Users/tisornnaphattalung/Desktop/Quantum/URECA/LLM_final_version/test_models/runs/model_discrete_Transformer/flower-9_w0_n50000_s0_14333e932d",
+  "/Users/tisornnaphattalung/Desktop/Quantum/URECA/LLM_final_version/test_models/runs/model_5b/flower-13-backward_w0.1_n50000_s0_733d584b1e",
+  "/Users/tisornnaphattalung/Desktop/Quantum/URECA/LLM_final_version/test_models/runs/model_B/flower-13-backward_w3_n50000_s0_f0c9695e27",
+  "/Users/tisornnaphattalung/Desktop/Quantum/URECA/LLM_final_version/test_models/runs/model_feedback_GRU/flower-13-backward_w0_n50000_s0_8a24dbfbbb",
+  "/Users/tisornnaphattalung/Desktop/Quantum/URECA/LLM_final_version/test_models/runs/model_discrete_Transformer/flower-13-backward_w0_n50000_s0_a6b940a580"
+ ],
+ "1": [
+  "/Users/tisornnaphattalung/Desktop/Quantum/URECA/LLM_final_version/test_models/runs/model_C/flower-9_w0.01_n50000_s1_ecf2210703",
+  "/Users/tisornnaphattalung/Desktop/Quantum/URECA/LLM_final_version/test_models/runs/model_C/flower-13-backward_w0.01_n50000_s1_7d1a40cc81",
+  "/Users/tisornnaphattalung/Desktop/Quantum/URECA/LLM_final_version/test_models/runs/model_B/renewal-60_w3_n50000_s1_b25a0c0880",
+  "/Users/tisornnaphattalung/Desktop/Quantum/URECA/LLM_final_version/test_models/runs/model_C/renewal-60_w0.01_n50000_s1_7946f82996",
+  "/Users/tisornnaphattalung/Desktop/Quantum/URECA/LLM_final_version/test_models/runs/model_5b/renewal-60_w0.1_n50000_s1_75e7430a3a",
+  "/Users/tisornnaphattalung/Desktop/Quantum/URECA/LLM_final_version/test_models/runs/model_discrete_Transformer/renewal-60_w0_n50000_s1_efbd1afcb2",
+  "/Users/tisornnaphattalung/Desktop/Quantum/URECA/LLM_final_version/test_models/runs/model_feedback_GRU/renewal-60_w0_n50000_s1_1cbd4a82b9",
+  "/Users/tisornnaphattalung/Desktop/Quantum/URECA/LLM_final_version/test_models/runs/model_5b/flower-9_w0.1_n50000_s1_5642318769",
+  "/Users/tisornnaphattalung/Desktop/Quantum/URECA/LLM_final_version/test_models/runs/model_B/flower-9_w3_n50000_s1_6a775eb3fd",
+  "/Users/tisornnaphattalung/Desktop/Quantum/URECA/LLM_final_version/test_models/runs/model_feedback_GRU/flower-9_w0_n50000_s1_2702201efc",
+  "/Users/tisornnaphattalung/Desktop/Quantum/URECA/LLM_final_version/test_models/runs/model_discrete_Transformer/flower-9_w0_n50000_s1_06cf649c63",
+  "/Users/tisornnaphattalung/Desktop/Quantum/URECA/LLM_final_version/test_models/runs/model_5b/flower-13-backward_w0.1_n50000_s1_447549099e",
+  "/Users/tisornnaphattalung/Desktop/Quantum/URECA/LLM_final_version/test_models/runs/model_B/flower-13-backward_w3_n50000_s1_54c94932f5",
+  "/Users/tisornnaphattalung/Desktop/Quantum/URECA/LLM_final_version/test_models/runs/model_feedback_GRU/flower-13-backward_w0_n50000_s1_4e748cb005",
+  "/Users/tisornnaphattalung/Desktop/Quantum/URECA/LLM_final_version/test_models/runs/model_discrete_Transformer/flower-13-backward_w0_n50000_s1_f28a593987"
+ ],
+ "2": [
+  "/Users/tisornnaphattalung/Desktop/Quantum/URECA/LLM_final_version/test_models/runs/model_C/flower-9_w0.01_n50000_s2_089619ea8c",
+  "/Users/tisornnaphattalung/Desktop/Quantum/URECA/LLM_final_version/test_models/runs/model_C/flower-13-backward_w0.01_n50000_s2_2d1338332c",
+  "/Users/tisornnaphattalung/Desktop/Quantum/URECA/LLM_final_version/test_models/runs/model_B/renewal-60_w3_n50000_s2_68c9e49056",
+  "/Users/tisornnaphattalung/Desktop/Quantum/URECA/LLM_final_version/test_models/runs/model_C/renewal-60_w0.01_n50000_s2_8a42beddb4",
+  "/Users/tisornnaphattalung/Desktop/Quantum/URECA/LLM_final_version/test_models/runs/model_5b/renewal-60_w0.1_n50000_s2_2ae75edb91",
+  "/Users/tisornnaphattalung/Desktop/Quantum/URECA/LLM_final_version/test_models/runs/model_discrete_Transformer/renewal-60_w0_n50000_s2_2333fca558",
+  "/Users/tisornnaphattalung/Desktop/Quantum/URECA/LLM_final_version/test_models/runs/model_feedback_GRU/renewal-60_w0_n50000_s2_0b8a59eca8",
+  "/Users/tisornnaphattalung/Desktop/Quantum/URECA/LLM_final_version/test_models/runs/model_5b/flower-9_w0.1_n50000_s2_d5b6398615",
+  "/Users/tisornnaphattalung/Desktop/Quantum/URECA/LLM_final_version/test_models/runs/model_B/flower-9_w3_n50000_s2_1d8826709e",
+  "/Users/tisornnaphattalung/Desktop/Quantum/URECA/LLM_final_version/test_models/runs/model_feedback_GRU/flower-9_w0_n50000_s2_c9248ecd99",
+  "/Users/tisornnaphattalung/Desktop/Quantum/URECA/LLM_final_version/test_models/runs/model_discrete_Transformer/flower-9_w0_n50000_s2_31ad77259b",
+  "/Users/tisornnaphattalung/Desktop/Quantum/URECA/LLM_final_version/test_models/runs/model_5b/flower-13-backward_w0.1_n50000_s2_387ca1e27f",
+  "/Users/tisornnaphattalung/Desktop/Quantum/URECA/LLM_final_version/test_models/runs/model_B/flower-13-backward_w3_n50000_s2_83e0756dfd",
+  "/Users/tisornnaphattalung/Desktop/Quantum/URECA/LLM_final_version/test_models/runs/model_feedback_GRU/flower-13-backward_w0_n50000_s2_fc7ecc3484",
+  "/Users/tisornnaphattalung/Desktop/Quantum/URECA/LLM_final_version/test_models/runs/model_discrete_Transformer/flower-13-backward_w0_n50000_s2_55f6f1c0b3"
+ ]
+}

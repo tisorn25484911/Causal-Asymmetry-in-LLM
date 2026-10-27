@@ -44,7 +44,8 @@ class PositionalEncoding(nn.Module):
         ith = torch.arange(0, d_model, 2, device=device, dtype=dtype)
         div = 10000 ** (ith / d_model)
         pe[:, 0::2] = torch.sin(pos / div)
-        pe[:, 1::2] = torch.cos(pos / div)
+        # an odd width has one cosine column fewer than sines; for an even width the slice is the whole
+        pe[:, 1::2] = torch.cos(pos / div)[:, : d_model // 2]
         self.register_buffer("pe", pe, persistent=False)
 
     def forward(self, x):
