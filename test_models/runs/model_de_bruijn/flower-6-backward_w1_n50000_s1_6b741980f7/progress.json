@@ -1,0 +1,21 @@
+{
+  "excess_node_table_future": -0.00010061191066279562,
+  "excess_node_table_all": -2.3994407809091456e-05,
+  "node_table_states_used": 6,
+  "node_table_information": 0.9999999999999998,
+  "node_table_determinism": 1.0,
+  "excess_next_state_from_handoff_future": -0.00010061191066279562,
+  "next_state_from_handoff_states_used": 6,
+  "next_state_from_handoff_information": 1.0,
+  "next_state_from_handoff_determinism": 1.0,
+  "handoff_margin_median": 20.46157455444336,
+  "handoff_codes": 6,
+  "U_bits": 0.0,
+  "defect": 1.1102230246251565e-16,
+  "head_agreement": 1.0,
+  "update": 50000,
+  "tau": 0.5,
+  "seconds": 2062.928321833024,
+  "grad_reader": 6.579247813220945e-09,
+  "grad_causal_head": 0.19848594069480896
+}

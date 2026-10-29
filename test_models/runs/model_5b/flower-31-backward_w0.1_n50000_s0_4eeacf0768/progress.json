@@ -1,0 +1,20 @@
+{
+  "excess_transformer_future": 0.14916754188082137,
+  "excess_transformer_all": 0.14574435577803957,
+  "transformer_states_used": 12,
+  "transformer_information": 0.7007902409081374,
+  "transformer_determinism": 1.0,
+  "handoff_margin_median": 17.449909210205078,
+  "handoff_codes": 12,
+  "inferred_entropy": 1.400451898574829,
+  "ratio_correction": 0.025164799764752388,
+  "inferred_predicts_transformer": 0.6877003312110901,
+  "update": 50000,
+  "tau": 0.5,
+  "seconds": 23502.56886137498,
+  "grad_encoder": 0.005849099718034267,
+  "grad_transformer_selector": 0.010970719158649445,
+  "grad_causal_head": 0.08138518780469894,
+  "grad_encoder_norm": 0.0024736912455409765,
+  "grad_pair_head": 0.07497545331716537
+}

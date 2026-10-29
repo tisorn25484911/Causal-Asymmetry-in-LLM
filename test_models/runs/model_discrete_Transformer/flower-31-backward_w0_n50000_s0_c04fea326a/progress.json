@@ -1,0 +1,19 @@
+{
+  "excess_transformer_future": 0.03592634620211044,
+  "excess_transformer_all": 0.03441003189498293,
+  "transformer_states_used": 25,
+  "transformer_information": 0.9468051402339073,
+  "transformer_determinism": 1.0,
+  "handoff_margin_median": 26.45365333557129,
+  "handoff_codes": 25,
+  "update": 50000,
+  "tau": 0.5,
+  "seconds": 9912.912813500036,
+  "grad_pe": 0.0,
+  "grad_attn_layers": 9.24994037632132e-06,
+  "grad_ffn_layers": 8.348210030817427e-06,
+  "grad_ln_attn": 2.952702971015242e-06,
+  "grad_ln_ffn": 3.1722311177873053e-06,
+  "grad_state_head": 2.3170032363850623e-05,
+  "grad_causal_head": 0.06502542644739151
+}

@@ -10,6 +10,7 @@ from nbclient import NotebookClient
 HERE = Path(__file__).resolve().parent
 sys.path.insert(0, str(HERE))
 import new_processes_section as S                                          # noqa: E402
+import de_bruijn_section as S10                                             # noqa: E402
 
 ROOT = sys.argv[1] if len(sys.argv) > 1 else None
 STEPS = int(sys.argv[2]) if len(sys.argv) > 2 else 50_000
@@ -26,12 +27,12 @@ from IPython.display import display
 import process as P
 import training as TR
 import analysis as A
+import main as MAIN
+runs = MAIN.imported_runs()
 pd.set_option("display.width", 220)
 pd.set_option("display.max_columns", 40)
 """.strip())]
-for kind, text in S.CELLS:
-    if kind == "code":
-        text = text.replace("NEW_ROOT, NEW_STEPS = None, 50_000", f"NEW_ROOT, NEW_STEPS = {ROOT!r}, {STEPS}")
+for kind, text in S.CELLS + S10.CELLS:
     cells.append(nbformat.v4.new_code_cell(text) if kind == "code" else nbformat.v4.new_markdown_cell(text))
 for text in getattr(S, "FINDINGS", []):
     cells.append(nbformat.v4.new_markdown_cell(text))

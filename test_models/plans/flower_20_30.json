@@ -1,0 +1,398 @@
+[
+ {
+  "model": "5b",
+  "settings": {
+   "process": "flower",
+   "params": {
+    "n": 20,
+    "m": 30,
+    "dice_seed": 0
+   },
+   "n_states": 64,
+   "seed": 0
+  },
+  "config": "flower-21",
+  "hours": 7.1,
+  "memory_gb": 1.1
+ },
+ {
+  "model": "5b",
+  "settings": {
+   "process": "flower",
+   "params": {
+    "n": 20,
+    "m": 30,
+    "dice_seed": 0,
+    "direction": "backward"
+   },
+   "n_states": 64,
+   "seed": 0
+  },
+  "config": "flower-31-backward",
+  "hours": 7.1,
+  "memory_gb": 1.1
+ },
+ {
+  "model": "discrete_Transformer",
+  "settings": {
+   "process": "flower",
+   "params": {
+    "n": 20,
+    "m": 30,
+    "dice_seed": 0
+   },
+   "n_states": 64,
+   "seed": 0
+  },
+  "config": "flower-21",
+  "hours": 3.9,
+  "memory_gb": 0.6
+ },
+ {
+  "model": "discrete_Transformer",
+  "settings": {
+   "process": "flower",
+   "params": {
+    "n": 20,
+    "m": 30,
+    "dice_seed": 0,
+    "direction": "backward"
+   },
+   "n_states": 64,
+   "seed": 0
+  },
+  "config": "flower-31-backward",
+  "hours": 3.9,
+  "memory_gb": 0.6
+ },
+ {
+  "model": "B",
+  "settings": {
+   "process": "flower",
+   "params": {
+    "n": 20,
+    "m": 30,
+    "dice_seed": 0
+   },
+   "n_states": 64,
+   "seed": 0
+  },
+  "config": "flower-21",
+  "hours": 3.0,
+  "memory_gb": 0.6
+ },
+ {
+  "model": "B",
+  "settings": {
+   "process": "flower",
+   "params": {
+    "n": 20,
+    "m": 30,
+    "dice_seed": 0,
+    "direction": "backward"
+   },
+   "n_states": 64,
+   "seed": 0
+  },
+  "config": "flower-31-backward",
+  "hours": 3.0,
+  "memory_gb": 0.6
+ },
+ {
+  "model": "feedback_GRU",
+  "settings": {
+   "process": "flower",
+   "params": {
+    "n": 20,
+    "m": 30,
+    "dice_seed": 0
+   },
+   "n_states": 64,
+   "seed": 0
+  },
+  "config": "flower-21",
+  "hours": 2.8,
+  "memory_gb": 0.6
+ },
+ {
+  "model": "feedback_GRU",
+  "settings": {
+   "process": "flower",
+   "params": {
+    "n": 20,
+    "m": 30,
+    "dice_seed": 0,
+    "direction": "backward"
+   },
+   "n_states": 64,
+   "seed": 0
+  },
+  "config": "flower-31-backward",
+  "hours": 2.8,
+  "memory_gb": 0.6
+ },
+ {
+  "model": "5b",
+  "settings": {
+   "process": "flower",
+   "params": {
+    "n": 20,
+    "m": 30,
+    "dice_seed": 0
+   },
+   "n_states": 64,
+   "seed": 1
+  },
+  "config": "flower-21",
+  "hours": 7.1,
+  "memory_gb": 1.1
+ },
+ {
+  "model": "5b",
+  "settings": {
+   "process": "flower",
+   "params": {
+    "n": 20,
+    "m": 30,
+    "dice_seed": 0,
+    "direction": "backward"
+   },
+   "n_states": 64,
+   "seed": 1
+  },
+  "config": "flower-31-backward",
+  "hours": 7.1,
+  "memory_gb": 1.1
+ },
+ {
+  "model": "discrete_Transformer",
+  "settings": {
+   "process": "flower",
+   "params": {
+    "n": 20,
+    "m": 30,
+    "dice_seed": 0
+   },
+   "n_states": 64,
+   "seed": 1
+  },
+  "config": "flower-21",
+  "hours": 3.9,
+  "memory_gb": 0.6
+ },
+ {
+  "model": "discrete_Transformer",
+  "settings": {
+   "process": "flower",
+   "params": {
+    "n": 20,
+    "m": 30,
+    "dice_seed": 0,
+    "direction": "backward"
+   },
+   "n_states": 64,
+   "seed": 1
+  },
+  "config": "flower-31-backward",
+  "hours": 3.9,
+  "memory_gb": 0.6
+ },
+ {
+  "model": "B",
+  "settings": {
+   "process": "flower",
+   "params": {
+    "n": 20,
+    "m": 30,
+    "dice_seed": 0
+   },
+   "n_states": 64,
+   "seed": 1
+  },
+  "config": "flower-21",
+  "hours": 3.0,
+  "memory_gb": 0.6
+ },
+ {
+  "model": "B",
+  "settings": {
+   "process": "flower",
+   "params": {
+    "n": 20,
+    "m": 30,
+    "dice_seed": 0,
+    "direction": "backward"
+   },
+   "n_states": 64,
+   "seed": 1
+  },
+  "config": "flower-31-backward",
+  "hours": 3.0,
+  "memory_gb": 0.6
+ },
+ {
+  "model": "feedback_GRU",
+  "settings": {
+   "process": "flower",
+   "params": {
+    "n": 20,
+    "m": 30,
+    "dice_seed": 0
+   },
+   "n_states": 64,
+   "seed": 1
+  },
+  "config": "flower-21",
+  "hours": 2.8,
+  "memory_gb": 0.6
+ },
+ {
+  "model": "feedback_GRU",
+  "settings": {
+   "process": "flower",
+   "params": {
+    "n": 20,
+    "m": 30,
+    "dice_seed": 0,
+    "direction": "backward"
+   },
+   "n_states": 64,
+   "seed": 1
+  },
+  "config": "flower-31-backward",
+  "hours": 2.8,
+  "memory_gb": 0.6
+ },
+ {
+  "model": "5b",
+  "settings": {
+   "process": "flower",
+   "params": {
+    "n": 20,
+    "m": 30,
+    "dice_seed": 0
+   },
+   "n_states": 64,
+   "seed": 2
+  },
+  "config": "flower-21",
+  "hours": 7.1,
+  "memory_gb": 1.1
+ },
+ {
+  "model": "5b",
+  "settings": {
+   "process": "flower",
+   "params": {
+    "n": 20,
+    "m": 30,
+    "dice_seed": 0,
+    "direction": "backward"
+   },
+   "n_states": 64,
+   "seed": 2
+  },
+  "config": "flower-31-backward",
+  "hours": 7.1,
+  "memory_gb": 1.1
+ },
+ {
+  "model": "discrete_Transformer",
+  "settings": {
+   "process": "flower",
+   "params": {
+    "n": 20,
+    "m": 30,
+    "dice_seed": 0
+   },
+   "n_states": 64,
+   "seed": 2
+  },
+  "config": "flower-21",
+  "hours": 3.9,
+  "memory_gb": 0.6
+ },
+ {
+  "model": "discrete_Transformer",
+  "settings": {
+   "process": "flower",
+   "params": {
+    "n": 20,
+    "m": 30,
+    "dice_seed": 0,
+    "direction": "backward"
+   },
+   "n_states": 64,
+   "seed": 2
+  },
+  "config": "flower-31-backward",
+  "hours": 3.9,
+  "memory_gb": 0.6
+ },
+ {
+  "model": "B",
+  "settings": {
+   "process": "flower",
+   "params": {
+    "n": 20,
+    "m": 30,
+    "dice_seed": 0
+   },
+   "n_states": 64,
+   "seed": 2
+  },
+  "config": "flower-21",
+  "hours": 3.0,
+  "memory_gb": 0.6
+ },
+ {
+  "model": "B",
+  "settings": {
+   "process": "flower",
+   "params": {
+    "n": 20,
+    "m": 30,
+    "dice_seed": 0,
+    "direction": "backward"
+   },
+   "n_states": 64,
+   "seed": 2
+  },
+  "config": "flower-31-backward",
+  "hours": 3.0,
+  "memory_gb": 0.6
+ },
+ {
+  "model": "feedback_GRU",
+  "settings": {
+   "process": "flower",
+   "params": {
+    "n": 20,
+    "m": 30,
+    "dice_seed": 0
+   },
+   "n_states": 64,
+   "seed": 2
+  },
+  "config": "flower-21",
+  "hours": 2.8,
+  "memory_gb": 0.6
+ },
+ {
+  "model": "feedback_GRU",
+  "settings": {
+   "process": "flower",
+   "params": {
+    "n": 20,
+    "m": 30,
+    "dice_seed": 0,
+    "direction": "backward"
+   },
+   "n_states": 64,
+   "seed": 2
+  },
+  "config": "flower-31-backward",
+  "hours": 2.8,
+  "memory_gb": 0.6
+ }
+]

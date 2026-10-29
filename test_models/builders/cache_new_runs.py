@@ -14,7 +14,8 @@ matplotlib.use("Agg")
 import analysis as A                                                          # noqa: E402
 import training as TR                                                         # noqa: E402
 
-folders = [Path(f) for items in json.loads((TM / "plans/new_processes_folders.json").read_text()).values() for f in items]
+PLAN = sys.argv[1] if len(sys.argv) > 1 else "plans/new_processes_folders.json"   # a {seed: [run folder]} file
+folders = [Path(f) for items in json.loads((TM / PLAN).read_text()).values() for f in items]
 done = set()
 while True:
     for f in folders:
@@ -29,7 +30,7 @@ while True:
               f"machine {m['n_states']} states ({time.time() - start:.0f} s)", flush=True)
     if len(done) == len(folders):
         break
-    runner = subprocess.run(["pgrep", "-f", "main.py train-many"], capture_output=True).returncode == 0
+    runner = subprocess.run(["pgrep", "-f", "main.py train-many|after_new_processes"], capture_output=True).returncode == 0
     if not runner and all(f in done or not (f / "completed.pt").exists() for f in folders):
         break
     time.sleep(300)

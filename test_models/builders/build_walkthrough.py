@@ -12,6 +12,7 @@ OUT = Path("/Users/tisornnaphattalung/Desktop/Quantum/URECA/LLM_final_version/te
 sys.path.insert(0, str(HERE))
 from walkthrough_findings import FINDINGS                                   # noqa: E402
 import new_processes_section as S7                                          # noqa: E402
+import de_bruijn_section as S10                                             # noqa: E402
 
 cells = []
 
@@ -37,8 +38,10 @@ This notebook uses the files of this folder:
 
 Sections 1–5 go through the steps once: choose a process, choose a model, train or load it, choose the plots. Section 6
 then has one demonstration per model. Each one shows how well the model predicts on held-out data, how it converges
-during training, and what machine it ends up with. Section 7 trains five of the models on three new processes:
-renewal-60, and the flower process read forward and backward. The demonstrations use the trained runs of sections 13, 16 and 17 of
+during training, and what machine it ends up with. Sections 7–9 train five of the models on new processes:
+renewal-60 (section 7), and the flower process with 8 dice of 12 faces (section 8) and with 20 dice of 30 faces
+(section 9), each flower read forward and backward. Section 10 tests a new model, the de Bruijn hybrid
+(`model_de_bruijn.py`), on renewal processes with 5 to 60 states and two more flower processes. The demonstrations use the trained runs of sections 13, 16 and 17 of
 `model_modeularised/hybrid_model_test.ipynb`, copied into `runs/imported/` by `python main.py import-runs`. Nothing is
 retrained here except a short example in section 4.
 
@@ -208,6 +211,467 @@ display(TR.history(folder)[["update", "tau", "excess_transformer_future", "exces
                             "transformer_states_used"]].round(4))
 """)
 
+# Section 4 protocols: Markdown examples, not additional executable notebook cells.
+md(r"""
+Section 4 connects **the process that generates data, the training settings, the model, and a folder that records
+the run**. The protocols below are copyable examples: they are displayed as Markdown, so running the notebook does
+not execute them. The 300-update example above remains the executable training demonstration. Use the `qdrug`
+environment or notebook kernel, with `test_models/` as the working directory.
+
+```text
+Choose process + parameters + window lengths
+    -> choose model + training settings
+    -> determine the run folder
+    -> generate a batch -> calculate loss -> update parameters (repeat)
+    -> save checkpoints and metric histories
+    -> load, evaluate, plot, or extend
+```
+
+The raw training sequences are generated during training. `runs/` stores settings, checkpoints and measurements;
+it does not store the sequence batches themselves.
+
+Your project's run directory is
+`/Users/tisornnaphattalung/Desktop/Quantum/URECA/LLM_final_version/test_models/runs`. In code, use `TR.RUNS` to refer
+to it. A different root can be selected with the `TEST_MODELS_RUNS` environment variable **before importing
+`training`**.
+
+```text
+runs/
+├── imported/                 Experiments copied from the old project
+│   ├── index.json
+│   ├── model_1/
+│   └── ...
+├── model_2/                  Runs created by the current training code
+│   └── renewal-15_w0_n300_s0_<hash>/
+├── model_5b/
+├── model_B/
+├── ...
+└── logs/                     Output logs from main.py train-many
+```
+
+For a newly created run, `renewal-15_w0_n300_s0_<hash>` encodes the process label, extra-loss weight 0, 300 planned
+updates and seed 0. The final hash depends on all settings and the tracked source files: the selected model,
+`training.py`, `process.py` and `causal_state_matrix.py`. Changing batch size, learning rate, seed or one of those
+files normally produces a different folder. The exact process parameters are in `settings.json`; the short process
+label does not encode every parameter. Imported runs keep the importer's older naming convention.
+
+| File in a new run | What it contains | When it is written |
+|---|---|---|
+| `settings.json` | Process, process parameters, model and optimizer settings, seeds, code fingerprint | At the start |
+| `validation_history.csv` | Held-out metrics, temperature, timing and recorded gradient norms | At update 0, every `eval_every` updates, and the final update |
+| `progress.json` | Most recent validation record | At each evaluation during the initial training |
+| `best.pt` | Parameters with the best main validation metric | Whenever that metric improves |
+| `training_history.csv` | Per-update training loss, its components and temperature | After the initial training finishes |
+| `completed.pt` | Final parameters, optimizer state, settings, sampler state and PyTorch random state | After the initial training finishes |
+| `report_latest.json` / `report_best.json` | Detailed held-out evaluation results | When analysis requests the corresponding report |
+
+At each update the training loss is accumulated in memory. The validation CSV and `progress.json` are refreshed at
+evaluation points, but the initial training-loss CSV is written only at completion. A folder with `settings.json`
+and some validation records can therefore be unfinished. `completed.pt` marks completion of the initial schedule.
+Training extensions add their own files, described below; `progress.json` is not refreshed by `TR.extend()`.
+""")
+
+md(r"""
+The **first protocol is to define and start one controlled run**. Define the data source and optimization settings
+separately so that it is clear which change affects the experiment. These variable names are separate from the
+walkthrough's existing `settings`, `model` and `folder` variables.
+
+```python
+from pathlib import Path
+import json
+import numpy as np
+import pandas as pd
+import matplotlib.pyplot as plt
+
+import training as TR
+import process as P
+import analysis as A
+
+data_options = dict(
+    process="renewal",
+    params={"F": [1 / 15] * 15},
+    history_len=40,
+    rollout_len=20,
+    context=19,
+)
+
+train_options = dict(
+    steps=5_000,
+    batch_size=64,
+    lr=1e-3,
+    weight_decay=5e-4,
+    grad_clip=1.0,
+    tau_start=2.5,
+    tau_end=0.5,
+    eval_every=250,
+    validation_rows=512,
+    seed=0,
+)
+
+protocol_settings = TR.settings_for("2", **data_options, **train_options)
+display(pd.Series(protocol_settings.to_dict()))
+print("Will save to:", TR.run_folder(protocol_settings))
+
+# This line starts training, or loads the matching completed run.
+protocol_model, protocol_folder = TR.train(protocol_settings)
+```
+
+`settings_for()` applies general `Settings` defaults, then the selected model file's `DEFAULTS`, then your explicit
+arguments. Your values take precedence. The example changes the default batch size from 128 to 64; settings that
+are not specified keep their model/default values.
+
+| Control | Meaning |
+|---|---|
+| `"2"` in `settings_for("2", ...)` | Selects `model_2.py` |
+| `process`, `params` | The statistical source of the sequences |
+| `history_len` | History tokens before the hybrid's handoff |
+| `rollout_len` | Future tokens predicted after that history |
+| `context` | Position from which the Transformer's own next-token predictions are scored |
+| `batch_size` | Independent windows used for one optimizer update |
+| `steps` | Number of optimizer updates |
+| `lr` | Learning rate |
+| `weight` | Coefficient of a model's extra loss term, where applicable |
+| `weight_decay`, `grad_clip` | Optimizer regularization and gradient clipping |
+| `tau_start`, `tau_end` | Start and end of the state-selection temperature schedule |
+| `eval_every`, `validation_rows` | Validation frequency and number of validation windows |
+| `n_states`, `state_dim` | Available learned states and their vector dimension |
+| `d_model`, `n_layers` | Transformer size, for models that use it |
+| `seed` | Run seed; controls model initialization and training-window randomness |
+
+`weight` and `weight_decay` are separate controls. A model's extra-loss coefficient does not select the optimizer's
+weight decay. The process's true number of states and the model's `n_states` capacity are also separate quantities.
+
+In this example every update draws a tensor of shape `(64, 60)`: 64 independent windows, each with 40 history tokens
+and 20 future tokens. The data-generation part of the loop is:
+
+```python
+# Illustration of the sampler calls inside TR.train(), not a second training loop.
+sampler = protocol_settings.process_object().sampler(protocol_settings.train_seed)
+for step in range(protocol_settings.steps):
+    batch = sampler.draw(protocol_settings.batch_size, protocol_settings.total_len)
+    # TR.train() then computes the loss, backpropagates, and updates the model.
+```
+
+There is no fixed training dataset that gets revisited for multiple epochs. This configuration draws
+5,000 × 64 = **320,000 windows**. Each window starts from the generating machine's stationary state distribution;
+the rows are not consecutive chunks of one long sequence. Random sampling can produce repeated token sequences.
+True generating-state IDs are used for analysis, not as training labels.
+
+By default the temperature schedule spans `steps`. The executable 300-update example above therefore changes
+temperature from 2.5 to 0.5 within those 300 updates. To study only the beginning of a longer schedule, pass, for
+example, `schedule_steps=50_000`; it must cover the requested initial updates. `TR.extend()` instead uses the fixed
+final temperature `tau_end`.
+""")
+
+md(r"""
+The **second protocol is to choose and inspect a different data source before training**. List the available models
+and processes with:
+
+```python
+print(TR.available_models())
+print(sorted(P.PROCESS))
+```
+
+Some concrete process configurations are:
+
+| Data source | `process` | `params` |
+|---|---|---|
+| Uniform renewal, up to 14 zeros between ones | `"renewal"` | `{"F": [1 / 15] * 15}` |
+| Uniform renewal, up to 59 zeros between ones | `"renewal"` | `{"F": [1 / 60] * 60}` |
+| Even process | `"even"` | `{"p": 0.5}` |
+| Flower: 8 dice, 12 faces | `"flower"` | `{"n": 8, "m": 12, "dice_seed": 0}` |
+| The same flower read backward | `"flower"` | `{"n": 8, "m": 12, "dice_seed": 0, "direction": "backward"}` |
+
+For renewal, `F[n]` specifies the probability of exactly `n` zeros between successive ones (the implementation
+normalizes the supplied weights). For the flower, `dice_seed` fixes the randomly drawn face probabilities of the
+dice. Changing it changes the process being studied.
+
+Using `data_options` and `train_options` from the first protocol, switch to the flower and inspect four windows:
+
+```python
+flower_data = {
+    **data_options,
+    "process": "flower",
+    "params": {"n": 8, "m": 12, "dice_seed": 0},
+}
+flower_settings = TR.settings_for("2", **flower_data, **train_options)
+flower_process = flower_settings.process_object()
+
+# An independent random stream for this preview.
+preview, generating_states = flower_process.sampler(9001).draw(
+    batch_size=4,
+    total_len=flower_settings.total_len,
+    states=True,
+)
+print("Vocabulary size:", flower_process.vocab_size)
+print("Token shape:", preview.shape)
+print(preview)
+
+# Uncomment in your own code cell to train this configuration.
+# flower_model, flower_folder = TR.train(flower_settings)
+```
+
+The preview sampler does not advance the training sampler: `TR.train()` creates its own sampler. `vocab_size` is
+filled automatically from the chosen process. Changing the process does not automatically increase window lengths
+or model capacity. For renewal-60, the walkthrough explicitly chooses:
+
+```python
+renewal60_settings = TR.settings_for(
+    "2",
+    process="renewal",
+    params={"F": [1 / 60] * 60},
+    history_len=120,
+    rollout_len=60,
+    context=59,
+    n_states=128,
+    **train_options,
+)
+```
+
+The run seeds control different random streams:
+
+* Starting model weights use `model_seed_base + seed` (default base 17).
+* Training windows use `train_seed_base + seed` (default base 1101).
+* Validation uses `validation_seed` (default 2202), which stays fixed across run seeds by default.
+* Flower's `dice_seed` belongs to the process parameters and is independent of these run seeds.
+
+Set `model_seed_base` or `train_seed_base` explicitly when you want to vary initialization and sampled data
+separately. Matching the process, training seed, batch size and window length across models gives them the same
+training-window stream under this sampler. To repeat an experiment with seed 1, build a new settings object using
+`**{**train_options, "seed": 1}`.
+
+The command-line equivalent accepts repeated `--set` arguments for any settings fields:
+
+```bash
+python main.py train \
+  --model 2 \
+  --process even \
+  --params '{"p": 0.5}' \
+  --steps 5000 \
+  --seed 0 \
+  --set batch_size=64 \
+  --set history_len=40 \
+  --set rollout_len=20 \
+  --set lr=0.001 \
+  --set eval_every=250
+```
+""")
+
+md(r"""
+The **third protocol is to choose between a new experiment and continuing an existing run**. With the default
+automatically generated folder, these actions have different effects:
+
+| Action | Effect |
+|---|---|
+| `TR.train(settings)` with the same settings/code and an existing `completed.pt` | Loads the saved run, using its latest checkpoint |
+| Change a setting and call `TR.train(new_settings)` | Normally creates a separate folder and starts from initialization |
+| `TR.extend(folder, extra_steps=...)` | Continues the saved run inside the same folder |
+| Rerun an initial run that has no `completed.pt` | Starts the initial training again; automatic resumption from an interrupted update is not implemented |
+| `TR.train(settings, force=True)` | Retrains and overwrites initial-run files in that folder; this is not continuation |
+
+Increasing `steps` in a new settings object creates a different experiment. To add 1,000 updates to the first
+protocol's completed 5,000-update run, use its returned folder:
+
+```python
+print("Before:", TR.checkpoint(protocol_folder, which="latest"))
+protocol_model = TR.extend(protocol_folder, extra_steps=1_000)
+print("After:", TR.checkpoint(protocol_folder, which="latest"))
+```
+
+`extend()` restores parameters, optimizer state, the training sampler's random state and PyTorch's random state.
+It continues at `tau_end` and writes these additional files after the extension completes:
+
+```text
+extended_6000.pt
+training_history_extended_6000.csv
+validation_history_extended.csv
+extensions.json
+```
+
+The extended validation CSV is also updated during extension evaluations, and `best.pt` is replaced whenever the
+main validation metric improves. The original `completed.pt` stays available. The folder name and `settings.steps`
+still describe the original 5,000-update schedule; `TR.checkpoint(folder, "latest")` gives the current checkpoint and
+total update count. Another 1,000-update extension would produce `extended_7000.pt` and its training-loss CSV.
+
+To load rather than train:
+
+```python
+loaded_model, loaded_settings, loaded_update = TR.load_run(protocol_folder, which="latest")
+```
+
+`"completed"` selects the end of the original schedule, `"latest"` includes the latest recorded extension, and
+`"best"` selects the checkpoint with the best main validation metric. For model 2 that metric is the GRU's future
+excess CE. `TR.train_until_settled(settings)` can automate extensions using the validation-improvement rule documented
+above. Imported checkpoints can be extended only if their original files included the required optimizer and
+random-generator states; not every imported run has those fields.
+""")
+
+md(r"""
+The **fourth protocol is to analyse saved training and evaluation records**. You can use the `folder` returned by
+the executable 300-update example, `protocol_folder` from the optional training protocol, or an explicitly selected
+existing path. The following defaults to the already executed demonstration:
+
+```python
+import json
+
+target = Path(folder)  # Change to Path(protocol_folder) to inspect the optional 5,000-update run.
+saved_settings = TR.read_settings(target)
+display(pd.Series(saved_settings.to_dict()))
+
+validation = TR.history(target)
+metric = TR.main_metric(saved_settings.model)
+display(validation[["update", "tau", metric]].tail())
+validation.plot(x="update", y=metric, ylabel="Validation excess CE (bits/token)")
+plt.show()
+```
+
+**`TR.history()` returns validation measurements**, including any extension validation history. It does not return
+the per-update training losses. Read those from the training CSVs:
+
+```python
+metadata = json.loads((target / "settings.json").read_text())
+training_paths = list(target.glob("training_history*.csv"))
+
+# Imported runs keep references to the original, potentially large training CSVs.
+if not training_paths:
+    training_paths = [Path(p) for p in metadata.get("training_histories", [])]
+training_paths = [p for p in training_paths if p.exists()]
+
+if training_paths:
+    training_history = pd.concat(
+        [pd.read_csv(p) for p in training_paths], ignore_index=True,
+    ).sort_values("update")
+    display(training_history.tail())
+    print("Available columns:", training_history.columns.tolist())
+    training_history.plot(x="update", y="loss")
+    plt.show()
+else:
+    print("No accessible training-history CSVs.")
+```
+
+For a new model 2 run, the training columns include `update`, `tau`, `ce_gru`, `ce_t1` and `loss`. Its loss combines
+the two prediction losses. Validation excess CE subtracts the true process's cross-entropy on held-out tokens, so
+its numerical value has a different meaning from the training loss. Imported CSV column names may follow the old
+code's naming; inspect the available columns before selecting loss components.
+
+To discover runs without remembering their hashes:
+
+```python
+found = TR.find_runs(model="2", process="renewal", steps=5_000, batch_size=64)
+for path, run_settings in found.items():
+    print(path, "seed =", run_settings.seed)
+
+# find_runs returns {folder: Settings}; test_table expects {display_name: folder}.
+selected = {path.name: path for path in found}
+if selected:
+    display(A.test_table(selected, which="latest"))
+
+# Imported runs are under a separate root.
+imported_found = TR.find_runs(root=TR.RUNS / "imported", model="2")
+```
+
+By default `find_runs()` includes only folders with `completed.pt`. Pass `finished=False` to include unfinished runs.
+Its filters match saved settings, so `steps=5_000` means the original planned schedule even if the run was later
+extended. Runs with different code hashes can coexist and match the same settings filters.
+
+For one run's full held-out report:
+
+```python
+display(A.test_table({"my run": target}, which="latest"))
+```
+
+`test_table()` loads the saved model and reuses the cached report when its update and report version match.
+Otherwise it evaluates the model and saves a report; this can take time but does not train it. The notebook's
+`performance({"my run": target})` helper then selects a smaller set of columns, indexes by seed and rounds to four
+decimal places. Each run remains a separate row.
+""")
+
+md(r"""
+The **fifth protocol is to reconstruct and analyse the actual token sequences**. For runs produced by this
+`training.py`, reconstruct past batches from the saved process, parameters, training seed, original batch size,
+window length and sampler-call order. The checkpoint's sampler state is the state at its saved update: it supports
+continuation from that point, rather than storing all preceding token batches.
+
+The example below reconstructs only the first ten batches of the executable demonstration. It also requests
+generating-state IDs for analysis; `states=True` does not change which tokens the sampler draws.
+
+```python
+import numpy as np
+
+target = Path(folder)  # Or another run produced by the current training sampler.
+replay_settings = TR.read_settings(target)
+replay_sampler = replay_settings.process_object().sampler(replay_settings.train_seed)
+token_batches, state_batches = [], []
+
+for _ in range(min(10, replay_settings.steps)):
+    tokens, states = replay_sampler.draw(
+        replay_settings.batch_size,
+        replay_settings.total_len,
+        states=True,
+    )
+    token_batches.append(tokens.numpy())
+    state_batches.append(states)
+
+replayed_tokens = np.stack(token_batches)
+replayed_states = np.stack(state_batches)
+print("Tokens:", replayed_tokens.shape)
+print("Generating states:", replayed_states.shape)
+
+export_dir = Path("exports") / target.name
+export_dir.mkdir(parents=True, exist_ok=True)
+np.savez_compressed(
+    export_dir / "first_training_batches.npz",
+    tokens=replayed_tokens,
+    generating_states=replayed_states,
+)
+```
+
+For the 300-update demonstration, token shape is `(10, 128, 60)`: update, window, token position. State shape is
+`(10, 128, 61)`. `states[..., j]` is the generating machine's state **before** token `j`; the extra last entry is its
+state after the final token. These generating states are causal states when the process's generating machine is its
+epsilon-machine (`process_object().is_epsilon_machine`). The model sees the tokens, not these state IDs.
+
+Inspect a window and the empirical token frequencies:
+
+```python
+first_window = replayed_tokens[0, 0]
+print("History:", first_window[:replay_settings.history_len])
+print("Future: ", first_window[replay_settings.history_len:])
+
+counts = np.bincount(replayed_tokens.ravel(), minlength=replay_settings.vocab_size)
+display(pd.Series(counts / counts.sum(), name="observed_frequency"))
+```
+
+To reproduce the batch at update 100, restart from the original seed and advance through 99 batches:
+
+```python
+replay_sampler = replay_settings.process_object().sampler(replay_settings.train_seed)
+for _ in range(99):
+    replay_sampler.draw(replay_settings.batch_size, replay_settings.total_len)
+batch_100 = replay_sampler.draw(replay_settings.batch_size, replay_settings.total_len)
+```
+
+Keep the original batch size, window length and call order. One giant draw does not reproduce the same arrangement
+of random draws. Exact reconstruction also requires compatible process/sampler code and random-generator behavior;
+the saved settings and code fingerprint record provenance but do not archive the source code. Imported experiments
+must be checked against their original sampler, especially the older Section 13 experiment. This protocol
+reconstructs input windows, not the full optimizer trajectory. For a complete training-data export, write batches
+incrementally instead of retaining every batch in memory.
+
+Validation and test windows have direct reconstruction helpers and use separate streams from training:
+
+```python
+validation_tokens, validation_states = TR.validation_windows(replay_settings)
+test_tokens, test_states, exact_ce = A.windows(replay_settings, "test")
+```
+
+The validation windows use the run's own `validation_rows` and `validation_seed`. The test set currently uses
+4,096 windows and the fixed test seed defined in `analysis.py`. `exact_ce` contains the true process's token-level
+cross-entropies used to calculate excess CE. These helpers let you inspect or export held-out data separately from
+the batches used for parameter updates.
+""")
+# End Section 4 protocols.
+
 md(r"""
 The trained runs of sections 13, 16 and 17 are in `runs/imported/` (`MAIN.imported_runs()`):
 * models 1–C: three seeds each, section 16;
@@ -274,10 +738,11 @@ for section in FINDINGS:
     if section.get("after"):
         md(section["after"])
 
-for kind, text in S7.CELLS:
-    (code if kind == "code" else md)(text)
-for text in getattr(S7, "FINDINGS", []):
-    md(text)
+for module in (S7, S10):
+    for kind, text in module.CELLS:
+        (code if kind == "code" else md)(text)
+    for text in getattr(module, "FINDINGS", []):
+        md(text)
 
 md(r"""
 ## References

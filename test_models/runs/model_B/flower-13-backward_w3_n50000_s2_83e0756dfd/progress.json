@@ -1,0 +1,23 @@
+{
+  "excess_transformer_future": 5.010795584090268,
+  "excess_transformer_all": 5.1847535641241524,
+  "transformer_states_used": 12,
+  "transformer_information": 0.17452598089437113,
+  "transformer_determinism": 0.68798828125,
+  "excess_gru_from_handoff_future": 0.0036373046713218393,
+  "gru_from_handoff_states_used": 12,
+  "gru_from_handoff_information": 0.982423624244717,
+  "gru_from_handoff_determinism": 1.0,
+  "handoff_margin_median": 32.953857421875,
+  "handoff_codes": 12,
+  "copy_agree": 1.0,
+  "update": 50000,
+  "tau": 0.5,
+  "seconds": 8977.52136975003,
+  "grad_encoder": 1.8269954438210334e-08,
+  "grad_transformer_selector": 3.4671270299213575e-09,
+  "grad_causal_head": 0.1143767386674881,
+  "grad_gru_cell": 0.01285606250166893,
+  "grad_gru_selector": 0.0072539797984063625,
+  "grad_encoder_norm": 1.90022220181163e-09
+}

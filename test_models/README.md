@@ -13,7 +13,7 @@ shared analysis, and a walkthrough notebook. Run everything from this folder wit
 | `analysis.py` | everything after training: test results, machines, comparison with the true machine, all figures; its docstring says which analysis applies to which model |
 | `walkthrough.ipynb` | choose a process → choose a model → train or load → plots; then one section per model (section 6); section 7: five models on renewal-60 and the flower process read forward and backward |
 | `plans/` | lists of trainings for `train-many`; `new_processes.json` is section 7's 45 runs |
-| `tests/` | `test_equivalence.py`: the same results as the code of sections 13–17 (needs `../model_modeularised`); `test_models.py`: every model end to end |
+| `tests/` | `test_equivalence.py`: the same results as the code of sections 13–17 (needs `../model_modeularised`); `test_models.py`: every model end to end; `test_de_bruijn.py`: the de Bruijn model against the plan's code and contract tests |
 | `runs/` | saved runs: `runs/model_<name>/...` for new runs, `runs/imported/...` for the runs of sections 13, 16, 17, `runs/logs/` for `train-many`'s logs (another folder: set `TEST_MODELS_RUNS`) |
 
 ## The models
@@ -33,6 +33,8 @@ shared analysis, and a walkthrough notebook. Run everything from this folder wit
 | `2_L2` | 2 + weight × D over the L − 1 GRU steps | section 17 `l2_both_losses` |
 | `feedback_GRU` | a GRU alone whose state is a row of the state table; its own next-token predictions | section 17 `feedback_gru` |
 | `discrete_Transformer` | a Transformer alone choosing a state at every position; its own next-token predictions | section 17 `discrete_transformer` |
+| `de_bruijn` | the de Bruijn hybrid: states read from the last R tokens (R = the process's Markov order), started at the machine merged from counts; L_pred + β L_use + λ (L_G + κ L_E) | `DEBRUIJN_HYBRID_IMPLEMENTATION_PLAN.md`, sections 1–9 |
+| `de_bruijn_bic` | the same with R estimated from the data by the plan's information criterion (written from `model_de_bruijn.py` by `builders/build_de_bruijn_bic.py`) | the plan, section 3 |
 
 D = the distance between the Transformer's and the GRU's state probabilities after the same tokens.
 

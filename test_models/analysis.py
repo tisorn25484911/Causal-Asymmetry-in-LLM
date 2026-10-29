@@ -40,6 +40,7 @@ Excess CE = the predictor's CE minus the true process's CE on the same tokens, b
 """
 import json
 import math
+import sys
 from functools import lru_cache
 from pathlib import Path
 
@@ -63,18 +64,21 @@ MIN_SHARE = 0.01                 # a state of a state-sequence machine is drawn 
 REPORT_VERSION = 1
 
 SURFACE, INK, INK2, GRID = "#fcfcfb", "#0b0b0b", "#52514e", "#e6e5e1"
-BLUE, ORANGE, AQUA, PURPLE, NEUTRAL = "#2a78d6", "#eb6834", "#1baf7a", "#8c5a9e", "#898781"
+BLUE, ORANGE, AQUA, PURPLE, NEUTRAL, GOLD = "#2a78d6", "#eb6834", "#1baf7a", "#8c5a9e", "#898781", "#b8860b"
 PREDICTOR_STYLE = {"transformer": ("Transformer: reads all tokens so far", BLUE),
                    "gru_from_handoff": ("GRU from the handoff", ORANGE),
                    "next_state_from_handoff": ("next-state network from the handoff", AQUA),
-                   "gru_from_start": ("feedback GRU: reads every token from the start", PURPLE)}
+                   "gru_from_start": ("feedback GRU: reads every token from the start", PURPLE),
+                   "node_table": ("node table: reads the last R tokens (de Bruijn)", GOLD)}
 SEED_STYLE = {0: "-", 1: "--", 2: ":", 3: "-.", 4: (0, (1, 3))}
 EXTRA_TERMS = {"next_entropy": "entropy of the next-state network's output (bits)",
                "next_predicts_transformer": "share: network's next state = Transformer's",
                "inferred_entropy": "entropy of the inferred next state (bits)",
                "inferred_predicts_transformer": "share: inferred next state = Transformer's",
                "copy_agree": "share: starting state = GRU's own state",
-               "l2": "distance D between the two parts"}
+               "l2": "distance D between the two parts",
+               "U_bits": "commutation entropy U of the reader's states (bits)",
+               "head_agreement": "share: G's next state = the reader's"}
 FLOOR = 1e-4
 
 
@@ -84,8 +88,9 @@ def capabilities(model_name):
     module = TR.load_model_module(model_name)
     model = TR.make_model(TR.settings_for(model_name))
     rules = list(model.step_rules())
-    own = [p for p in ("transformer", "gru_from_start")
-           if p == module.MAIN_PREDICTOR or (p == "transformer" and hasattr(model, "transformer_selector"))]
+    own = [p for p in ("transformer", "gru_from_start", "node_table")
+           if p == module.MAIN_PREDICTOR or (p == "transformer" and hasattr(model, "transformer_selector"))
+           or (p == "node_table" and hasattr(model, "reader"))]
     return dict(model=model_name, description=module.DESCRIPTION, main_predictor=module.MAIN_PREDICTOR,
                 step_rules=rules, own_predictors=own, gru_hybrid=hasattr(model, "gru_selector"),
                 transformer_scoring_layer=hasattr(model, "transformer_selector"),
@@ -405,6 +410,8 @@ def measures_in_batches(model, rows=MEASURE_ROWS):
     4,096 test windows)."""
     if not hasattr(model, "measures") or getattr(model, "measures_in_batches", False):
         return model
+    if getattr(sys.modules.get(type(model).__module__), "MEASURES_ONE_PASS", False):
+        return model                                   # (its measures are not means over windows)
     whole = model.measures
 
     def measures(tokens, tau, prediction):
@@ -529,8 +536,9 @@ def first_below(folders, levels=(0.04, 0.02, 0.01)):
 
 
 def _items(folders):
+    """[(name, folder)] from a dict {name: folder} or a list of folders; a None folder stays None."""
     if isinstance(folders, dict):
-        return [(str(k), Path(v)) for k, v in folders.items()]
+        return [(str(k), Path(v) if v is not None else None) for k, v in folders.items()]
     return [(Path(f).name, Path(f)) for f in folders]
 
 
@@ -827,7 +835,8 @@ def plot_test_summary(table, levels, title="Test excess CE of every predictor (f
     models = list(dict.fromkeys(table["group"]))[::-1]
     fig, ax = plt.subplots(figsize=(10, 0.5 * len(models) + 1.3), layout="constrained")
     markers = {0: "o", 1: "s", 2: "^", 3: "D", 4: "v"}
-    offsets = {"transformer": 0.24, "gru_from_handoff": 0.08, "next_state_from_handoff": -0.08, "gru_from_start": -0.24}
+    offsets = {"transformer": 0.24, "node_table": 0.24, "gru_from_handoff": 0.08, "next_state_from_handoff": -0.08,
+               "gru_from_start": -0.24}
     for name, (label, colour) in PREDICTOR_STYLE.items():
         col = f"excess_{name}_future"
         if col not in table:
@@ -920,15 +929,16 @@ def plot_excess_by_true_state(folders, which="latest", title="Excess CE at each 
     return fig
 
 
-def plot_state_tables(folders, which="latest", predictors=None, min_share=0.01):
+def plot_state_tables(folders, which="latest", predictors=None, min_share=0.01, main_only=False):
     """For each run and predictor: which learned states each true state is sent to (share of the true state's test
     positions in each learned state; rows ordered by the mean true state they are used at).  One learned state per true
-    state gives a diagonal; one state covering several gives a horizontal run."""
+    state gives a diagonal; one state covering several gives a horizontal run.  main_only: each model's main predictor."""
     style()
     items = _items(folders)
     reps = [(label, report(folder, which), TR.read_settings(folder)) for label, folder in items]
     pairs = [(label, rep, s, name) for label, rep, s in reps for name in PREDICTOR_STYLE
-             if f"{name}_by_true_state" in rep["tables"] and (predictors is None or name in predictors)]
+             if f"{name}_by_true_state" in rep["tables"] and (predictors is None or name in predictors)
+             and (not main_only or name == TR.load_model_module(s.model).MAIN_PREDICTOR)]
     ncols = min(3, len(pairs))
     fig, axes = plt.subplots(math.ceil(len(pairs) / ncols), ncols, figsize=(3.9 * ncols, 3.2 * math.ceil(len(pairs) / ncols)),
                              squeeze=False, layout="constrained")
@@ -1050,8 +1060,10 @@ def plot_true_machine(settings):
     style()
     proc = settings.process_object()
     fig, axes = plt.subplots(1, 2, figsize=(13.5, 6.2), gridspec_kw=dict(width_ratios=[1.45, 1.0]), layout="constrained")
-    draw_machine(axes[0], true_machine(settings), settings, NEUTRAL)
-    axes[0].set_title(f"{len(proc.T)} states; arrow token|p = emit the token with probability p and move", fontsize=8.5)
+    labels = proc.vocab_size <= 20                          # (more tokens: too many labels to read)
+    draw_machine(axes[0], true_machine(settings), settings, NEUTRAL, edge_labels=labels)
+    axes[0].set_title(f"{len(proc.T)} states; " + ("arrow token|p = emit the token with probability p and move" if labels
+                      else f"{proc.vocab_size} tokens, arrows without labels"), fontsize=8.5)
     heat(axes[1], proc.M.sum(-1), proc.state_names, ramp(NEUTRAL), 1.0, "its state-to-state transition matrix")
     fig.suptitle(f"The true ε-machine of {proc.label}", fontsize=10.5)
     return fig
@@ -1127,7 +1139,8 @@ def plot_machines(folders, which="latest", predictor=None, max_drawn=24):
 
 
 def plot_machine_grid(folders, which="latest", predictor=None, kind="auto", ncols=3, max_drawn=24):
-    """One panel per run (e.g. a row per model, a column per seed): the machine of its main predictor (or `predictor`),
+    """One panel per run (e.g. a row per model, a column per seed; a None folder leaves its panel empty): the machine of
+    its main predictor (or `predictor`),
     as a graph when kind='graph', or kind='auto' and it has at most `max_drawn` states; otherwise its state-to-state
     matrix laid out on the true states (as in plot_machines).  Arrows carry 'token|p' labels only for processes with at
     most 4 tokens.  Titles: the machine's size, the true states it covers, the mean |learned - true| over the covered
@@ -1139,6 +1152,10 @@ def plot_machine_grid(folders, which="latest", predictor=None, kind="auto", ncol
     for ax in axes.flat[len(items):]:
         ax.set_visible(False)
     for ax, (label, folder) in zip(axes.flat, items):
+        if folder is None:                                   # (a run that has not finished yet)
+            ax.set_axis_off()
+            ax.set_title(f"{label}: not finished yet", fontsize=7.5, color=INK2)
+            continue
         settings = TR.read_settings(folder)
         m, rep = machine(folder, which, predictor), report(folder, which)
         cmp = transition_comparison(m, settings)
@@ -1149,9 +1166,9 @@ def plot_machine_grid(folders, which="latest", predictor=None, kind="auto", ncol
         else:
             heat(ax, cmp["aggregated"], names, ramp(colour), 1.0, "")
         excess = rep["metrics"][f"excess_{m['predictor']}_future"]
-        ax.set_title(f"model {settings.model}, seed {settings.seed} ({m['kind']}): {m['n_states']} states, "
-                     f"covers {cmp['covered']} of {len(names)}\nmean |learned − true| {cmp['mean_error']:.3f}, "
-                     f"test excess {excess:.4f} bits", fontsize=7.5)
+        ax.set_title(f"model {settings.model}, {settings.process_object().label}, seed {settings.seed} ({m['kind']}):\n"
+                     f"{m['n_states']} states, covers {cmp['covered']} of {len(names)}, mean |learned − true| "
+                     f"{cmp['mean_error']:.3f}, test excess {excess:.4f} bits", fontsize=7.5)
     return fig
 
 
